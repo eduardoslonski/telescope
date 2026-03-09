@@ -1,0 +1,13 @@
+*__pycache__*
+*.pyc
+.env
+.venv/
+.ruff_cache/
+.claude/
+dist/
+*.egg-info/
+logs
+wandb
+specs
+checkpoints
+src/telescope/checkpoints

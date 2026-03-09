@@ -1,0 +1,300 @@
+# Telescope default configuration
+# All fields with their defaults — serves as documentation.
+# Override per-experiment in a run.yaml passed via --config.
+# Override on CLI: --learning_rate 5e-7  or  --learning-rate 5e-7
+
+# ── General ──────────────────────────────────────────────────────────────────
+debug: false
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model: "Qwen/Qwen2.5-3B"
+model_dtype: "float32" # "float32", "float16", "bfloat16"
+mixed_precision_dtype: "bfloat16" # FSDP mixed precision, or null to disable
+
+# ── Ray cluster ──────────────────────────────────────────────────────────────
+ray_address: "auto"
+ray_auto_start_local: true
+ray_namespace: "telescope"
+ray_log_to_driver: true
+ray_runtime_env: null
+ray_disable_runtime_env_hook: true
+ray_pin_py_executable: true
+ray_propagate_active_venv: true
+ray_propagate_run_dir: true
+ray_broadcast_init_timeout_s: 300
+ray_broadcast_prefer_loopback_if_single_node: true
+ray_shutdown_on_exit: false
+ray_inference_cpus_per_worker: 4.0
+ray_trainer_cpus_per_worker: 4.0
+ray_inference_placement_strategy: "PACK" # PACK, SPREAD, STRICT_PACK, STRICT_SPREAD
+ray_trainer_placement_strategy: "PACK"
+ray_placement_timeout_s: 900
+
+# ── Workers ──────────────────────────────────────────────────────────────────
+inference_num_workers: 2
+inference_tensor_parallel_size: 1
+trainer_num_workers: 2
+
+# ── Orchestrator ─────────────────────────────────────────────────────────────
+max_concurrent_prompts_per_server: 32
+prompts_batch_size_for_trainer: 16
+number_of_steps: 300
+max_async_rollout: 2 # 0 = fully synchronous; N = inference can run N training steps ahead
+discard_group_zero_advantage: true # drop groups where all samples got identical rewards (no learning signal)
+enable_prompt_prefetch: true
+prompt_prefetch_buffer_size: 24
+enable_individual_sample_lanes: true # true = each sample gets its own lane slot instead of one per group
+max_off_policy_steps: 8 # cancel in-flight rollouts after this many weight updates (-1 = disabled)
+
+# ── Trainer ──────────────────────────────────────────────────────────────────
+learning_rate: 1.0e-6
+weight_decay: 0.0
+grad_clip: 1.0
+lr_scheduler: "constant" # "none" = fixed LR; "constant" = warmup then constant; "linear" = warmup then linear decay; "cosine" = warmup then cosine decay
+warmup_steps: 0 # number of linear warmup steps (0 = no warmup)
+min_lr_ratio: 0.0 # minimum LR as fraction of learning_rate (linear/cosine decay; 0.0 = decay to zero)
+train_backend: "fsdp" # "fsdp" or "megatron"
+# ── Megatron (ignored for FSDP) ─────────────────────────────────────────────
+megatron_tensor_parallel_size: 1
+megatron_pipeline_parallel_size: 1
+megatron_context_parallel_size: 1
+megatron_expert_parallel_size: 1
+megatron_global_batch_size: null # defaults to prompts_batch_size_for_trainer
+megatron_disable_unified_memory_jit: true
+megatron_optimizer_cpu_offload: false
+megatron_optimizer_offload_fraction: 1.0
+megatron_overlap_cpu_optimizer_d2h_h2d: true
+megatron_use_precision_aware_optimizer: false
+megatron_main_grads_dtype: "float32"
+megatron_main_params_dtype: "float32"
+megatron_exp_avg_dtype: "float32"
+megatron_exp_avg_sq_dtype: "float32"
+megatron_grad_reduce_in_fp32: true # false halves grad buffer memory (fp32→bf16, saves ~14 GB)
+megatron_gradient_checkpointing: true # recompute activations in backward to save memory (~15-20 GB)
+megatron_sequence_parallel: true # shard sequence dim in LayerNorm/dropout regions (requires TP > 1)
+megatron_use_distributed_optimizer: true # shard optimizer states across DP ranks (requires DP > 1 to help)
+megatron_overlap_grad_reduce: false # overlap gradient allreduce with backward compute
+megatron_use_transformer_engine: false # use TransformerEngine layer spec (fused attention, FP8-ready)
+megatron_fp8: false # enable FP8 compute (requires TE + Hopper GPU)
+
+# ── Algorithm ────────────────────────────────────────────────────────────────
+algorithm: "grpo" # grpo, rloo, reinforce_pp, dr_grpo, cispo, gspo, sapo
+number_of_minibatches: 1 # >1 enables PPO-style multiple gradient steps per rollout batch
+use_ppo_clip: false # apply PPO ratio clipping to the policy loss
+ppo_clip_ref_logprobs: "rollout" # "rollout" = vLLM logprobs; "batch" = recompute with trainer before update
+clip_low: 0.4 # PPO clip lower bound (1 - clip_low)
+clip_high: 0.5 # PPO clip upper bound (1 + clip_high)
+sapo_tau_pos: 1.0 # sigmoid sharpness for positive advantages (sapo only)
+sapo_tau_neg: 1.05 # sigmoid sharpness for negative advantages (sapo only)
+dr_grpo_loss_agg_mode: "token_mean" # "token_mean" or "token_sum_norm" (removes response-level length bias per DR-GRPO paper)
+advantage_norm: "group" # "group" = normalize within prompt group; "batch" = normalize across training batch
+use_tis: false # truncated importance sampling — corrects for async vLLM/trainer logprob mismatch
+tis_cap: 2.0 # max importance weight
+tis_logprob_clamp: 20.0
+entropy_chunk_size: 1024
+
+# ── Weight sync ──────────────────────────────────────────────────────────────
+weight_broadcast_mode: "flattened_bucket" # "flattened_bucket" or "per_tensor"
+weight_broadcast_bucket_mb: 256
+weight_broadcast_cpu_staging: false
+weight_broadcast_pin_memory: true # use pinned CPU memory for staging (faster H2D transfers)
+weight_broadcast_free_grad_buffers: true # free Megatron grad buffers during broadcast (saves ~14 GB)
+
+# ── Sequence packing ────────────────────────────────────────────────────────
+seq_len: 4096
+pad_to_multiple_of: 64
+
+# ── Inference server ─────────────────────────────────────────────────────────
+inference_host: "0.0.0.0"
+inference_base_port: 8100
+gpu_memory_utilization: 0.9
+max_model_len: 4096
+vllm_scheduling_policy: "priority" # "priority" = turn-aware scheduling for multi-turn; "fcfs" = first-come-first-served
+enable_thinking: false # pass enable_thinking=True/False to apply_chat_template (e.g. Qwen3 thinking mode)
+
+# ── Rollout / sampling ───────────────────────────────────────────────────────
+group_size: 8
+temperature: 1.0
+max_tokens: 3700
+top_p: null # nucleus sampling; null = disabled
+interleaved_rollouts: true # exact token reuse across turns (avoids re-tokenization mismatches in multi-turn)
+
+# ── Checkpoint ───────────────────────────────────────────────────────────────
+checkpoint_every: false # set to N to checkpoint every N steps
+checkpoint_save_training_state: true # save optimizer/scheduler/orchestrator state for resume; false = weights-only
+resume_from_checkpoint: false
+checkpoint_dir: null # custom path for checkpoints; default: RUN_DIR/checkpoints
+checkpoint_keep_last: null # keep N most recent checkpoints; null = keep all
+checkpoint_keep_every: null # always keep checkpoints at these step multiples (e.g. 100)
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+use_wandb: true
+wandb_project: "telescope"
+wandb_run_name: "telescope_run"
+wandb_tags: ["telescope"]
+wandb_upload_code: true
+wandb_code_max_file_size_mb: 2.0
+wandb_code_exclude_patterns:
+  [
+    ".git",
+    ".venv",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    "__pycache__",
+    "checkpoints",
+    "data",
+    "logs",
+    "stdout",
+    "wandb",
+    "*.pyc",
+    "*.egg-info",
+  ]
+system_metrics_collection_interval_seconds: 1.0
+torch_memory_sample_interval_seconds: 0.1
+event_tail_window_seconds: 60
+event_block_duration_seconds: 1800
+event_upload_interval_seconds: 5
+metrics_logger_interval_seconds: 2.0
+ray_torch_memory_drain_interval_seconds: 0.5
+rollout_block_size: 500
+track_gpu_events: true
+
+# ── Evals ────────────────────────────────────────────────────────────────────
+eval_before_training: true
+eval_after_training: true
+eval_num_servers: 1
+eval_start_end_use_all_servers: true
+
+# ── vLLM tracing ────────────────────────────────────────────────────────────
+enable_vllm_tracing: true
+otlp_receiver_port: 4318
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Environments & evals
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Environments ────────────────────────────────────────────────────────────
+# Each entry: name (required), weight, reward_min, reward_max, kwargs
+# All environments inherit from base: eos_token, add_thinking_prefix
+# SingleTurnEnvironment adds: system_prompt, instruction_prompt
+# MultiTurnEnvironment adds: max_turns, system_prompt
+# ToolEnvironment adds: tools, max_turns, tool_call_format, include_tool_schemas_in_prompt, error_formatter, system_prompt
+#
+# environments:
+#
+#   - name: "hendrycks_math"              # SingleTurnEnvironment
+#     weight: 0.5
+#     reward_min: 0.0
+#     reward_max: 1.0
+#     kwargs:
+#       dataset_name: "justus27/math-hendrycks-genesys-format"
+#       dataset_subset: "default"
+#       dataset_split: "train"
+#       system_prompt: null
+#       instruction_prompt: null
+#       eos_token: null
+#       add_thinking_prefix: false
+#
+#   - name: "countdown"                   # SingleTurnEnvironment
+#     weight: 0.5
+#     reward_min: 0.0
+#     reward_max: 2.0
+#     kwargs:
+#       dataset_name: "Jiayi-Pan/Countdown-Tasks-3to4"
+#       dataset_subset: "default"
+#       dataset_split: "train"
+#       system_prompt: null
+#       instruction_prompt: null
+#       eos_token: null
+#       add_thinking_prefix: false
+#
+#   - name: "i3_code"                     # SingleTurnEnvironment (async rewards, requires sandbox)
+#     weight: 0.5
+#     reward_min: 0.0
+#     reward_max: 1.0
+#     kwargs:
+#       dataset_name: "PrimeIntellect/INTELLECT-3-RL"
+#       dataset_subset: "code"
+#       dataset_split: "train"
+#       difficulty_key: "avg@8_qwen3_4b_instruct_2507"
+#       min_difficulty: 0.0
+#       max_difficulty: 1.0
+#       max_num_tests: 15
+#       timeout_per_test: 10
+#       random_seed: 42
+#       provider: null               # REQUIRED — sandbox provider name
+#       provider_kwargs: null
+#       pool_size: 10
+#       max_concurrent_creates: 100
+#       timeout_minutes: 360
+#       environment_vars: null
+#       docker_image: null
+#       cpu: 1.0
+#       memory_mb: 2048
+#       disk_size_gb: 3
+#       gpu_count: 0
+#       team_id: null
+#       eos_token: null
+#       add_thinking_prefix: false
+#
+#   - name: "wordle"            # MultiTurnEnvironment
+#     weight: 0.5
+#     reward_min: 0.0
+#     reward_max: 2.2
+#     kwargs:
+#       max_turns: 6
+#       num_samples: 2000
+#       seed: 0
+#       system_prompt: null
+#       eos_token: null
+#       add_thinking_prefix: false
+
+# ── Evals ───────────────────────────────────────────────────────────────────
+# Each entry: name (required), eval_every, num_samples, kwargs,
+#             temperature, top_p, max_tokens, pass_k, separate_eval_samples
+# Any environment can also be used as an eval by name.
+# Dedicated evals: math500. All environments above also work as evals.
+#
+# evals:
+#
+#   - name: "math500"                     # dedicated eval (wraps hendrycks_math)
+#     eval_every: 10
+#     num_samples: 500
+#     temperature: 1.0
+#     top_p: null
+#     max_tokens: 3000
+#     separate_eval_samples: false
+#     pass_k:
+#       at_k:
+#         metrics: ["correct"]
+#         k: [1, 5, 10]
+#       pow_k:
+#         metrics: ["correct"]
+#         k: [1, 5]
+#     kwargs:
+#       dataset_name: "HuggingFaceH4/MATH-500"
+#       dataset_split: "test"
+#       instruction_prompt_post: "\nPlease reason step by step, and put your final answer within \\boxed{}."
+#
+#   - name: "hendrycks_math"              # environment used as eval
+#     eval_every: 10
+#     num_samples: 200
+#     separate_eval_samples: true         # use held-out eval split instead of training samples
+#     temperature: null                   # null = inherit from base config
+#     top_p: null
+#     max_tokens: null
+#     pass_k: {}
+#     kwargs:
+#       dataset_name: "justus27/math-hendrycks-genesys-format"
+#       dataset_subset: "default"
+#       dataset_split: "train"
+#
+#   - name: "countdown"                   # environment used as eval
+#     eval_every: 10
+#     num_samples: 200
+#     separate_eval_samples: true
+#     kwargs:
+#       dataset_name: "Jiayi-Pan/Countdown-Tasks-3to4"
+#       dataset_subset: "default"
+#       dataset_split: "train"

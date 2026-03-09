@@ -1,0 +1,40 @@
+# Hendrycks MATH training with periodic eval on MATH-500 and hendrycks_math
+# Install: uv add math-verify
+#
+# Usage: uv run train.py --config configs/examples/example_hendrycks_math_with_eval.yaml
+
+wandb_project: "telescope"
+wandb_run_name: "hendrycks_math_with_eval"
+
+model: "Qwen/Qwen2.5-3B"
+
+inference_num_workers: 2
+trainer_num_workers: 2
+
+environments:
+  - name: "hendrycks_math"
+    reward_min: 0.0
+    reward_max: 1.0
+
+prompts_batch_size_for_trainer: 16
+group_size: 8
+number_of_steps: 300
+algorithm: "grpo"
+
+max_model_len: 4096
+max_tokens: 3000
+
+evals:
+  - name: "math500"
+    eval_every: 10
+    num_samples: 100
+    max_tokens: 3000
+  - name: "hendrycks_math"
+    eval_every: 10
+    num_samples: 100
+    separate_eval_samples: true
+
+eval_before_training: true
+eval_after_training: true
+eval_num_servers: 1
+eval_start_end_use_all_servers: true

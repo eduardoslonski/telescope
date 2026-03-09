@@ -1,0 +1,27 @@
+# Countdown: create equations from numbers to reach a target
+# Good first example — simple, fast, no extra dependencies.
+#
+# Usage: uv run train.py --config configs/examples/example_countdown.yaml
+
+wandb_project: "telescope"
+wandb_run_name: "countdown"
+
+model: "Qwen/Qwen2.5-3B"
+
+inference_num_workers: 2
+trainer_num_workers: 2
+
+environments:
+  - name: "countdown"
+    reward_min: 0.0
+    reward_max: 2.0
+    kwargs:
+      add_thinking_prefix: true
+
+prompts_batch_size_for_trainer: 16
+group_size: 8
+number_of_steps: 300
+algorithm: "grpo"
+
+max_model_len: 4096
+max_tokens: 3600

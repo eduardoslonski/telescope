@@ -1,0 +1,43 @@
+# Code generation with sandboxed test execution
+#
+# Requires a sandbox provider — install the one you want to use:
+#   uv add daytona-sdk     (Daytona)
+#   uv add prime-sandboxes (Prime)
+#   uv add modal           (Modal)
+#   uv add e2b             (E2B)
+#
+# Set the API key for your chosen provider via environment variable:
+#   export DAYTONA_API_KEY="..."   (Daytona)
+#   export PRIME_API_KEY="..."     (Prime — or use `prime login`)
+#   export MODAL_TOKEN_ID="..."    (Modal)
+#   export E2B_API_KEY="..."       (E2B)
+#
+# Usage: uv run train.py --config configs/examples/example_i3_code.yaml
+
+wandb_project: "telescope"
+wandb_run_name: "i3_code"
+
+model: "Qwen/Qwen3-4B"
+
+inference_num_workers: 2
+trainer_num_workers: 2
+
+environments:
+  - name: "i3_code"
+    weight: 1.0
+    reward_min: 0.0
+    reward_max: 1.0
+    kwargs:
+      provider: "daytona" # or prime, modal, e2b, ...
+      # Sandbox resource limits (tune to fit your provider's quota):
+      pool_size: 10 # concurrent sandboxes (10 is the free limit in Daytona, will work but more optimal to use larger like 100)
+      memory_mb: 512 # per sandbox (default 2048 — too high for Daytona free tier)
+      disk_size_gb: 1
+
+prompts_batch_size_for_trainer: 16
+group_size: 8
+number_of_steps: 300
+algorithm: "grpo"
+
+max_model_len: 4096
+max_tokens: 2000

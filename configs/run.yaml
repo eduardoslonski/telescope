@@ -1,0 +1,88 @@
+# Telescope default configuration
+# All fields with their defaults — serves as documentation.
+# Override per-experiment in a run.yaml passed via --config.
+# Override on CLI: --learning_rate 5e-7  or  --learning-rate 5e-7
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model: "Qwen/Qwen2.5-3B"
+model_dtype: "float32" # "float32", "float16", "bfloat16"
+mixed_precision_dtype: "bfloat16" # FSDP mixed precision, or null to disable
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Environments
+# ══════════════════════════════════════════════════════════════════════════════
+
+environments:
+  - name: "countdown"
+    weight: 1.0
+    reward_min: 0.0
+    reward_max: 2.0
+
+checkpoint_every: false
+
+wandb_project: "telescope"
+wandb_run_name: "telescope_run"
+
+# ── Workers ──────────────────────────────────────────────────────────────────
+inference_num_workers: 2
+inference_tensor_parallel_size: 1
+trainer_num_workers: 2
+
+# ── Orchestrator ─────────────────────────────────────────────────────────────
+max_concurrent_prompts_per_server: 32
+prompts_batch_size_for_trainer: 16
+number_of_steps: 300
+max_async_rollout: 2
+discard_group_zero_advantage: true
+enable_prompt_prefetch: true
+prompt_prefetch_buffer_size: 8
+enable_individual_sample_lanes: True
+
+# ── Trainer ──────────────────────────────────────────────────────────────────
+learning_rate: 1.0e-6
+weight_decay: 0.0
+grad_clip: 1.0
+train_backend: "fsdp"
+
+# ── Algorithm ────────────────────────────────────────────────────────────────
+algorithm: "grpo"
+number_of_minibatches: 1
+use_ppo_clip: false
+ppo_clip_ref_logprobs: "rollout"
+clip_low: 0.4
+clip_high: 0.5
+sapo_tau_pos: 1.0
+sapo_tau_neg: 1.05
+advantage_norm: "group"
+use_tis: false
+tis_cap: 10
+tis_logprob_clamp: 2
+entropy_chunk_size: 2048
+
+# ── Sequence packing ────────────────────────────────────────────────────────
+seq_len: 4096
+pad_to_multiple_of: 64
+
+# ── Inference server ─────────────────────────────────────────────────────────
+inference_host: "0.0.0.0"
+inference_base_port: 8100
+gpu_memory_utilization: 0.9
+max_model_len: 4096
+vllm_scheduling_policy: "priority"
+enable_thinking: false
+
+# ── Rollout / sampling ───────────────────────────────────────────────────────
+group_size: 8
+temperature: 1.0
+max_tokens: 3600
+interleaved_rollouts: true
+
+# ── Evals ────────────────────────────────────────────────────────────────────
+eval_before_training: false
+eval_after_training: false
+eval_num_servers: 1
+eval_start_end_use_all_servers: false
+
+# ── vLLM tracing ────────────────────────────────────────────────────────────
+enable_vllm_tracing: true
+otlp_receiver_port: 4318

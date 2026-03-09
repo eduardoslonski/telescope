@@ -1,0 +1,74 @@
+# Telescope standalone eval — default configuration
+# All fields with their defaults. Override in a run config via --config.
+#
+# Required fields (must be set in your run config):
+#   wandb_run_path: "entity/project/run_id"
+#   evals: [{name: "math500", ...}, ...]
+#
+# Checkpoint sources (at least one required):
+#   checkpoint_dir: "/path/to/checkpoints"   # auto-discover step_N/ dirs
+#   checkpoints: [{path: "/path/to/ckpt", step: 100}, ...]  # explicit list
+#
+# hf_weights: false  (default) — checkpoint_dir contains native training checkpoints
+#                     (step_N/ with meta.json), converted to HF on the fly before eval
+# hf_weights: true   — checkpoint_dir contains already-converted HF checkpoints
+#                     (step_N/ with config.json)
+hf_weights: false
+
+# ── Inference ────────────────────────────────────────────────────────────────
+inference_num_workers: 1
+inference_tensor_parallel_size: 1
+gpu_memory_utilization: 0.9
+max_model_len: 4000
+max_concurrent_samples_per_server: 256
+vllm_scheduling_policy: "priority" # "priority" or "fcfs"
+enable_thinking: false
+
+# ── Sampling defaults ────────────────────────────────────────────────────────
+temperature: 1.0
+# top_p: null
+max_tokens: 3700
+
+# ── Ray cluster ──────────────────────────────────────────────────────────────
+ray_address: "auto"
+ray_auto_start_local: true
+ray_namespace: "telescope-eval"
+ray_log_to_driver: true
+ray_disable_runtime_env_hook: true
+ray_pin_py_executable: true
+ray_propagate_active_venv: true
+ray_propagate_run_dir: true
+ray_inference_cpus_per_worker: 4.0
+ray_inference_placement_strategy: "PACK" # PACK, SPREAD, STRICT_PACK, STRICT_SPREAD
+ray_placement_timeout_s: 900
+ray_shutdown_on_exit: false
+# ray_runtime_env: null
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+enable_prompt_prefetch: true
+inference_host: "0.0.0.0"
+inference_base_port: 8100
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Evals reference
+# ══════════════════════════════════════════════════════════════════════════════
+# Each entry: name (required), num_samples, kwargs,
+#             temperature, top_p, max_tokens, pass_k
+# All evals run on every checkpoint (no eval_every — that is a training concept).
+#
+# Available: math500 (dedicated eval), hendrycks_math, i3_math, i3_science,
+#            i3_logic, i3_code, acereason_math, countdown, ifeval, calculator,
+#            wordle, alphabet_sort, retry_math, fluxem_rl,
+#            mini_swe_agent_plus, acebench_agent_multistep
+#
+# evals:
+#   - name: "math500"
+#     num_samples: 500
+#     kwargs:
+#       dataset_name: "HuggingFaceH4/MATH-500"
+#       dataset_split: "test"
+#     temperature: 1.0
+#     max_tokens: 3000
+#   - name: "countdown"
+#     num_samples: 200
+#     kwargs: {}

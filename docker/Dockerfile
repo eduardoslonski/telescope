@@ -1,0 +1,102 @@
+# Telescope: RL post-training for LLMs
+#
+# Build:
+#   docker build -f docker/Dockerfile -t telescope .
+#
+# Run:
+#   docker run --gpus all --ipc=host --network=host --ulimit nofile=65536:65536 -it telescope bash
+#   docker run --gpus all --ipc=host --network=host --ulimit nofile=65536:65536 telescope train --config configs/run.yaml
+#
+# Install optional packages inside the container:
+#   uv add math-verify
+#   uv add megatron-core megatron-bridge
+
+# ── Base: vLLM v0.12.0 (torch, CUDA 12.x, Python 3.12) ─────────────────────
+FROM vllm/vllm-openai:v0.12.0
+
+ENV MAX_JOBS=32 \
+    DEBIAN_FRONTEND=noninteractive \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0 9.0a" \
+    NVTE_WITH_USERBUFFERS=1 \
+    NVTE_FRAMEWORK=pytorch \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# ── System packages ─────────────────────────────────────────────────────────
+# vLLM base image lacks CUDA dev headers needed for Apex/TE source builds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git cmake \
+        cuda-nvrtc-dev-12-9 cuda-nvtx-12-9 cuda-profiler-api-12-9 \
+        cuda-nvml-dev-12-9 \
+        libcusparse-dev-12-9 libcublas-dev-12-9 libcusolver-dev-12-9 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── uv (fast Python package manager) ────────────────────────────────────────
+ADD https://astral.sh/uv/install.sh /uv-installer.sh
+RUN UV_INSTALL_DIR="/usr/local/bin" sh /uv-installer.sh && rm /uv-installer.sh
+
+# ── Pin setuptools & wheel (>=80 breaks CUDA package builds) ────────────────
+# System wheel package shadows pip-installed version; remove it first.
+RUN apt-get remove -y --purge python3-wheel 2>/dev/null || true
+RUN uv pip install --system "setuptools>=77.0.3,<80" "wheel>=0.43"
+
+# ── Flash-attention (pre-built wheel, NOT compiled from source) ──────────────
+# Required by FSDP backend (transformers attn_implementation="flash_attention_2").
+RUN uv pip install --system --no-build-isolation flash-attn==2.8.1
+
+# ── NVIDIA APEX (fused LayerNorm, fused Adam, enables sequence parallel) ────
+RUN NVCC_APPEND_FLAGS="--threads 8" \
+    pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation \
+    --config-settings "--build-option=--cpp_ext" \
+    --config-settings "--build-option=--cuda_ext" \
+    git+https://github.com/NVIDIA/apex.git@25.04
+
+# ── Transformer Engine (FP8 training on Hopper GPUs) ────────────────────────
+# Symlink cuDNN headers for PyTorch extension builds (TE needs cudnn.h).
+# nvidia-cudnn-cu12 is pre-installed in vLLM base but headers aren't on the default include path.
+RUN ln -sf /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/include/cudnn*.h /usr/local/cuda/include/
+RUN uv pip install --system nvidia-mathdx pybind11
+RUN MAX_JOBS=8 NVTE_BUILD_THREADS_PER_JOB=4 CMAKE_BUILD_PARALLEL_LEVEL=1 \
+    uv pip install --system -v --no-build-isolation \
+    git+https://github.com/NVIDIA/TransformerEngine.git@stable
+
+
+# ── Fix known conflicts in vLLM base image (after all source builds) ────────
+# pynvml conflicts with nvidia-ml-py; libcudnn9 conflicts with torch's bundled cuDNN.
+RUN uv pip uninstall --system pynvml 2>/dev/null; uv pip install --system nvidia-ml-py
+RUN apt-get remove -y --purge --allow-change-held-packages libcudnn9* 2>/dev/null; \
+    apt-get autoremove -y 2>/dev/null || true
+
+# ── Copy project files ──────────────────────────────────────────────────────
+WORKDIR /root/telescope
+COPY pyproject.toml uv.lock train.py eval.py README.md ./
+COPY src/ src/
+COPY configs/ configs/
+COPY tools/ tools/
+
+# ── Install telescope ───────────────────────────────────────────────────────
+# Pre-sync .venv so `uv run` doesn't re-sync at runtime.
+# Enable system-site-packages so CUDA packages (flash-attn, apex, TE)
+# installed earlier into system Python remain visible in the venv.
+RUN ulimit -n 65536 && uv sync --frozen --no-dev \
+    && sed -i 's/include-system-site-packages = false/include-system-site-packages = true/' .venv/pyvenv.cfg
+
+ENV PATH="/root/telescope/.venv/bin:$PATH"
+
+# ── Persist env vars for SSH sessions ─────────────────────────────────────
+# Docker ENV vars aren't inherited by SSH login shells; write them to .bashrc
+# so interactive sessions (e.g. RunPod SSH) get the venv PATH and GPU vars.
+RUN echo 'export PATH="/root/telescope/.venv/bin:$PATH"' >> /root/.bashrc
+
+# ── Register CUDA stubs for Triton JIT linking ──────────────────────────────
+# Triton JIT-compiles CUDA utils with gcc -lcuda at runtime.  The CUDA stubs
+# directory provides a link-time libcuda.so; the real driver is loaded at
+# runtime via LD_LIBRARY_PATH (set by the NVIDIA container runtime).
+RUN echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/z-cuda-stubs.conf \
+    && ldconfig
+
+ENTRYPOINT []
+CMD ["/bin/bash"]
