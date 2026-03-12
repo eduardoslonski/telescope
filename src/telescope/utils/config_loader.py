@@ -128,20 +128,28 @@ def load_config(
         data = yaml.safe_load(f) or {}
 
     # Layer 2: run overrides
+    user_keys: set[str] = set()
     resolved = _resolve_config_path(run_yaml)
     if resolved is not None:
         print(f"[config] Using run config: {resolved}")
         with open(resolved) as f:
             run_data = yaml.safe_load(f) or {}
+        user_keys.update(run_data.keys())
         data = _deep_merge(data, run_data)
     else:
         print(f"[config] No run config found, using {DEFAULT_YAML} only")
 
     # Layer 3: CLI overrides
     for key, raw_value in (cli_overrides or []):
+        user_keys.add(key)
         _set_dotpath(data, key, raw_value)
 
-    return TelescopeConfig(**data)
+    # Build custom config: user-specified keys with final merged values
+    custom_config = {k: data[k] for k in user_keys if k in data}
+
+    cfg = TelescopeConfig(**data)
+    cfg._custom_config = custom_config
+    return cfg
 
 
 def _parse_extra_args(remaining: list[str]) -> list[tuple[str, str]]:

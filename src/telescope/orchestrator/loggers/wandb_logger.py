@@ -217,6 +217,11 @@ class WandbLogger:
         # Keep wandb run config in sync with telescope config automatically.
         run_config = config.cfg.model_dump()
 
+        # Include user-specified config (run YAML + CLI overrides) for the UI
+        custom_config = config.cfg.get_custom_config()
+        if custom_config:
+            run_config["_custom_config"] = custom_config
+
         # Parse tags from config or environment variable
         tags = list(config.cfg.wandb_tags) if config.cfg.wandb_tags else []
         env_tags = os.environ.get("WANDB_TAGS", "")
