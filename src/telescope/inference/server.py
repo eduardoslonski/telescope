@@ -41,6 +41,7 @@ def build_base_args(host: str = None, port: int = None, model: str = None):
     args.tensor_parallel_size = max(1, int(config.cfg.inference_tensor_parallel_size))
     args.worker_extension_cls = "telescope.inference.worker.NCCLWeightUpdateWorker"
     args.enable_prefix_caching = False
+    args.override_generation_config = {"max_new_tokens": None}
 
     # Scheduling policy: "priority" enables turn-aware scheduling for multi-turn
     args.scheduling_policy = config.cfg.vllm_scheduling_policy
