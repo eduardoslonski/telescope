@@ -2203,12 +2203,12 @@ class Orchestrator:
 
         step_metrics = []
         timeline_events = []
-        weight_sync_events = []
+        weight_sync_load_refs = []
 
         for result in step_results:
             step_metrics.extend(result.get("step_metrics", []))
             timeline_events.extend(result.get("timeline_events", []))
-            weight_sync_events.extend(result.get("weight_sync_events", []))
+            weight_sync_load_refs.extend(result.get("weight_sync_load_refs", []))
 
         self.wandb_logger.log_trainer_metrics_payload(
             step=step,
@@ -2221,6 +2221,14 @@ class Orchestrator:
         batch = self._step_batches.pop(step, None)
         if batch is not None:
             self.wandb_logger.log_rollout_reward_metrics(step, batch)
+
+        # Resolve inference timing asynchronously.  By this point inference is
+        # almost certainly done (the training step took seconds).  Using
+        # asyncio.to_thread so the event loop stays responsive.
+        if weight_sync_load_refs:
+            weight_sync_events = await asyncio.to_thread(ray.get, weight_sync_load_refs)
+        else:
+            weight_sync_events = []
 
         for event in weight_sync_events:
             self.wandb_logger.log_inference_event(

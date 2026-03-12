@@ -294,36 +294,24 @@ def setup_inference_communicator_for_group(
     return communicator
 
 
-def send_weights_to_inference(
+def prepare_weights_for_broadcast(
     backend: TrainingBackend,
-    communicator: PyNcclCommunicator | None,
     step: int | None = None,
     tracker: GPUTimelineLogger | _NullTracker | None = None,
-):
+) -> dict[str, torch.Tensor] | None:
     """
-    Send model weights from trainer to inference via NCCL broadcast.
-    
-    Uses the backend's gather_weights_for_inference() to get a HuggingFace-format
-    state dict (works for both FSDP and Megatron backends).
-    
+    Phase 1 of weight sync: gather weights and barrier.
+
+    All trainer ranks must call this collectively.  Returns the gathered
+    state dict on the broadcast rank (optionally CPU-staged), ``None``
+    on other ranks.
+
     IMPORTANT: We must barrier AFTER gathering but BEFORE broadcasting.
-    
+
     The gather operation uses collective ops (all-gather for FSDP shards or
     TP shards). If the broadcast rank finishes gathering and immediately starts
     broadcasting to inference (different NCCL group), other ranks get stuck
     waiting to participate in the gather = DEADLOCK.
-    
-    Flow:
-    1. All ranks gather state dict (collective operation via backend)
-    2. Barrier — ensure ALL ranks finished gathering
-    3. Only the broadcast rank broadcasts to inference
-    4. Final barrier — sync before next step
-    
-    Timeline events logged (when tracker provided):
-    - gather_state_dict: Backend gathers weights (FSDP all-gather / Megatron TP all-gather + conversion)
-    - barrier_pre: Barrier before broadcast
-    - nccl_broadcast: Actual NCCL broadcast to inference (broadcast rank only)
-    - barrier_post: Final sync barrier
     """
     rank = backend.rank
     is_broadcast_rank = backend.is_weight_broadcast_rank
@@ -347,14 +335,39 @@ def send_weights_to_inference(
     # Non-broadcast ranks no longer need gathered weights.
     if not is_broadcast_rank:
         del state_dict
+        return None
 
-    # Step 3: Broadcast rank sends to inference
+    # Optional: stage to CPU to reduce GPU peak memory during broadcast.
+    if config.cfg.weight_broadcast_cpu_staging:
+        with _track("stage_state_dict_cpu"):
+            state_dict = _stage_state_dict_to_cpu(state_dict, rank)
+
+    return state_dict
+
+
+def broadcast_weights_to_inference(
+    backend: TrainingBackend,
+    state_dict: dict[str, torch.Tensor] | None,
+    communicator: PyNcclCommunicator | None,
+    step: int | None = None,
+    tracker: GPUTimelineLogger | _NullTracker | None = None,
+):
+    """
+    Phase 2 of weight sync: NCCL broadcast and final barrier.
+
+    All trainer ranks must call this collectively.  Only the broadcast rank
+    actually sends data; other ranks participate in the final barrier.
+    """
+    rank = backend.rank
+    is_broadcast_rank = backend.is_weight_broadcast_rank
+
+    def _track(name: str):
+        if tracker is not None:
+            return tracker.track(name)
+        return nullcontext()
+
     should_cleanup_state_dict = False
     if is_broadcast_rank:
-        if config.cfg.weight_broadcast_cpu_staging:
-            with _track("stage_state_dict_cpu"):
-                state_dict = _stage_state_dict_to_cpu(state_dict, rank)
-
         _log.debug("Starting broadcast to inference", step=step, rank=rank)
         with _track("nccl_broadcast"):
             _broadcast_state_dict(state_dict, communicator, rank)
@@ -363,7 +376,7 @@ def send_weights_to_inference(
     else:
         _log.debug("Waiting for broadcast rank to finish sending to inference", step=step, rank=rank)
 
-    # Step 4: Final sync barrier
+    # Final sync barrier
     with _track("barrier_post"):
         backend.barrier()
     _log.debug("Barrier after broadcast completed", step=step, rank=rank)
@@ -373,6 +386,22 @@ def send_weights_to_inference(
     if should_cleanup_state_dict:
         with _track("cleanup_state_dict"):
             del state_dict
+
+
+def send_weights_to_inference(
+    backend: TrainingBackend,
+    communicator: PyNcclCommunicator | None,
+    step: int | None = None,
+    tracker: GPUTimelineLogger | _NullTracker | None = None,
+):
+    """
+    Send model weights from trainer to inference via NCCL broadcast.
+
+    Convenience wrapper that calls :func:`prepare_weights_for_broadcast`
+    followed by :func:`broadcast_weights_to_inference`.
+    """
+    state_dict = prepare_weights_for_broadcast(backend, step=step, tracker=tracker)
+    broadcast_weights_to_inference(backend, state_dict, communicator, step=step, tracker=tracker)
 
 
 def _broadcast_state_dict(state_dict: dict, communicator: PyNcclCommunicator, rank: int):

@@ -24,6 +24,8 @@ from telescope.trainer.backends import create_backend
 from telescope.trainer.metrics import GPUTimelineLogger, create_timeline_tracker
 from telescope.trainer.metrics.torch_memory_logger import TorchMemoryLogger
 from telescope.trainer.weight_sync import (
+    broadcast_weights_to_inference,
+    prepare_weights_for_broadcast,
     send_weights_to_inference,
     setup_inference_communicator,
     setup_inference_communicator_for_group,
@@ -1678,22 +1680,34 @@ class TrainerRayActor:
         actors: list,
         step: int | None = None,
         tracker=None,
-    ) -> list[dict[str, Any]]:
-        """Core weight broadcast: gather → NCCL send → inference load_weights."""
+    ) -> list:
+        """Core weight broadcast: gather → fire inference → NCCL send.
+
+        Returns Ray ObjectRefs for deferred collection of inference timing.
+        The trainer GPU is free as soon as ``barrier_post`` completes.
+        """
         is_broadcast_rank = self._backend.is_weight_broadcast_rank
 
+        # Phase 1: Gather weights (collective) + barrier
+        state_dict = prepare_weights_for_broadcast(
+            self._backend, step=step, tracker=tracker,
+        )
+
+        # NOW fire inference — gather is done, broadcast imminent.
+        # Inference serves requests during the gather phase above instead
+        # of blocking in comm.broadcast() waiting for the trainer.
         load_refs = []
         if is_broadcast_rank:
             load_refs = [actor.load_weights.remote(group=group_name) for actor in actors]
 
-        send_weights_to_inference(
-            self._backend, communicator, step=step, tracker=tracker,
+        # Phase 2: NCCL broadcast + final barrier
+        broadcast_weights_to_inference(
+            self._backend, state_dict, communicator, step=step, tracker=tracker,
         )
 
-        weight_sync_events = []
-        if load_refs:
-            weight_sync_events = ray.get(load_refs)
-        return weight_sync_events
+        # Return ObjectRefs — don't block on ray.get.
+        # Timing is collected by the orchestrator asynchronously.
+        return load_refs
 
     # ------------------------------------------------------------------
     # Train step
@@ -1753,7 +1767,7 @@ class TrainerRayActor:
                 step=step, rank=self.rank,
             )
         with tracker.track("weight_broadcast"):
-            weight_sync_events = self._broadcast_weights_impl(
+            load_refs = self._broadcast_weights_impl(
                 communicator=communicator,
                 group_name=group_name,
                 actors=actors_for_broadcast,
@@ -1768,7 +1782,7 @@ class TrainerRayActor:
         if is_broadcast_rank:
             _trainer_log.info(
                 f"Weight sync complete (group={group_name}, "
-                f"inference_servers_ack={len(weight_sync_events)})",
+                f"inference_servers={len(load_refs)})",
                 step=step, rank=self.rank,
             )
 
@@ -1822,7 +1836,7 @@ class TrainerRayActor:
             "train_metrics": metrics,
             "step_metrics": step_metrics,
             "timeline_events": timeline_events,
-            "weight_sync_events": weight_sync_events,
+            "weight_sync_load_refs": load_refs,
             "eval_step": is_eval_step,
             "weight_sync_group": group_name,
         }
@@ -1887,11 +1901,13 @@ class TrainerRayActor:
         """Broadcast current model weights to inference servers. All actors must call simultaneously."""
         if self._backend is None:
             raise RuntimeError("Trainer backend not initialized")
-        return self._broadcast_weights_impl(
+        load_refs = self._broadcast_weights_impl(
             communicator=self._communicator,
             group_name="full",
             actors=self._inference_actors,
         )
+        # For standalone calls (checkpoint restore), resolve immediately.
+        return ray.get(load_refs) if load_refs else []
 
     def shutdown(self) -> bool:
         self._stop_torch_memory_logger()

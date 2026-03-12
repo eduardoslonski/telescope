@@ -206,14 +206,26 @@ class NCCLWeightUpdateWorker:
 
     def load_weights(self, group: str = "full"):
         """Load new weights from trainer using the specified NCCL group."""
-        start = time.time()
         self._log(f"loading weights from trainer (group={group})")
+
+        # Use CUDA events for accurate GPU timing.  The raw ncclBroadcast()
+        # calls in receive_state_dict() are async on CUDA — they enqueue
+        # kernels and return immediately.  Without event sync, wall-clock
+        # timing only captures enqueue time, not actual data transfer.
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
 
         model = self.model_runner.model
         state_iter = self.receive_state_dict(group=group)
         model.load_weights(state_iter)
 
-        self._log(f"weights loaded in {time.time() - start:.2f}s (group={group})")
+        end_event.record()
+        end_event.synchronize()  # Targeted: waits for this stream up to this event only
+
+        elapsed_ms = start_event.elapsed_time(end_event)
+        self._log(f"weights loaded in {elapsed_ms / 1000:.2f}s (group={group})")
 
     def collect_torch_memory_metrics(self) -> list[dict]:
         """
