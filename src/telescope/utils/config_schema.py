@@ -182,6 +182,7 @@ class TelescopeConfig(BaseModel, extra="forbid"):
     max_model_len: int = Field(ge=1)
     vllm_scheduling_policy: Literal["priority", "fcfs"]
     enable_thinking: bool
+    chat_template: str | None = None
 
     # Rollout / sampling
     group_size: int = Field(ge=1)

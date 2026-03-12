@@ -111,6 +111,7 @@ gpu_memory_utilization: 0.9
 max_model_len: 4096
 vllm_scheduling_policy: "priority" # "priority" = turn-aware scheduling for multi-turn; "fcfs" = first-come-first-served
 enable_thinking: false # pass enable_thinking=True/False to apply_chat_template (e.g. Qwen3 thinking mode)
+chat_template: null # Jinja2 chat template string; null = use tokenizer's built-in template. Required for base models without a chat_template (e.g. allenai/OLMo-3-1025-7B).
 
 # ── Rollout / sampling ───────────────────────────────────────────────────────
 group_size: 8

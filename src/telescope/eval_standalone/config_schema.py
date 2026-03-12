@@ -67,6 +67,7 @@ class EvalStandaloneConfig(BaseModel, extra="forbid"):
     max_concurrent_samples_per_server: int = Field(default=256, ge=1)
     vllm_scheduling_policy: Literal["priority", "fcfs"] = "priority"
     enable_thinking: bool = False
+    chat_template: str | None = None
 
     # Sampling defaults
     temperature: float = Field(default=1.0, ge=0)

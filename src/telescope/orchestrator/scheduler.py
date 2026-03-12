@@ -250,6 +250,14 @@ def create_scheduler(
     _log.debug(f"Loading tokenizer for model: {config.cfg.model}")
     _log.debug(f"Loading tokenizer with trust_remote_code=True")
     tokenizer = AutoTokenizer.from_pretrained(config.cfg.model, trust_remote_code=True)
+    if config.cfg.chat_template is not None:
+        _log.info(f"Overriding tokenizer chat_template from config")
+        tokenizer.chat_template = config.cfg.chat_template
+    elif not getattr(tokenizer, "chat_template", None):
+        _log.warning(
+            f"Tokenizer for {config.cfg.model} has no chat_template. "
+            f"Set 'chat_template' in your config to provide one."
+        )
     _log.debug(f"Tokenizer loaded: vocab_size={tokenizer.vocab_size}, eos_token={repr(tokenizer.eos_token)}")
     
     # Load environments
