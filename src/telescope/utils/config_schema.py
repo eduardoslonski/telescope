@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +54,12 @@ class EvalEntry(BaseModel, extra="forbid"):
 # ---------------------------------------------------------------------------
 
 class TelescopeConfig(BaseModel, extra="forbid"):
+
+    _custom_config: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    def get_custom_config(self) -> dict[str, Any]:
+        """Return the user-specified config (run YAML + CLI overrides)."""
+        return dict(self._custom_config)
 
     # General
     debug: bool
