@@ -23,6 +23,7 @@ max_model_len: 4000
 max_concurrent_samples_per_server: 256
 vllm_scheduling_policy: "priority" # "priority" or "fcfs"
 enable_thinking: false
+chat_template: null # Jinja2 chat template string; null = use tokenizer's built-in template
 
 # ── Sampling defaults ────────────────────────────────────────────────────────
 temperature: 1.0

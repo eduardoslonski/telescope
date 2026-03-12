@@ -188,6 +188,7 @@ def _install_compat_config(
         max_concurrent_prompts_per_server=eval_cfg.max_concurrent_samples_per_server,
         vllm_scheduling_policy=eval_cfg.vllm_scheduling_policy,
         enable_thinking=eval_cfg.enable_thinking,
+        chat_template=eval_cfg.chat_template,
         # Sampling
         temperature=eval_cfg.temperature,
         top_p=eval_cfg.top_p,
@@ -571,6 +572,14 @@ async def _run_eval_async(eval_cfg: EvalStandaloneConfig) -> None:
         tokenizer_path = os.path.join(first_ckpt_path, "hf_meta")
     _log.info(f"Loading tokenizer from {tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    if eval_cfg.chat_template is not None:
+        _log.info("Overriding tokenizer chat_template from config")
+        tokenizer.chat_template = eval_cfg.chat_template
+    elif not getattr(tokenizer, "chat_template", None):
+        _log.warning(
+            f"Tokenizer has no chat_template. "
+            f"Set 'chat_template' in your config to provide one."
+        )
 
     # Init Ray
     _log.info("Initializing Ray cluster")
