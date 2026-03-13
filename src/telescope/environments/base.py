@@ -118,10 +118,12 @@ class Environment(ABC):
     reward_min: float | None = None
     reward_max: float | None = None
     
-    # Known ranges for sample_metrics: {"metric_name": {"min": float, "max": float}, ...}
+    # Known ranges for sample_metrics: {"metric_name": {"min": float, "max": float, "invert": bool}, ...}
     # Override in subclasses to declare known min/max bounds for metrics.
     # Used by the UI to display normalized charts.
-    metrics_ranges: dict[str, dict[str, float]] = {}
+    # Set "invert": True when lower values are better (e.g. num_errors), so the UI
+    # colors min as green and max as red instead of the default min=red, max=green.
+    metrics_ranges: dict[str, dict[str, float | bool]] = {}
     
     @property
     def is_multi_turn(self) -> bool:
