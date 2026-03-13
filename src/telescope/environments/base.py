@@ -40,6 +40,7 @@ class RewardResult:
     info_turns: list[dict[str, Any]] = field(default_factory=list)  # Per-turn text info (e.g. stderr, summaries)
     # Each dict: {"turn_order": int, "info_key": str, "info_value": str, "info_type": str}
     # info_type defaults to "text", can also be "stderr", "stdout", etc.
+    sample_tags: dict[str, str] = field(default_factory=dict)  # Per-sample string tags for filtering (e.g. {"style": "4 numbers", "task": "coding"})
 
 
 @dataclass
@@ -48,6 +49,7 @@ class EvalMetricsResult:
     metrics: dict[str, float] = field(default_factory=dict)
     golden_answers: dict[str, str | None] = field(default_factory=dict)
     info_turns: list[dict[str, Any]] = field(default_factory=list)
+    sample_tags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -124,7 +126,12 @@ class Environment(ABC):
     # Set "invert": True when lower values are better (e.g. num_errors), so the UI
     # colors min as green and max as red instead of the default min=red, max=green.
     metrics_ranges: dict[str, dict[str, float | bool]] = {}
-    
+
+    # Known options for sample_tags: {"tag_name": ["option1", "option2", ...], ...}
+    # Override in subclasses to declare known tag names and their possible values.
+    # Used by the UI for filtering (e.g. show only samples with tag "task" == "coding").
+    tags_options: dict[str, list[str]] = {}
+
     @property
     def is_multi_turn(self) -> bool:
         """Whether this environment requires multi-turn rollouts."""
@@ -204,6 +211,7 @@ class Environment(ABC):
             metrics=reward_result.sample_metrics,
             golden_answers=reward_result.golden_answers,
             info_turns=reward_result.info_turns,
+            sample_tags=reward_result.sample_tags,
         )
 
     def get_sample(self, idx: int) -> Sample:
@@ -501,6 +509,7 @@ class MultiTurnEnvironment(Environment):
             metrics=reward_result.sample_metrics,
             golden_answers=reward_result.golden_answers,
             info_turns=reward_result.info_turns,
+            sample_tags=reward_result.sample_tags,
         )
 
     def load_dataset(self, num_samples: int = -1, **kwargs) -> list[Sample]:

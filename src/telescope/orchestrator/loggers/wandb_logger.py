@@ -499,6 +499,8 @@ class WandbLogger:
                 info["max_turns"] = getattr(env, "max_turns", None)
             if env.metrics_ranges:
                 info["metrics_ranges"] = env.metrics_ranges
+            if env.tags_options:
+                info["tags_options"] = env.tags_options
             env_details.append(info)
 
         self.run.summary["env_details"] = json.dumps(env_details)
@@ -530,6 +532,8 @@ class WandbLogger:
                     base_ranges[f"pass^{k}/{metric_name}"] = {"min": 0, "max": 1}
             if base_ranges:
                 info["metrics_ranges"] = base_ranges
+            if env.tags_options:
+                info["tags_options"] = env.tags_options
             eval_env_details.append(info)
 
         self.run.summary["eval_env_details"] = json.dumps(eval_env_details)
@@ -719,6 +723,7 @@ class WandbLogger:
         sample_metrics: dict[str, float] | None = None,
         golden_answers: dict[str, str | None] | None = None,
         info_turns: list[dict] | None = None,
+        sample_tags: dict[str, str] | None = None,
         tokens_prompt: int = 0,
         system_prompt: str = "",
         tokens_system_prompt: int = 0,
@@ -751,6 +756,7 @@ class WandbLogger:
             sample_metrics: Dict of per-sample metric names to float values
             golden_answers: Dict mapping golden answer keys to their values
             info_turns: List of per-turn text info dicts (see EventLogger.log_rollout)
+            sample_tags: Dict of per-sample string tags for filtering
             tokens_prompt: Number of prompt tokens (stored in prompts_discarded table)
             system_prompt: The system message (if any)
             tokens_system_prompt: Number of tokens in the system message
@@ -775,6 +781,7 @@ class WandbLogger:
             sample_metrics=sample_metrics,
             golden_answers=golden_answers,
             info_turns=info_turns,
+            sample_tags=sample_tags,
             tokens_prompt=tokens_prompt,
             system_prompt=system_prompt,
             tokens_system_prompt=tokens_system_prompt,

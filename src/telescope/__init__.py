@@ -25,6 +25,7 @@ table_schema_versions = {
     "rollouts_metrics": "0.1",
     "golden_answers": "0.1",
     "info_turns": "0.1",
+    "sample_tags": "0.1",
     "metrics": "0.2",
     # discarded tables (events zip)
     "prompts_discarded": "0.1",
@@ -33,6 +34,7 @@ table_schema_versions = {
     "rollouts_metrics_discarded": "0.1",
     "golden_answers_discarded": "0.1",
     "info_turns_discarded": "0.1",
+    "sample_tags_discarded": "0.1",
     # eval tables (events zip)
     "prompts_eval": "0.1",
     "rollouts_eval": "0.1",
@@ -40,5 +42,6 @@ table_schema_versions = {
     "rollouts_metrics_eval": "0.1",
     "golden_answers_eval": "0.1",
     "info_turns_eval": "0.1",
+    "sample_tags_eval": "0.1",
 }
 

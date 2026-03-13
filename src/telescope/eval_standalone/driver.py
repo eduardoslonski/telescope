@@ -61,6 +61,7 @@ from telescope.orchestrator.loggers.event_logger import (
     ROLLOUTS_METRICS_EVAL_SCHEMA,
     GOLDEN_ANSWERS_EVAL_SCHEMA,
     INFO_TURNS_EVAL_SCHEMA,
+    SAMPLE_TAGS_EVAL_SCHEMA,
 )
 from telescope.utils.config_schema import TelescopeConfig
 from telescope.utils.ray_runtime.runtime import (
@@ -353,6 +354,7 @@ def _collect_eval_objects(
                 sample_metrics=sr.metrics,
                 golden_answers=sr.golden_answers,
                 info_turns=sr.info_turns,
+                sample_tags=sr.sample_tags,
                 compute_eval_metrics_time=sr.compute_eval_metrics_time,
                 tail_idx=0,
             ))
@@ -500,6 +502,29 @@ def _info_turns_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
     return pa.table(data, schema=INFO_TURNS_EVAL_SCHEMA)
 
 
+def _sample_tags_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
+    if not rollouts:
+        return pa.table({f.name: pa.array([], type=f.type) for f in SAMPLE_TAGS_EVAL_SCHEMA})
+    steps, eval_names, sample_idxs, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], []
+    for r in rollouts:
+        for tag_name, tag_value in r.sample_tags.items():
+            steps.append(r.step)
+            eval_names.append(r.eval_name)
+            sample_idxs.append(r.sample_idx)
+            comp_idxs.append(r.completion_idx)
+            envs.append(r.env)
+            tag_names.append(tag_name)
+            tag_values.append(str(tag_value))
+            tail_idxs.append(r.tail_idx)
+    data = {
+        "step": steps, "eval_name": eval_names,
+        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+        "env": envs, "tag_name": tag_names,
+        "tag_value": tag_values, "tail_idx": tail_idxs,
+    }
+    return pa.table(data, schema=SAMPLE_TAGS_EVAL_SCHEMA)
+
+
 # ---------------------------------------------------------------------------
 # Zip upload
 # ---------------------------------------------------------------------------
@@ -523,6 +548,7 @@ def _upload_eval_zip(
     metrics_table = _rollouts_metrics_eval_to_table(all_rollouts)
     golden_answers_table = _golden_answers_eval_to_table(all_rollouts)
     info_turns_table = _info_turns_eval_to_table(all_rollouts)
+    sample_tags_table = _sample_tags_eval_to_table(all_rollouts)
 
     steps = [p.step for p in all_prompts]
     metadata: dict[str, Any] = {
@@ -543,6 +569,7 @@ def _upload_eval_zip(
         _write_table(zf, "rollouts_metrics_eval.parquet", metrics_table)
         _write_table(zf, "golden_answers_eval.parquet", golden_answers_table)
         _write_table(zf, "info_turns_eval.parquet", info_turns_table)
+        _write_table(zf, "sample_tags_eval.parquet", sample_tags_table)
         zf.writestr("metadata.json", json.dumps(metadata))
 
     wandb_run.save(str(dest_path), base_path=wandb_run.dir, policy="now")

@@ -9,7 +9,7 @@ All events are stored together in unified zip archives:
   Contains: orchestrator.parquet, trainer.parquet, inference.parquet, gpu.parquet, cpu.parquet, vllm.parquet,
             rollouts_discarded.parquet, rollouts_metrics_discarded.parquet,
             golden_answers_discarded.parquet, info_turns_discarded.parquet,
-            samples_data_discarded.parquet, prompts_discarded.parquet
+            sample_tags_discarded.parquet, samples_data_discarded.parquet, prompts_discarded.parquet
 - events/block_live.zip: Current 30-minute block with all parquet files
 - events/block_*.zip: Finalized 30-minute blocks
 
@@ -241,6 +241,16 @@ GOLDEN_ANSWERS_SCHEMA = pa.schema([
     ("value", pa.string()),  # Golden answer value (null if not available)
 ])
 
+# Sample tags schema - per-sample string tags for filtering
+# Each row represents one tag key/value for one sample
+SAMPLE_TAGS_SCHEMA = pa.schema([
+    ("step", pa.int32()),
+    ("sample_idx", pa.int32()),
+    ("env", pa.string()),  # Environment name
+    ("tag_name", pa.string()),  # Tag key (e.g. "style", "task")
+    ("tag_value", pa.string()),  # Tag value (e.g. "4 numbers", "coding")
+])
+
 STEP_METRICS_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("section", pa.string()),
@@ -342,6 +352,15 @@ INFO_TURNS_DISCARDED_SCHEMA = pa.schema([
     ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this was first uploaded
 ])
 
+# Discarded sample tags schema - per-sample string tags for discarded samples
+SAMPLE_TAGS_DISCARDED_SCHEMA = pa.schema([
+    ("sample_idx", pa.int32()),
+    ("env", pa.string()),
+    ("tag_name", pa.string()),
+    ("tag_value", pa.string()),
+    ("tail_idx", pa.int32()),
+])
+
 # ---- Eval schemas (parallel to discarded, for eval completions) ----
 
 PROMPTS_EVAL_SCHEMA = pa.schema([
@@ -419,6 +438,17 @@ INFO_TURNS_EVAL_SCHEMA = pa.schema([
     ("tail_idx", pa.int32()),
 ])
 
+SAMPLE_TAGS_EVAL_SCHEMA = pa.schema([
+    ("step", pa.int32()),
+    ("eval_name", pa.string()),
+    ("sample_idx", pa.int32()),
+    ("completion_idx", pa.int32()),
+    ("env", pa.string()),
+    ("tag_name", pa.string()),
+    ("tag_value", pa.string()),
+    ("tail_idx", pa.int32()),
+])
+
 
 @dataclass
 class Event:
@@ -479,6 +509,7 @@ class Rollout:
     sample_metrics: dict[str, float]  # Per-sample metrics: reward components + any other metrics
     golden_answers: dict[str, str | None] = field(default_factory=dict)  # Golden answer per reward component
     info_turns: list[dict] = field(default_factory=list)  # Per-turn text info (e.g. stderr, summaries)
+    sample_tags: dict[str, str] = field(default_factory=dict)  # Per-sample string tags for filtering
     total_tokens: int = 0  # Total tokens passed to trainer
     raw_string: str = ""  # Decoded raw input passed to trainer
     compute_reward_time: float = 0.0  # Time in seconds for compute_reward() call
@@ -526,6 +557,7 @@ class DiscardedRollout:
     sample_metrics: dict[str, float]  # Per-sample metrics: reward components + any other metrics
     golden_answers: dict[str, str | None] = field(default_factory=dict)  # Golden answer per reward component
     info_turns: list[dict] = field(default_factory=list)  # Per-turn text info (e.g. stderr, summaries)
+    sample_tags: dict[str, str] = field(default_factory=dict)  # Per-sample string tags for filtering
     total_tokens: int = 0  # Total tokens that would have been passed to trainer
     raw_string: str = ""  # Decoded raw input that would have been passed to trainer
     compute_reward_time: float = 0.0  # Time in seconds for compute_reward() call
@@ -595,6 +627,7 @@ class EvalRollout:
     sample_metrics: dict[str, float] = field(default_factory=dict)
     golden_answers: dict[str, str | None] = field(default_factory=dict)
     info_turns: list[dict] = field(default_factory=list)
+    sample_tags: dict[str, str] = field(default_factory=dict)
     compute_eval_metrics_time: float = 0.0
     tail_idx: int = -1
 
@@ -847,6 +880,7 @@ class EventLogger:
         sample_metrics: dict[str, float] | None = None,
         golden_answers: dict[str, str | None] | None = None,
         info_turns: list[dict] | None = None,
+        sample_tags: dict[str, str] | None = None,
         tokens_prompt: int = 0,
         system_prompt: str = "",
         tokens_system_prompt: int = 0,
@@ -879,6 +913,8 @@ class EventLogger:
                        - "info_key": str (e.g. "stderr", "summary")
                        - "info_value": str (the text content)
                        - "info_type": str (default "text", can be "stderr", "stdout", etc.)
+            sample_tags: Dict of per-sample string tags for filtering
+                        (e.g. {"style": "4 numbers", "task": "coding"})
             tokens_prompt: Number of prompt tokens (stored in prompts table)
             system_prompt: The system message (if any)
             tokens_system_prompt: Number of tokens in the system message
@@ -912,6 +948,7 @@ class EventLogger:
             sample_metrics=sample_metrics or {},
             golden_answers=golden_answers or {},
             info_turns=info_turns or [],
+            sample_tags=sample_tags or {},
             total_tokens=total_tokens,
             raw_string=raw_string,
             compute_reward_time=compute_reward_time,
@@ -1059,6 +1096,7 @@ class EventLogger:
         sample_metrics: dict[str, float] | None = None,
         golden_answers: dict[str, str | None] | None = None,
         info_turns: list[dict] | None = None,
+        sample_tags: dict[str, str] | None = None,
         tokens_prompt: int = 0,
         system_prompt: str = "",
         tokens_system_prompt: int = 0,
@@ -1073,7 +1111,7 @@ class EventLogger:
         These are rollouts that were not sent to the trainer due to:
         - max_async: Async level exceeded the maximum allowed
         - zero_advantage: All samples in the group had zero advantage
-        
+
         Args:
             discard_reason: Why the rollout was discarded (e.g. "max_async", "zero_advantage")
             trainer_step: Current trainer step at the time of discarding
@@ -1092,6 +1130,7 @@ class EventLogger:
             sample_metrics: Dict of per-sample metric names to values
             golden_answers: Dict mapping golden answer keys to their values
             info_turns: List of per-turn text info dicts (see log_rollout)
+            sample_tags: Dict of per-sample string tags for filtering
             tokens_prompt: Number of prompt tokens (stored in prompts_discarded table)
             system_prompt: The system message (if any)
             tokens_system_prompt: Number of tokens in the system message
@@ -1131,6 +1170,7 @@ class EventLogger:
             sample_metrics=sample_metrics or {},
             golden_answers=golden_answers or {},
             info_turns=info_turns or [],
+            sample_tags=sample_tags or {},
             total_tokens=total_tokens,
             raw_string=raw_string,
             compute_reward_time=compute_reward_time,
@@ -1630,6 +1670,40 @@ class EventLogger:
         }
         return pa.table(data, schema=INFO_TURNS_SCHEMA)
 
+    def _sample_tags_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+        """Convert rollouts' sample_tags to a normalized table (one row per tag per rollout)."""
+        if not rollouts:
+            return pa.table({
+                "step": pa.array([], type=pa.int32()),
+                "sample_idx": pa.array([], type=pa.int32()),
+                "env": pa.array([], type=pa.string()),
+                "tag_name": pa.array([], type=pa.string()),
+                "tag_value": pa.array([], type=pa.string()),
+            })
+
+        steps = []
+        sample_idxs = []
+        envs = []
+        tag_names = []
+        tag_values = []
+
+        for gen in rollouts:
+            for tag_name, tag_value in gen.sample_tags.items():
+                steps.append(gen.step)
+                sample_idxs.append(gen.sample_idx)
+                envs.append(gen.env)
+                tag_names.append(tag_name)
+                tag_values.append(str(tag_value))
+
+        data = {
+            "step": steps,
+            "sample_idx": sample_idxs,
+            "env": envs,
+            "tag_name": tag_names,
+            "tag_value": tag_values,
+        }
+        return pa.table(data, schema=SAMPLE_TAGS_SCHEMA)
+
     def _step_metrics_to_table(self, step_metrics: list[StepMetric]) -> pa.Table:
         """Convert list of step metrics to PyArrow table."""
         if not step_metrics:
@@ -1919,6 +1993,40 @@ class EventLogger:
         }
         return pa.table(data, schema=INFO_TURNS_DISCARDED_SCHEMA)
 
+    def _sample_tags_discarded_to_table(self, rollouts: list[DiscardedRollout]) -> pa.Table:
+        """Convert discarded rollouts' sample_tags to a normalized table."""
+        if not rollouts:
+            return pa.table({
+                "sample_idx": pa.array([], type=pa.int32()),
+                "env": pa.array([], type=pa.string()),
+                "tag_name": pa.array([], type=pa.string()),
+                "tag_value": pa.array([], type=pa.string()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        sample_idxs = []
+        envs = []
+        tag_names = []
+        tag_values = []
+        tail_idxs = []
+
+        for gen in rollouts:
+            for tag_name, tag_value in gen.sample_tags.items():
+                sample_idxs.append(gen.sample_idx)
+                envs.append(gen.env)
+                tag_names.append(tag_name)
+                tag_values.append(str(tag_value))
+                tail_idxs.append(gen.tail_idx)
+
+        data = {
+            "sample_idx": sample_idxs,
+            "env": envs,
+            "tag_name": tag_names,
+            "tag_value": tag_values,
+            "tail_idx": tail_idxs,
+        }
+        return pa.table(data, schema=SAMPLE_TAGS_DISCARDED_SCHEMA)
+
     # ------------------------------------------------------------------
     # Eval table converters (mirror discarded pattern)
     # ------------------------------------------------------------------
@@ -2053,6 +2161,29 @@ class EventLogger:
         }
         return pa.table(data, schema=INFO_TURNS_EVAL_SCHEMA)
 
+    def _sample_tags_eval_to_table(self, rollouts: list[EvalRollout]) -> pa.Table:
+        """Convert eval rollouts' sample_tags to a normalized table."""
+        if not rollouts:
+            return pa.table({f.name: pa.array([], type=f.type) for f in SAMPLE_TAGS_EVAL_SCHEMA})
+        steps, eval_names, sample_idxs, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], []
+        for r in rollouts:
+            for tag_name, tag_value in r.sample_tags.items():
+                steps.append(r.step)
+                eval_names.append(r.eval_name)
+                sample_idxs.append(r.sample_idx)
+                comp_idxs.append(r.completion_idx)
+                envs.append(r.env)
+                tag_names.append(tag_name)
+                tag_values.append(str(tag_value))
+                tail_idxs.append(r.tail_idx)
+        data = {
+            "step": steps, "eval_name": eval_names,
+            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+            "env": envs, "tag_name": tag_names,
+            "tag_value": tag_values, "tail_idx": tail_idxs,
+        }
+        return pa.table(data, schema=SAMPLE_TAGS_EVAL_SCHEMA)
+
     def _write_parquet_to_wandb(self, table: pa.Table, path: str):
         """Write a PyArrow table to W&B as a parquet file."""
         if self.run is None:
@@ -2131,6 +2262,7 @@ class EventLogger:
         discarded_golden_answers_table = self._golden_answers_discarded_to_table(discarded_gens)
         discarded_samples_data_table = self._samples_data_discarded_to_table(discarded_gens)
         discarded_info_turns_table = self._info_turns_discarded_to_table(discarded_gens)
+        discarded_sample_tags_table = self._sample_tags_discarded_to_table(discarded_gens)
 
         # Convert eval prompts and rollouts (empty lists if None)
         eval_rols = eval_rollouts or []
@@ -2141,6 +2273,7 @@ class EventLogger:
         eval_metrics_table = self._rollouts_metrics_eval_to_table(eval_rols)
         eval_golden_answers_table = self._golden_answers_eval_to_table(eval_rols)
         eval_info_turns_table = self._info_turns_eval_to_table(eval_rols)
+        eval_sample_tags_table = self._sample_tags_eval_to_table(eval_rols)
 
         # Write all parquet files and metadata to a single zip
         with zipfile.ZipFile(dest_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -2193,6 +2326,10 @@ class EventLogger:
             pq.write_table(discarded_info_turns_table, buf)
             zf.writestr("info_turns_discarded.parquet", buf.getvalue())
 
+            buf = io.BytesIO()
+            pq.write_table(discarded_sample_tags_table, buf)
+            zf.writestr("sample_tags_discarded.parquet", buf.getvalue())
+
             # Eval tables
             buf = io.BytesIO()
             pq.write_table(eval_prompts_table, buf)
@@ -2217,6 +2354,10 @@ class EventLogger:
             buf = io.BytesIO()
             pq.write_table(eval_info_turns_table, buf)
             zf.writestr("info_turns_eval.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(eval_sample_tags_table, buf)
+            zf.writestr("sample_tags_eval.parquet", buf.getvalue())
 
             # Write metadata as JSON file
             meta = dict(metadata) if metadata else {}
@@ -2243,6 +2384,7 @@ class EventLogger:
         - rollouts_metrics.parquet: Normalized metrics table (step, sample_idx, env, metric_name, value)
         - golden_answers.parquet: Golden answers table (step, sample_idx, env, key, value)
         - info_turns.parquet: Per-turn text info table (step, sample_idx, turn_order, env, info_key, info_value, info_type)
+        - sample_tags.parquet: Per-sample string tags table (step, sample_idx, env, tag_name, tag_value)
         - metrics.parquet: Per-step, per-rank metrics (step, metric, value, rank)
         - metadata.json: Archive metadata (if provided)
         """
@@ -2258,6 +2400,7 @@ class EventLogger:
         gen_metrics_table = self._rollouts_metrics_to_table(rollouts)
         golden_answers_table = self._golden_answers_to_table(rollouts)
         info_turns_table = self._info_turns_to_table(rollouts)
+        sample_tags_table = self._sample_tags_to_table(rollouts)
         metrics_table = self._step_metrics_to_table(step_metrics)
 
         with zipfile.ZipFile(dest_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -2290,7 +2433,12 @@ class EventLogger:
             buf = io.BytesIO()
             pq.write_table(info_turns_table, buf)
             zf.writestr("info_turns.parquet", buf.getvalue())
-            
+
+            # Write sample tags table (per-sample string tags for filtering)
+            buf = io.BytesIO()
+            pq.write_table(sample_tags_table, buf)
+            zf.writestr("sample_tags.parquet", buf.getvalue())
+
             # Write step metrics table (grad_norm, kl_divergence_inference, entropy per rank)
             buf = io.BytesIO()
             pq.write_table(metrics_table, buf)

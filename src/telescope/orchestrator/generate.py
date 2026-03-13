@@ -1055,6 +1055,7 @@ async def process_sample(
     total_reward = reward_result.total_reward
     sample_metrics = reward_result.sample_metrics
     golden_answers = reward_result.golden_answers
+    sample_tags = reward_result.sample_tags
 
     # Extract token counts from usage
     usage = completion_data.get("usage", {})
@@ -1081,6 +1082,7 @@ async def process_sample(
         "sample_metrics": sample_metrics,  # Per-sample metrics (reward components + other metrics)
         "golden_answers": golden_answers,  # Golden answer per reward component
         "info_turns": info_turns,  # Per-turn text info (e.g. stderr, summaries)
+        "sample_tags": sample_tags,  # Per-sample string tags for filtering
         "request_timing": {
             "start_time": start_time,
             "end_time": end_time,
@@ -1204,6 +1206,7 @@ async def process_multiturn_sample(
         "sample_metrics": reward_result.sample_metrics,
         "golden_answers": reward_result.golden_answers,
         "info_turns": reward_result.info_turns,  # Per-turn text info (e.g. stderr, summaries)
+        "sample_tags": reward_result.sample_tags,  # Per-sample string tags for filtering
         "request_timings": request_timings,
         "prompt_ids": prompt_ids,
         "completion_ids": completion_ids,
@@ -1304,10 +1307,11 @@ async def process_multiturn_group(
     sample_metrics_list = [s["sample_metrics"] for s in group_samples]
     golden_answers_list = [s["golden_answers"] for s in group_samples]
     info_turns_list = [s["info_turns"] for s in group_samples]
+    sample_tags_list = [s["sample_tags"] for s in group_samples]
     completion_texts = [s["completion_text"] for s in group_samples]
     prompt_texts = [s["prompt_text"] for s in group_samples]
     compute_reward_times = [s["compute_reward_time"] for s in group_samples]
-    
+
     # Flatten all request timings with sample index metadata
     all_request_timings = []
     for sample_idx, s in enumerate(group_samples):
@@ -1366,6 +1370,7 @@ async def process_multiturn_group(
         "sample_metrics": sample_metrics_list,
         "golden_answers": golden_answers_list,
         "info_turns": info_turns_list,  # Per-sample list of per-turn text info dicts
+        "sample_tags": sample_tags_list,  # Per-sample string tags for filtering
         "request_timings": all_request_timings,
         "vllm_logprobs": vllm_logprobs,
         "server_url": server_url,
@@ -1457,6 +1462,7 @@ async def process_group(
     sample_metrics_list = [s["sample_metrics"] for s in group_samples]
     golden_answers_list = [s["golden_answers"] for s in group_samples]
     info_turns_list = [s["info_turns"] for s in group_samples]
+    sample_tags_list = [s["sample_tags"] for s in group_samples]
     compute_reward_times = [s["compute_reward_time"] for s in group_samples]
     completion_texts = [
         s["data_completion"]["choices"][0].get("text", "")
@@ -1524,6 +1530,7 @@ async def process_group(
         "sample_metrics": sample_metrics_list,  # List of dicts, per-sample metrics (reward components + other metrics)
         "golden_answers": golden_answers_list,  # List of dicts mapping golden answer keys -> values
         "info_turns": info_turns_list,  # Per-sample list of per-turn text info dicts
+        "sample_tags": sample_tags_list,  # Per-sample string tags for filtering
         "request_timings": request_timings,
         "vllm_logprobs": vllm_logprobs,
         "server_url": server_url,

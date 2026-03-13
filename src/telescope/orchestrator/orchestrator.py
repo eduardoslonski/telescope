@@ -1714,6 +1714,7 @@ class Orchestrator:
         sample_metrics_list = result.get("sample_metrics", [])
         golden_answers_list = result.get("golden_answers", [])
         info_turns_list = result.get("info_turns", [])
+        sample_tags_list = result.get("sample_tags", [])
         request_timings = result.get("request_timings", [])
         system_prompt = result.get("system_prompt", "")
         prompt_token_ids = result.get("prompt_token_ids", [])
@@ -1743,6 +1744,7 @@ class Orchestrator:
             sample_metrics = sample_metrics_list[idx] if idx < len(sample_metrics_list) else {}
             golden_answers = golden_answers_list[idx] if idx < len(golden_answers_list) else {}
             info_turns = info_turns_list[idx] if idx < len(info_turns_list) else []
+            sample_tags = sample_tags_list[idx] if idx < len(sample_tags_list) else {}
 
             prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
             comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
@@ -1776,6 +1778,7 @@ class Orchestrator:
                 sample_metrics=sample_metrics,
                 golden_answers=golden_answers,
                 info_turns=info_turns,
+                sample_tags=sample_tags,
                 tokens_prompt=tokens_prompt,
                 system_prompt=system_prompt,
                 tokens_system_prompt=tokens_system_prompt,
@@ -1906,6 +1909,7 @@ class Orchestrator:
             sample_metrics_list = group.get("sample_metrics", [])
             golden_answers_list = group.get("golden_answers", [])
             info_turns_list = group.get("info_turns", [])
+            sample_tags_list = group.get("sample_tags", [])
             system_prompt = group.get("system_prompt", "")
             prompt_token_ids = group.get("prompt_token_ids", [])
             completion_token_ids = group.get("completion_token_ids", [])
@@ -1945,6 +1949,7 @@ class Orchestrator:
                 sample_metrics = sample_metrics_list[idx] if idx < len(sample_metrics_list) else {}
                 golden_answers = golden_answers_list[idx] if idx < len(golden_answers_list) else {}
                 info_turns = info_turns_list[idx] if idx < len(info_turns_list) else []
+                sample_tags = sample_tags_list[idx] if idx < len(sample_tags_list) else {}
 
                 # Get total_tokens and compute raw_string
                 prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
@@ -1978,6 +1983,7 @@ class Orchestrator:
                     sample_metrics=sample_metrics,
                     golden_answers=golden_answers,
                     info_turns=info_turns,
+                    sample_tags=sample_tags,
                     tokens_prompt=tokens_prompt,
                     system_prompt=system_prompt,
                     tokens_system_prompt=tokens_system_prompt,
@@ -2654,6 +2660,7 @@ class Orchestrator:
                     sample_metrics=sr.metrics,
                     golden_answers=sr.golden_answers,
                     info_turns=sr.info_turns,
+                    sample_tags=sr.sample_tags,
                     compute_eval_metrics_time=sr.compute_eval_metrics_time,
                 ))
 
