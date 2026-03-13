@@ -142,6 +142,7 @@ def _explode_groups(all_groups_results: list[dict]) -> list[dict]:
         vllm_logprobs_list = group.get("vllm_logprobs", [[] for _ in range(n)])
         sample_metrics_list = group.get("sample_metrics", [{} for _ in range(n)])
         golden_answers_list = group.get("golden_answers", [{} for _ in range(n)])
+        sample_tags_list = group.get("sample_tags", [{} for _ in range(n)])
         turns_list = group.get("turns", [[] for _ in range(n)])  # Per-sample turns
         # completion_masks: per-token mask (1=model, 0=env response) for multi-turn
         completion_masks_list = group.get("completion_masks", None)
@@ -154,6 +155,7 @@ def _explode_groups(all_groups_results: list[dict]) -> list[dict]:
             comp_ids = group["completion_token_ids"][j]
             sample_metrics = sample_metrics_list[j] if j < len(sample_metrics_list) else {}
             golden_answers = golden_answers_list[j] if j < len(golden_answers_list) else {}
+            sample_tags = sample_tags_list[j] if j < len(sample_tags_list) else {}
             vllm_logprobs = vllm_logprobs_list[j] if j < len(vllm_logprobs_list) else []
             turns = turns_list[j] if j < len(turns_list) else []
             
@@ -173,6 +175,7 @@ def _explode_groups(all_groups_results: list[dict]) -> list[dict]:
                 "advantage": group["advantages"][j],
                 "sample_metrics": sample_metrics,  # Per-sample metrics (reward components + other metrics)
                 "golden_answers": golden_answers,  # Dict mapping reward_name -> golden_answer
+                "sample_tags": sample_tags,  # Per-sample string tags for filtering
                 "env_name": env_name,
                 "prompt_text": prompt_text,
                 "completion_text": completion_texts[j] if j < len(completion_texts) else "",

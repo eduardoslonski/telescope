@@ -78,6 +78,7 @@ class EvalSampleResult:
     info_turns: list[dict[str, Any]]
     completion_text: str
     prompt_text: str
+    sample_tags: dict[str, str] = field(default_factory=dict)
     turns: list[dict[str, Any]] = field(default_factory=list)
     num_turns: int = 1
     stop_reason: str | None = None
@@ -483,6 +484,7 @@ class EvalRunner:
             metrics=eval_result.metrics,
             golden_answers=eval_result.golden_answers,
             info_turns=eval_result.info_turns,
+            sample_tags=eval_result.sample_tags,
             completion_text=completion_text,
             prompt_text=prompt_text,
             turns=turns,
@@ -579,6 +581,7 @@ class EvalRunner:
             metrics=eval_result.metrics,
             golden_answers=eval_result.golden_answers,
             info_turns=eval_result.info_turns,
+            sample_tags=eval_result.sample_tags,
             completion_text=completion_text,
             prompt_text=prompt_text,
             turns=turns,
