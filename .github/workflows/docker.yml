@@ -1,29 +1,19 @@
 name: Build and Push Docker Image
 
 on:
-  # Manual trigger from GitHub UI only (build is too heavy for GH Actions runners)
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 30
     permissions:
       packages: write
       contents: read
 
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -47,3 +37,5 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/telescope-base:latest
