@@ -1,6 +1,6 @@
 [project]
 name = "telescope"
-version = "0.1.1"
+version = "0.1.2"
 description = "A framework for post-training LLMs with RL for reasoning and agents"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"

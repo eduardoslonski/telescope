@@ -5,8 +5,8 @@ A modular framework for reinforcement learning based post-training
 with asynchronous inference and training.
 """
 
-__version__ = "0.1.1"
-schema_version = "0.1.7"
+__version__ = "0.1.2"
+schema_version = "0.1.8"
 
 # Per-table schema versions for parquet tables uploaded to wandb.
 # Bump the version for a table whenever its schema (columns, types, semantics) changes.
