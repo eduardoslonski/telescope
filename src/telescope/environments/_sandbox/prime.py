@@ -171,6 +171,15 @@ class PrimeSandboxProvider(SandboxProvider):
             raise SandboxNotRunningError(str(e)) from e
         except PrimeImagePull as e:
             raise SandboxImagePullError(str(e)) from e
+        except (SandboxError,):
+            raise  # Already classified — re-raise as-is
+        except Exception as e:
+            # Unclassified errors (HTTP 500, broken chroot, etc.) indicate
+            # the sandbox is dead.  Wrap as SandboxError so the pool removes
+            # it instead of releasing it back for reuse.
+            raise SandboxError(
+                f"Sandbox {handle.id} failed: {e!r}"
+            ) from e
 
     # ── upload_bytes ──────────────────────────────────────────────────
 
@@ -194,6 +203,12 @@ class PrimeSandboxProvider(SandboxProvider):
             raise SandboxError(
                 f"Timeout uploading to {remote_path} in sandbox {handle.id}"
             )
+        except (SandboxError,):
+            raise
+        except Exception as e:
+            raise SandboxError(
+                f"Upload failed in sandbox {handle.id}: {e!r}"
+            ) from e
 
     # ── upload_file ───────────────────────────────────────────────────
 
@@ -203,7 +218,14 @@ class PrimeSandboxProvider(SandboxProvider):
         remote_path: str,
         local_path: str,
     ) -> None:
-        await self._get_client().upload_file(handle.id, remote_path, local_path)
+        try:
+            await self._get_client().upload_file(handle.id, remote_path, local_path)
+        except (SandboxError,):
+            raise
+        except Exception as e:
+            raise SandboxError(
+                f"Upload failed in sandbox {handle.id}: {e!r}"
+            ) from e
 
     # ── destroy ───────────────────────────────────────────────────────
 
