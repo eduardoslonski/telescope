@@ -1390,6 +1390,7 @@ class Orchestrator:
         sample_metrics_list = [s["sample_metrics"] for s in group_samples]
         golden_answers_list = [s["golden_answers"] for s in group_samples]
         info_turns_list = [s["info_turns"] for s in group_samples]
+        sample_tags_list = [s.get("sample_tags", {}) for s in group_samples]
         compute_reward_times = [s["compute_reward_time"] for s in group_samples]
         completion_texts = [
             s["data_completion"]["choices"][0].get("text", "")
@@ -1446,6 +1447,7 @@ class Orchestrator:
             "sample_metrics": sample_metrics_list,
             "golden_answers": golden_answers_list,
             "info_turns": info_turns_list,
+            "sample_tags": sample_tags_list,
             "request_timings": request_timings,
             "vllm_logprobs": vllm_logprobs,
             "server_url": server_url,
@@ -1487,6 +1489,7 @@ class Orchestrator:
         sample_metrics_list = [s["sample_metrics"] for s in group_samples]
         golden_answers_list = [s["golden_answers"] for s in group_samples]
         info_turns_list = [s["info_turns"] for s in group_samples]
+        sample_tags_list = [s.get("sample_tags", {}) for s in group_samples]
         completion_texts = [s["completion_text"] for s in group_samples]
         prompt_texts = [s["prompt_text"] for s in group_samples]
         compute_reward_times = [s["compute_reward_time"] for s in group_samples]
@@ -1538,6 +1541,7 @@ class Orchestrator:
             "sample_metrics": sample_metrics_list,
             "golden_answers": golden_answers_list,
             "info_turns": info_turns_list,
+            "sample_tags": sample_tags_list,
             "request_timings": all_request_timings,
             "vllm_logprobs": vllm_logprobs,
             "server_url": server_url,
