@@ -172,6 +172,7 @@ class Orchestrator:
         # Individual sample lanes: each sample gets its own lane slot instead of
         # sharing one slot per GROUP_SIZE group.
         self.individual_sample_lanes = config.cfg.enable_individual_sample_lanes
+        self.free_lane_after_generation = config.cfg.free_lane_after_generation and self.individual_sample_lanes
         # Tracks partially-completed groups when individual_sample_lanes is enabled.
         # Maps request_id -> {prompt_data, server_url, model_step, lane_slots,
         #                      samples: [dict|None]*GROUP_SIZE, remaining: int,
@@ -1100,6 +1101,24 @@ class Orchestrator:
         rollout_info = self.inflight_rollout_info.get(request_id)
         if rollout_info:
             rollout_info.sample_timings[sample_idx] = timing
+
+        # When free_lane_after_generation is enabled, the callback frees the
+        # lane slot as soon as generation/rollout finishes (before compute_reward).
+        # The flag prevents the post-try fallback from double-freeing.
+        lane_freed = False
+
+        def _free_lane():
+            nonlocal lane_freed
+            if lane_freed:
+                return
+            lane_freed = True
+            if server_url in self.available_server_lane_slots:
+                self.available_server_lane_slots[server_url].add(lane_slot)
+            # A lane just freed — try to dispatch queued samples immediately.
+            self._start_next_prompt()
+
+        on_gen_complete = _free_lane if self.free_lane_after_generation else None
+
         try:
             if is_multiturn:
                 result = await process_multiturn_sample(
@@ -1111,6 +1130,7 @@ class Orchestrator:
                     self.tokenizer,
                     prompt_data=prompt_data,
                     timing_out=timing,
+                    on_generation_complete=on_gen_complete,
                 )
             else:
                 result = await process_sample(
@@ -1121,12 +1141,14 @@ class Orchestrator:
                     self.scheduler.compute_reward,
                     self.tokenizer,
                     timing_out=timing,
+                    on_generation_complete=on_gen_complete,
                 )
         except asyncio.CancelledError:
             now = time.time()
             self._handle_cancelled_sample(
                 request_id, sample_idx, server_url, lane_slot,
                 timing.get("start_time", now), timing.get("end_time", now),
+                lane_already_freed=lane_freed,
             )
             raise
         except Exception as e:
@@ -1134,18 +1156,20 @@ class Orchestrator:
                 _log.warning(f"Individual sample error: request_id={request_id}, idx={sample_idx}: {e}")
             result = {"error": "sample_error", "error_message": str(e)}
 
-        # Free lane slot immediately
-        if server_url in self.available_server_lane_slots:
-            self.available_server_lane_slots[server_url].add(lane_slot)
+        # Free lane slot if not already freed by the on_generation_complete callback.
+        if not lane_freed:
+            if server_url in self.available_server_lane_slots:
+                self.available_server_lane_slots[server_url].add(lane_slot)
 
         self._on_individual_sample_complete(request_id, sample_idx, result)
 
     def _handle_cancelled_sample(
         self, request_id: int, sample_idx: int, server_url: str, lane_slot: int,
         start_time: float, end_time: float,
+        lane_already_freed: bool = False,
     ):
         """Handle a cancelled individual sample (e.g. during off-policy cancellation or eval drain)."""
-        if server_url in self.available_server_lane_slots:
+        if not lane_already_freed and server_url in self.available_server_lane_slots:
             self.available_server_lane_slots[server_url].add(lane_slot)
 
         # Log inference event for the cancelled sample

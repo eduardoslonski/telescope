@@ -982,10 +982,11 @@ async def process_sample(
     compute_reward_fn: Callable[[str, Sample, str], RewardResult],
     tokenizer: Any = None,
     timing_out: dict | None = None,
+    on_generation_complete: Callable[[], None] | None = None,
 ) -> dict:
     """
     Process a single prompt and compute rewards.
-    
+
     Args:
         client: HTTP client
         prompt_data: Dict with 'prompt' (raw question), 'sample', 'env_name', 'env'
@@ -993,7 +994,9 @@ async def process_sample(
         server_url: Inference server URL
         compute_reward_fn: Function to compute rewards (from scheduler/environment)
         tokenizer: HuggingFace tokenizer for formatting prompts with chat template
-        
+        on_generation_complete: Optional callback invoked after generation succeeds
+            but before compute_reward starts (used to free lane slots early).
+
     Returns:
         Dict with completion data, rewards, timing info.
         If there's an error, returns dict with "error" key set.
@@ -1044,6 +1047,9 @@ async def process_sample(
     
     choice = completion_data["choices"][0]
     completion_text = choice["text"]
+
+    if on_generation_complete is not None:
+        on_generation_complete()
 
     # Compute rewards using environment's reward function
     # Support both sync and async compute_reward (async needed for sandbox-based envs like i3-code)
@@ -1106,12 +1112,17 @@ async def process_multiturn_sample(
     tokenizer: Any = None,
     prompt_data: dict | None = None,
     timing_out: dict | None = None,
+    on_generation_complete: Callable[[], None] | None = None,
 ) -> dict:
     """
     Process a single multi-turn sample.
-    
+
     Runs a complete rollout and computes the reward.
-    
+
+    Args:
+        on_generation_complete: Optional callback invoked after rollout succeeds
+            but before compute_reward starts (used to free lane slots early).
+
     Returns:
         Dict with trajectory data, rewards, timing info.
         If there's an error, returns dict with "error" key set.
@@ -1141,7 +1152,10 @@ async def process_multiturn_sample(
             "error": "rollout_error",
             "error_message": str(e),
         }
-    
+
+    if on_generation_complete is not None:
+        on_generation_complete()
+
     # Check for errors in state (but context_exhausted is OK)
     if state.error:
         return {
