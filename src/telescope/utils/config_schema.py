@@ -120,6 +120,7 @@ class TelescopeConfig(BaseModel, extra="forbid"):
     enable_prompt_prefetch: bool
     prompt_prefetch_buffer_size: int
     enable_individual_sample_lanes: bool
+    free_lane_after_generation: bool
     max_off_policy_steps: int
 
     # Trainer
