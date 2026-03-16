@@ -58,6 +58,12 @@ class Eval:
     environment_name: str | None = None
     environment_kwargs: dict[str, Any] = {}
 
+    # Defaults for standalone evals (no wrapped environment).
+    system_prompt: str | None = None
+    is_multi_turn: bool = False
+    metrics_ranges: dict[str, dict[str, float | bool]] = {}
+    tags_options: dict[str, list[str]] = {}
+
     def __init__(self, **kwargs):
         self._env = None
         self._samples: list[Sample] | None = None
