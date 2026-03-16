@@ -1,7 +1,7 @@
 """
-MATH-500 evaluation.
+AIME 2024 evaluation.
 
-500 problems from the MATH benchmark (HuggingFaceH4/MATH-500, test split).
+30 problems from the 2024 American Invitational Mathematics Examination.
 Uses math_verify for symbolic answer verification.
 
 Requires: uv add math-verify
@@ -25,8 +25,8 @@ INSTRUCTION_PROMPT_POST = (
 )
 
 
-class Math500Eval(Eval):
-    name = "math500"
+class Aime2024Eval(Eval):
+    name = "aime_2024"
 
     metrics_ranges = {
         "correct": {"min": 0, "max": 1},
@@ -34,8 +34,8 @@ class Math500Eval(Eval):
 
     def __init__(
         self,
-        dataset_name: str = "HuggingFaceH4/MATH-500",
-        dataset_split: str = "test",
+        dataset_name: str = "HuggingFaceH4/aime_2024",
+        dataset_split: str = "train",
         instruction_prompt_post: str = INSTRUCTION_PROMPT_POST,
         **kwargs,
     ):
@@ -55,15 +55,13 @@ class Math500Eval(Eval):
         samples = []
         for item in dataset:
             question = item["problem"] + self.instruction_prompt_post
-            answer = item["answer"]
+            answer = str(item["answer"])
 
             samples.append(Sample(
                 prompt=question,
                 answer=answer,
                 metadata={
                     "question": item["problem"],
-                    "subject": item.get("subject", ""),
-                    "level": item.get("level", ""),
                 },
             ))
 
@@ -86,18 +84,7 @@ class Math500Eval(Eval):
 
         correct = 1.0 if verify_math_answer(predicted, ground_truth) else 0.0
 
-        metrics = {"correct": correct}
-
-        level_str = sample.metadata.get("level", "")
-        try:
-            metrics["level"] = float(level_str.replace("Level ", ""))
-        except (ValueError, AttributeError):
-            pass
-
         return EvalMetricsResult(
-            metrics=metrics,
-            golden_answers={
-                "correct": ground_truth,
-                "subject": sample.metadata.get("subject", ""),
-            },
+            metrics={"correct": correct},
+            golden_answers={"correct": ground_truth},
         )
