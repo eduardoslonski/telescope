@@ -96,8 +96,6 @@ class Math500Eval(Eval):
 
         return EvalMetricsResult(
             metrics=metrics,
-            golden_answers={
-                "correct": ground_truth,
-                "subject": sample.metadata.get("subject", ""),
-            },
+            golden_answers={"correct": ground_truth},
+            sample_tags={"subject": sample.metadata.get("subject", "")},
         )
