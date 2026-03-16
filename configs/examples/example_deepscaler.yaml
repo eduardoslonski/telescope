@@ -1,0 +1,25 @@
+# DeepScaleR: math reasoning for iterative context lengthening
+# Install: uv add math-verify
+#
+# Usage: uv run train.py --config configs/examples/example_deepscaler.yaml
+
+wandb_project: "telescope"
+wandb_run_name: "deepscaler"
+
+model: "Qwen/Qwen2.5-3B"
+
+inference_num_workers: 2
+trainer_num_workers: 2
+
+environments:
+  - name: "deepscaler"
+    reward_min: 0.0
+    reward_max: 1.0
+
+prompts_batch_size_for_trainer: 16
+group_size: 8
+number_of_steps: 300
+algorithm: "grpo"
+
+max_model_len: 4096
+max_tokens: 3000
