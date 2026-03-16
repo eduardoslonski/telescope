@@ -1079,6 +1079,10 @@ class Orchestrator:
         result["group_id"] = request_id
         result["individual_lane_slots"] = lane_slots
 
+        # Eagerly fetch OTLP timing for each sample in the group.
+        if "error" not in result:
+            await self._fetch_otlp_timing_for_group(result)
+
         _log.debug(f"Completed rollout request_id={request_id} on {server_url} (model_step={result['model_step']})")
 
         self._on_rollout_complete(result)
@@ -1161,6 +1165,13 @@ class Orchestrator:
             if server_url in self.available_server_lane_slots:
                 self.available_server_lane_slots[server_url].add(lane_slot)
 
+        # Eagerly fetch OTLP timing while still in this sample's async task.
+        # The BatchSpanProcessor flushes every ~200ms, so fetching here
+        # (right after sample completion) is much more reliable than deferring
+        # to batch-save time when spans may have been pruned or not yet flushed.
+        if "error" not in result:
+            await self._fetch_otlp_timing_for_result(result)
+
         self._on_individual_sample_complete(request_id, sample_idx, result)
 
     def _handle_cancelled_sample(
@@ -1219,6 +1230,72 @@ class Orchestrator:
             self.inflight_rollout_info.pop(request_id, None)
             _log.debug(f"Cancelled group {request_id} fully resolved (active={self.active_count})")
 
+    async def _fetch_otlp_timing_for_result(self, result: dict):
+        """Eagerly fetch OTLP timing data for a single completed sample.
+
+        Called right after the sample finishes, while still inside the
+        sample's async task.  A brief ``asyncio.sleep`` gives the
+        BatchSpanProcessor time to flush (OTEL_BSP_SCHEDULE_DELAY=200ms).
+        The fetched timing is stored in the sample result dict so that
+        ``_log_inference_request_events`` can use it later without
+        another (likely stale) lookup.
+        """
+        if self.otlp_receiver is None:
+            return
+
+        # Single-turn: "request_timing" (dict); multi-turn: "request_timings" (list)
+        timings = result.get("request_timings")
+        if timings is None:
+            single = result.get("request_timing")
+            timings = [single] if single else []
+
+        for timing in timings:
+            vllm_request_id = timing.get("vllm_request_id", "")
+            if not vllm_request_id:
+                continue
+
+            span_key = f"{vllm_request_id}-0"
+            # Try immediate lookup — the span may already be available.
+            span_data = self.otlp_receiver.get_and_remove(span_key)
+            if span_data is None:
+                span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
+            if span_data is None:
+                # Wait for BSP flush (200ms schedule + margin) and retry.
+                await asyncio.sleep(0.3)
+                span_data = self.otlp_receiver.get_and_remove(span_key)
+                if span_data is None:
+                    span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
+            if span_data is not None:
+                timing["otlp_timing"] = span_data
+
+    async def _fetch_otlp_timing_for_group(self, result: dict):
+        """Eagerly fetch OTLP timing for all samples in a completed group.
+
+        Called in group-mode ``_run_prompt`` right after ``process_group``
+        returns, so each sample's span is looked up close to completion time
+        rather than being deferred to batch-save time.
+        """
+        if self.otlp_receiver is None:
+            return
+
+        request_timings = result.get("request_timings", [])
+        for timing in request_timings:
+            vllm_request_id = timing.get("vllm_request_id", "")
+            if not vllm_request_id:
+                continue
+
+            span_key = f"{vllm_request_id}-0"
+            span_data = self.otlp_receiver.get_and_remove(span_key)
+            if span_data is None:
+                span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
+            if span_data is None:
+                await asyncio.sleep(0.3)
+                span_data = self.otlp_receiver.get_and_remove(span_key)
+                if span_data is None:
+                    span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
+            if span_data is not None:
+                timing["otlp_timing"] = span_data
+
     def _log_completed_individual_samples(
         self, group: dict, request_id: int,
         rollout_info: "InflightRolloutInfo | None",
@@ -1263,18 +1340,21 @@ class Orchestrator:
                 inference_time = 0.0
                 e2e_latency = 0.0
 
-                if self.otlp_receiver is not None and vllm_request_id:
+                # Use pre-fetched timing from _fetch_otlp_timing_for_result
+                # if available, otherwise fall back to live lookup.
+                span_data = timing.pop("otlp_timing", None)
+                if span_data is None and self.otlp_receiver is not None and vllm_request_id:
                     span_key = f"{vllm_request_id}-0"
                     span_data = self.otlp_receiver.get_and_remove(span_key)
                     if span_data is None:
                         span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
-                    if span_data is not None:
-                        queue_time = span_data.get("queue_time") or 0.0
-                        time_to_first_token = span_data.get("time_to_first_token") or 0.0
-                        prefill_time = span_data.get("prefill_time") or 0.0
-                        decode_time = span_data.get("decode_time") or 0.0
-                        inference_time = span_data.get("inference_time") or 0.0
-                        e2e_latency = span_data.get("e2e_latency") or 0.0
+                if span_data is not None:
+                    queue_time = span_data.get("queue_time") or 0.0
+                    time_to_first_token = span_data.get("time_to_first_token") or 0.0
+                    prefill_time = span_data.get("prefill_time") or 0.0
+                    decode_time = span_data.get("decode_time") or 0.0
+                    inference_time = span_data.get("inference_time") or 0.0
+                    e2e_latency = span_data.get("e2e_latency") or 0.0
 
                 server_lane = lane_slots[sample_idx] if sample_idx < len(lane_slots) and lane_slots[sample_idx] is not None else -1
 
@@ -1850,7 +1930,9 @@ class Orchestrator:
             sample_idx_in_group = timing.get("sample_idx_in_group", -1)
             sample_id = sample_idx_map.get(sample_idx_in_group, -1)
 
-            # Extract vLLM request ID and look up OTLP span data
+            # Extract vLLM request ID and look up OTLP span data.
+            # Prefer pre-fetched timing (stored by _fetch_otlp_timing_for_result
+            # at sample completion time) to avoid stale/missing lookups.
             vllm_request_id = timing.get("vllm_request_id", "")
             vllm_max_tokens = timing.get("max_tokens", 0)
             queue_time = 0.0
@@ -1860,25 +1942,21 @@ class Orchestrator:
             inference_time = 0.0
             e2e_latency = 0.0
 
-            if self.otlp_receiver is not None and vllm_request_id:
-                # vLLM appends "-{prompt_index}" to the external request ID
-                # for the OTLP span. Since we always send one prompt per
-                # request, the prompt index is 0.
-                #
-                # vLLM's BatchSpanProcessor flushes spans asynchronously
-                # (every OTEL_BSP_SCHEDULE_DELAY ms, we set it to 200ms).
-                # Poll briefly so fast requests don't miss their span data.
+            span_data = timing.pop("otlp_timing", None)
+            if span_data is None and self.otlp_receiver is not None and vllm_request_id:
+                # Fallback: try live lookup (may miss if BSP hasn't flushed
+                # or span was already pruned).
                 span_key = f"{vllm_request_id}-0"
                 span_data = self.otlp_receiver.get_and_remove(span_key)
                 if span_data is None:
                     span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
-                if span_data is not None:
-                    queue_time = span_data.get("queue_time") or 0.0
-                    time_to_first_token = span_data.get("time_to_first_token") or 0.0
-                    prefill_time = span_data.get("prefill_time") or 0.0
-                    decode_time = span_data.get("decode_time") or 0.0
-                    inference_time = span_data.get("inference_time") or 0.0
-                    e2e_latency = span_data.get("e2e_latency") or 0.0
+            if span_data is not None:
+                queue_time = span_data.get("queue_time") or 0.0
+                time_to_first_token = span_data.get("time_to_first_token") or 0.0
+                prefill_time = span_data.get("prefill_time") or 0.0
+                decode_time = span_data.get("decode_time") or 0.0
+                inference_time = span_data.get("inference_time") or 0.0
+                e2e_latency = span_data.get("e2e_latency") or 0.0
 
             if individual_lane_slots is not None and sample_idx_in_group < len(individual_lane_slots):
                 server_lane = individual_lane_slots[sample_idx_in_group]
