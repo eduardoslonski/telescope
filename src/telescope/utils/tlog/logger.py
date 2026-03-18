@@ -13,6 +13,9 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
+import time
+from dataclasses import dataclass, field as dc_field
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
@@ -257,6 +260,106 @@ _logs_path: Path | None = None
 _debug_mode: bool = False
 
 
+@dataclass
+class LogRecord:
+    """A single log record captured for upload."""
+    timestamp: float
+    level: str
+    component: str
+    source: str  # "log", "detailed", "stdout"
+    message: str
+
+
+class BufferedLogHandler(logging.Handler):
+    """Captures log records in a thread-safe buffer for upload to wandb."""
+
+    def __init__(self, component: str, source: str):
+        super().__init__()
+        self._component = component
+        self._source = source
+        self._buffer: list[LogRecord] = []
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord):
+        log_record = LogRecord(
+            timestamp=record.created,
+            level=record.levelname,
+            component=self._component,
+            source=self._source,
+            message=self.format(record),
+        )
+        with self._lock:
+            self._buffer.append(log_record)
+
+    def drain(self) -> list[LogRecord]:
+        """Atomically drain and return all buffered records."""
+        with self._lock:
+            records = self._buffer
+            self._buffer = []
+            return records
+
+
+class StdoutTailer:
+    """Reads new content from stdout log files by tracking file offsets."""
+
+    def __init__(self, directory: Path, component: str):
+        self._directory = directory
+        self._component = component
+        self._offsets: dict[Path, int] = {}
+
+    def read_new_content(self) -> list[LogRecord]:
+        """Read any new content appended to stdout files since last call."""
+        records: list[LogRecord] = []
+        if not self._directory.exists():
+            return records
+        for filepath in sorted(self._directory.iterdir()):
+            if not filepath.is_file():
+                continue
+            last_offset = self._offsets.get(filepath, 0)
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(last_offset)
+                    new_content = f.read()
+                    if new_content:
+                        self._offsets[filepath] = f.tell()
+                        for line in new_content.splitlines():
+                            if line.strip():
+                                records.append(LogRecord(
+                                    timestamp=time.time(),
+                                    level="INFO",
+                                    component=self._component,
+                                    source="stdout",
+                                    message=f"[{filepath.name}] {line}",
+                                ))
+            except (OSError, IOError):
+                continue
+        return records
+
+
+# Registry for buffered log handlers and stdout tailers
+_buffered_handlers: dict[str, list[BufferedLogHandler]] = {}
+_stdout_tailers: dict[str, StdoutTailer] = {}
+
+
+def drain_all_log_buffers() -> list[LogRecord]:
+    """Drain all buffered log records from all components. Called by EventLogger."""
+    all_records: list[LogRecord] = []
+    for handlers in _buffered_handlers.values():
+        for handler in handlers:
+            all_records.extend(handler.drain())
+    for tailer in _stdout_tailers.values():
+        all_records.extend(tailer.read_new_content())
+    return all_records
+
+
+def setup_stdout_tailers(logs_path: Path):
+    """Create stdout tailers for inference and trainer stdout directories."""
+    global _stdout_tailers
+    stdout_dir = logs_path / "stdout"
+    _stdout_tailers["inference"] = StdoutTailer(stdout_dir / "inference", "inference")
+    _stdout_tailers["trainer"] = StdoutTailer(stdout_dir / "trainer", "trainer")
+
+
 def is_debug_mode() -> bool:
     """Return True if Telescope was started with --debug."""
     return _debug_mode
@@ -357,7 +460,20 @@ def setup_logging(
         detailed_handler.setLevel(detailed_level)
         detailed_handler.setFormatter(DetailedFormatter(use_colors=False))
         component_logger.addHandler(detailed_handler)
-    
+
+        # Buffered handlers for wandb upload (records will be drained by EventLogger)
+        standard_buffered = BufferedLogHandler(component, "log")
+        standard_buffered.setLevel(file_level)
+        standard_buffered.setFormatter(TelescopeFormatter(use_colors=False))
+        component_logger.addHandler(standard_buffered)
+
+        detailed_buffered = BufferedLogHandler(component, "detailed")
+        detailed_buffered.setLevel(detailed_level)
+        detailed_buffered.setFormatter(DetailedFormatter(use_colors=False))
+        component_logger.addHandler(detailed_buffered)
+
+        _buffered_handlers[component] = [standard_buffered, detailed_buffered]
+
     _initialized = True
     _logs_path = logs_path
     return logs_path

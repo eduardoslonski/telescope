@@ -67,6 +67,7 @@ import zstandard as zstd
 
 from telescope import table_schema_versions
 from telescope.utils.tlog import get_logger
+from telescope.utils.tlog.logger import drain_all_log_buffers, LogRecord
 from telescope.orchestrator.loggers.system_metrics_logger import (
     SystemMetricsLogger,
     GpuMetricSample,
@@ -449,6 +450,16 @@ SAMPLE_TAGS_EVAL_SCHEMA = pa.schema([
     ("tail_idx", pa.int32()),
 ])
 
+# Logs schema - captured log records for UI display
+LOGS_SCHEMA = pa.schema([
+    ("timestamp", pa.float64()),
+    ("level", pa.string()),
+    ("component", pa.string()),
+    ("source", pa.string()),
+    ("message", pa.string()),
+    ("tail_idx", pa.int32()),
+])
+
 
 @dataclass
 class Event:
@@ -741,6 +752,9 @@ class EventLogger:
         self._eval_rollouts: list[EvalRollout] = []
         self._eval_prompts: list[EvalPrompt] = []
         self._logged_eval_prompt_keys: set[tuple] = set()  # (step, eval_name, sample_idx)
+
+        # Log records buffer (drained from logging handlers each upload cycle)
+        self._log_records: list[tuple[LogRecord, int]] = []
 
         # Summary tracking
         self._summary_id: int = 0
@@ -1399,6 +1413,27 @@ class EventLogger:
             "tail_idx": [tail_idx for _, tail_idx in metrics],
         }
         return pa.table(data, schema=CPU_METRICS_SCHEMA)
+
+    def _logs_to_table(self, logs: list[tuple[LogRecord, int]]) -> pa.Table:
+        """Convert log records (with tail_idx) to PyArrow table."""
+        if not logs:
+            return pa.table({
+                "timestamp": pa.array([], type=pa.float64()),
+                "level": pa.array([], type=pa.string()),
+                "component": pa.array([], type=pa.string()),
+                "source": pa.array([], type=pa.string()),
+                "message": pa.array([], type=pa.string()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+        data = {
+            "timestamp": [r.timestamp for r, _ in logs],
+            "level": [r.level for r, _ in logs],
+            "component": [r.component for r, _ in logs],
+            "source": [r.source for r, _ in logs],
+            "message": [r.message for r, _ in logs],
+            "tail_idx": [tail_idx for _, tail_idx in logs],
+        }
+        return pa.table(data, schema=LOGS_SCHEMA)
 
     def _vllm_metrics_to_table(self, metrics: list[tuple[VllmMetricSample, int]]) -> pa.Table:
         """Convert list of vLLM metrics (with tail_idx) to PyArrow table."""
@@ -2237,6 +2272,7 @@ class EventLogger:
         discarded_prompts: list[DiscardedPrompt] | None = None,
         eval_rollouts: list[EvalRollout] | None = None,
         eval_prompts: list[EvalPrompt] | None = None,
+        logs: list[tuple[LogRecord, int]] | None = None,
     ):
         """Write all event data as separate parquet files in a single zip archive."""
         if self.run is None:
@@ -2274,6 +2310,10 @@ class EventLogger:
         eval_golden_answers_table = self._golden_answers_eval_to_table(eval_rols)
         eval_info_turns_table = self._info_turns_eval_to_table(eval_rols)
         eval_sample_tags_table = self._sample_tags_eval_to_table(eval_rols)
+
+        # Convert logs
+        logs_list = logs or []
+        logs_table = self._logs_to_table(logs_list)
 
         # Write all parquet files and metadata to a single zip
         with zipfile.ZipFile(dest_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -2358,6 +2398,11 @@ class EventLogger:
             buf = io.BytesIO()
             pq.write_table(eval_sample_tags_table, buf)
             zf.writestr("sample_tags_eval.parquet", buf.getvalue())
+
+            # Logs table
+            buf = io.BytesIO()
+            pq.write_table(logs_table, buf)
+            zf.writestr("logs.parquet", buf.getvalue())
 
             # Write metadata as JSON file
             meta = dict(metadata) if metadata else {}
@@ -2519,12 +2564,32 @@ class EventLogger:
             new_vllm = self._vllm_metrics_logger.get_and_clear_metrics()
             self._vllm_metrics.extend((m, current_tail_idx) for m in new_vllm)
 
+        # Pull log records from the logging system
+        from telescope.utils import config as _config_mod
+        cfg = getattr(_config_mod, 'cfg', None)
+        upload_logs = getattr(cfg, 'wandb_upload_logs', False) if cfg else False
+        upload_detailed = getattr(cfg, 'wandb_upload_logs_detailed', False) if cfg else False
+        upload_stdout = getattr(cfg, 'wandb_upload_logs_stdout', False) if cfg else False
+
+        if upload_logs or upload_detailed or upload_stdout:
+            new_logs = drain_all_log_buffers()
+            filtered_logs = []
+            for rec in new_logs:
+                if rec.source == "log" and upload_logs:
+                    filtered_logs.append(rec)
+                elif rec.source == "detailed" and upload_detailed:
+                    filtered_logs.append(rec)
+                elif rec.source == "stdout" and upload_stdout:
+                    filtered_logs.append(rec)
+            self._log_records.extend((rec, current_tail_idx) for rec in filtered_logs)
+
         # Assign tail_idx to any metrics that were added externally (via add_gpu_metrics)
         self._gpu_metrics = [(m, current_tail_idx if idx == -1 else idx) for m, idx in self._gpu_metrics]
 
         all_gpu_metrics = list(self._gpu_metrics)
         all_cpu_metrics = list(self._cpu_metrics)
         all_vllm_metrics = list(self._vllm_metrics)
+        all_log_records = list(self._log_records)
 
         block_end_time = self._block_start_time + self.BLOCK_DURATION_SECONDS
 
@@ -2558,6 +2623,10 @@ class EventLogger:
             ]
             block_vllm_metrics = [
                 (m, idx) for m, idx in all_vllm_metrics
+                if idx >= self._block_first_tail_idx and idx <= block_last_tail_idx
+            ]
+            block_log_records = [
+                (r, idx) for r, idx in all_log_records
                 if idx >= self._block_first_tail_idx and idx <= block_last_tail_idx
             ]
             block_discarded_rollouts = [
@@ -2596,6 +2665,7 @@ class EventLogger:
                     discarded_prompts=block_discarded_prompts,
                     eval_rollouts=block_eval_rollouts,
                     eval_prompts=block_eval_prompts,
+                    logs=block_log_records,
                 )
                 _log.debug(f"Finalized {block_path} (tails {self._block_first_tail_idx}-{block_last_tail_idx})")
 
@@ -2640,12 +2710,14 @@ class EventLogger:
             self._gpu_metrics = [(m, idx) for m, idx in self._gpu_metrics if idx >= new_block_first_tail_idx]
             self._cpu_metrics = [(m, idx) for m, idx in self._cpu_metrics if idx >= new_block_first_tail_idx]
             self._vllm_metrics = [(m, idx) for m, idx in self._vllm_metrics if idx >= new_block_first_tail_idx]
-            
+            self._log_records = [(r, idx) for r, idx in self._log_records if idx >= new_block_first_tail_idx]
+
             all_events = [e for e in all_events if e.tail_idx >= new_block_first_tail_idx]
             all_inference_events = [e for e in all_inference_events if e.tail_idx >= new_block_first_tail_idx]
             all_gpu_metrics = [(m, idx) for m, idx in all_gpu_metrics if idx >= new_block_first_tail_idx]
             all_cpu_metrics = [(m, idx) for m, idx in all_cpu_metrics if idx >= new_block_first_tail_idx]
             all_vllm_metrics = [(m, idx) for m, idx in all_vllm_metrics if idx >= new_block_first_tail_idx]
+            all_log_records = [(r, idx) for r, idx in all_log_records if idx >= new_block_first_tail_idx]
             all_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
             all_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= new_block_first_tail_idx]
             all_eval_prompts = [p for p in all_eval_prompts if p.tail_idx >= new_block_first_tail_idx]
@@ -2663,6 +2735,7 @@ class EventLogger:
         current_block_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= self._block_first_tail_idx]
         current_block_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= self._block_first_tail_idx]
         current_block_eval_prompts = [p for p in all_eval_prompts if p.tail_idx >= self._block_first_tail_idx]
+        current_block_log_records = [(r, idx) for r, idx in all_log_records if idx >= self._block_first_tail_idx]
 
         # Filter for tail BY TAIL_IDX (ensures complete tails)
         tail_events = [e for e in all_events if e.tail_idx >= tail_min_idx_for_window]
@@ -2674,6 +2747,7 @@ class EventLogger:
         tail_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= tail_min_idx_for_window]
         tail_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= tail_min_idx_for_window]
         tail_eval_prompts = [p for p in all_eval_prompts if p.tail_idx >= tail_min_idx_for_window]
+        tail_log_records = [(r, idx) for r, idx in all_log_records if idx >= tail_min_idx_for_window]
 
         # Split events by source
         tail_orch_events = [e for e in tail_events if e.source == "orchestrator"]
@@ -2709,6 +2783,7 @@ class EventLogger:
             discarded_prompts=tail_discarded_prompts,
             eval_rollouts=tail_eval_rollouts,
             eval_prompts=tail_eval_prompts,
+            logs=tail_log_records,
         )
 
         # Write block_live.zip with all data
@@ -2728,6 +2803,7 @@ class EventLogger:
             discarded_prompts=current_block_discarded_prompts,
             eval_rollouts=current_block_eval_rollouts,
             eval_prompts=current_block_eval_prompts,
+            logs=current_block_log_records,
         )
 
         # Process rollouts, prompts, and step metrics into blocks

@@ -135,6 +135,9 @@ wandb_project: "telescope"
 wandb_run_name: "telescope_run"
 wandb_tags: ["telescope"]
 wandb_upload_code: true
+wandb_upload_logs: true
+wandb_upload_logs_detailed: false
+wandb_upload_logs_stdout: false
 wandb_code_max_file_size_mb: 2.0
 wandb_code_exclude_patterns:
   [

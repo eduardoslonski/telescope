@@ -18,6 +18,7 @@ table_schema_versions = {
     "gpu": "0.1",
     "cpu": "0.1",
     "vllm": "0.1",
+    "logs": "0.1",
     # steps zip tables
     "prompts": "0.1",
     "rollouts": "0.1",
