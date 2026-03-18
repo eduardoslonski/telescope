@@ -299,16 +299,62 @@ class BufferedLogHandler(logging.Handler):
             return records
 
 
-class StdoutTailer:
-    """Reads new content from stdout log files by tracking file offsets."""
+class FileTailer:
+    """Reads new content from a single log file by tracking the file offset."""
 
-    def __init__(self, directory: Path, component: str):
+    def __init__(self, filepath: Path, component: str, source: str):
+        self._filepath = filepath
+        self._component = component
+        self._source = source
+        self._offset: int = 0
+
+    def _parse_level(self, line: str) -> str:
+        """Extract log level from file log format: [HH:MM:SS.mmm] [LEVEL   ] ..."""
+        # Look for the second bracketed section containing the level
+        try:
+            first_close = line.index("]")
+            level_start = line.index("[", first_close + 1)
+            level_end = line.index("]", level_start + 1)
+            return line[level_start + 1 : level_end].strip()
+        except (ValueError, IndexError):
+            return "INFO"
+
+    def read_new_content(self) -> list[LogRecord]:
+        """Read any new content appended since last call."""
+        records: list[LogRecord] = []
+        if not self._filepath.exists():
+            return records
+        try:
+            with open(self._filepath, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._offset)
+                new_content = f.read()
+                if new_content:
+                    self._offset = f.tell()
+                    for line in new_content.splitlines():
+                        if line.strip():
+                            records.append(LogRecord(
+                                timestamp=time.time(),
+                                level=self._parse_level(line),
+                                component=self._component,
+                                source=self._source,
+                                message=line,
+                            ))
+        except (OSError, IOError):
+            pass
+        return records
+
+
+class DirTailer:
+    """Reads new content from all files in a directory by tracking file offsets."""
+
+    def __init__(self, directory: Path, component: str, source: str):
         self._directory = directory
         self._component = component
+        self._source = source
         self._offsets: dict[Path, int] = {}
 
     def read_new_content(self) -> list[LogRecord]:
-        """Read any new content appended to stdout files since last call."""
+        """Read any new content appended to files since last call."""
         records: list[LogRecord] = []
         if not self._directory.exists():
             return records
@@ -328,7 +374,7 @@ class StdoutTailer:
                                     timestamp=time.time(),
                                     level="INFO",
                                     component=self._component,
-                                    source="stdout",
+                                    source=self._source,
                                     message=f"[{filepath.name}] {line}",
                                 ))
             except (OSError, IOError):
@@ -336,9 +382,9 @@ class StdoutTailer:
         return records
 
 
-# Registry for buffered log handlers and stdout tailers
+# Registry for buffered log handlers and file tailers
 _buffered_handlers: dict[str, list[BufferedLogHandler]] = {}
-_stdout_tailers: dict[str, StdoutTailer] = {}
+_file_tailers: list[FileTailer | DirTailer] = []
 
 
 def drain_all_log_buffers() -> list[LogRecord]:
@@ -347,17 +393,32 @@ def drain_all_log_buffers() -> list[LogRecord]:
     for handlers in _buffered_handlers.values():
         for handler in handlers:
             all_records.extend(handler.drain())
-    for tailer in _stdout_tailers.values():
+    for tailer in _file_tailers:
         all_records.extend(tailer.read_new_content())
     return all_records
 
 
-def setup_stdout_tailers(logs_path: Path):
-    """Create stdout tailers for inference and trainer stdout directories."""
-    global _stdout_tailers
-    stdout_dir = logs_path / "stdout"
-    _stdout_tailers["inference"] = StdoutTailer(stdout_dir / "inference", "inference")
-    _stdout_tailers["trainer"] = StdoutTailer(stdout_dir / "trainer", "trainer")
+def setup_file_tailers(logs_path: Path):
+    """Create file tailers for trainer/inference log files and stdout directories.
+
+    The orchestrator's logs are captured in-process via BufferedLogHandler.
+    Trainer and inference run in separate Ray workers, so we tail their log files instead.
+    """
+    global _file_tailers
+    _file_tailers = []
+    for component in ("trainer", "inference"):
+        # Standard log file
+        _file_tailers.append(FileTailer(
+            logs_path / component / f"{component}.log", component, "log"
+        ))
+        # Detailed log file
+        _file_tailers.append(FileTailer(
+            logs_path / component / f"{component}.detailed.log", component, "detailed"
+        ))
+        # Stdout directory (multiple files)
+        _file_tailers.append(DirTailer(
+            logs_path / "stdout" / component, component, "stdout"
+        ))
 
 
 def is_debug_mode() -> bool:
@@ -461,18 +522,21 @@ def setup_logging(
         detailed_handler.setFormatter(DetailedFormatter(use_colors=False))
         component_logger.addHandler(detailed_handler)
 
-        # Buffered handlers for wandb upload (records will be drained by EventLogger)
-        standard_buffered = BufferedLogHandler(component, "log")
-        standard_buffered.setLevel(file_level)
-        standard_buffered.setFormatter(TelescopeFormatter(use_colors=False))
-        component_logger.addHandler(standard_buffered)
+        # Buffered handlers for wandb upload — only for orchestrator which runs
+        # in the same process as EventLogger. Trainer/inference logs are captured
+        # via file tailers (setup_file_tailers) since they run in separate Ray workers.
+        if component == "orchestrator":
+            standard_buffered = BufferedLogHandler(component, "log")
+            standard_buffered.setLevel(file_level)
+            standard_buffered.setFormatter(TelescopeFormatter(use_colors=False))
+            component_logger.addHandler(standard_buffered)
 
-        detailed_buffered = BufferedLogHandler(component, "detailed")
-        detailed_buffered.setLevel(detailed_level)
-        detailed_buffered.setFormatter(DetailedFormatter(use_colors=False))
-        component_logger.addHandler(detailed_buffered)
+            detailed_buffered = BufferedLogHandler(component, "detailed")
+            detailed_buffered.setLevel(detailed_level)
+            detailed_buffered.setFormatter(DetailedFormatter(use_colors=False))
+            component_logger.addHandler(detailed_buffered)
 
-        _buffered_handlers[component] = [standard_buffered, detailed_buffered]
+            _buffered_handlers[component] = [standard_buffered, detailed_buffered]
 
     _initialized = True
     _logs_path = logs_path
