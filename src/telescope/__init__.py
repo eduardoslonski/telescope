@@ -6,7 +6,7 @@ with asynchronous inference and training.
 """
 
 __version__ = "0.1.2"
-schema_version = "0.1.8"
+schema_version = "0.1.9"
 
 # Per-table schema versions for parquet tables uploaded to wandb.
 # Bump the version for a table whenever its schema (columns, types, semantics) changes.
@@ -18,6 +18,7 @@ table_schema_versions = {
     "gpu": "0.1",
     "cpu": "0.1",
     "vllm": "0.1",
+    "logs": "0.1",
     # steps zip tables
     "prompts": "0.1",
     "rollouts": "0.1",

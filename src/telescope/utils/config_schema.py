@@ -219,6 +219,9 @@ class TelescopeConfig(BaseModel, extra="forbid"):
     wandb_run_name: str
     wandb_tags: list[str]
     wandb_upload_code: bool
+    wandb_upload_logs: bool
+    wandb_upload_logs_detailed: bool
+    wandb_upload_logs_stdout: bool
     wandb_code_max_file_size_mb: float = Field(gt=0)
     wandb_code_exclude_patterns: list[str]
     system_metrics_collection_interval_seconds: float

@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
+import threading
+import time
+from dataclasses import dataclass, field as dc_field
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
@@ -257,6 +261,184 @@ _logs_path: Path | None = None
 _debug_mode: bool = False
 
 
+@dataclass
+class LogRecord:
+    """A single log record captured for upload."""
+    timestamp: float
+    level: str
+    component: str
+    source: str  # "log", "detailed", "stdout"
+    message: str
+
+
+class BufferedLogHandler(logging.Handler):
+    """Captures log records in a thread-safe buffer for upload to wandb."""
+
+    def __init__(self, component: str, source: str):
+        super().__init__()
+        self._component = component
+        self._source = source
+        self._buffer: list[LogRecord] = []
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord):
+        log_record = LogRecord(
+            timestamp=record.created,
+            level=record.levelname,
+            component=self._component,
+            source=self._source,
+            message=_strip_ansi(record.getMessage()),
+        )
+        with self._lock:
+            self._buffer.append(log_record)
+
+    def drain(self) -> list[LogRecord]:
+        """Atomically drain and return all buffered records."""
+        with self._lock:
+            records = self._buffer
+            self._buffer = []
+            return records
+
+
+# Strip ANSI escape sequences (colors, bold, etc.)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+# Matches: [HH:MM:SS.mmm] [LEVEL   ] [component   ] optional_context message
+# or for detailed: same but with extra [...] suffix
+_LOG_LINE_RE = re.compile(
+    r"^\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+"  # [HH:MM:SS.mmm]
+    r"\[(\w+)\s*\]\s+"                       # [LEVEL   ]
+    r"\[\w+\s*\]\s*"                         # [component   ]
+    r"(?:\[[^\]]*\]\s*)?"                     # optional [step=N, rank=N]
+    r"(.*)"                                   # message
+)
+
+
+class FileTailer:
+    """Reads new content from a single log file by tracking the file offset."""
+
+    def __init__(self, filepath: Path, component: str, source: str):
+        self._filepath = filepath
+        self._component = component
+        self._source = source
+        self._offset: int = 0
+
+    def _parse_line(self, line: str) -> tuple[str, str]:
+        """Parse a log line, returning (level, message) with prefix stripped."""
+        clean = _strip_ansi(line)
+        m = _LOG_LINE_RE.match(clean)
+        if m:
+            return m.group(2).strip(), m.group(3)
+        return "INFO", clean
+
+    def read_new_content(self) -> list[LogRecord]:
+        """Read any new content appended since last call."""
+        records: list[LogRecord] = []
+        if not self._filepath.exists():
+            return records
+        try:
+            with open(self._filepath, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._offset)
+                new_content = f.read()
+                if new_content:
+                    self._offset = f.tell()
+                    for line in new_content.splitlines():
+                        if line.strip():
+                            level, message = self._parse_line(line)
+                            records.append(LogRecord(
+                                timestamp=time.time(),
+                                level=level,
+                                component=self._component,
+                                source=self._source,
+                                message=message,
+                            ))
+        except (OSError, IOError):
+            pass
+        return records
+
+
+class DirTailer:
+    """Reads new content from all files in a directory by tracking file offsets."""
+
+    def __init__(self, directory: Path, component: str, source: str):
+        self._directory = directory
+        self._component = component
+        self._source = source
+        self._offsets: dict[Path, int] = {}
+
+    def read_new_content(self) -> list[LogRecord]:
+        """Read any new content appended to files since last call."""
+        records: list[LogRecord] = []
+        if not self._directory.exists():
+            return records
+        for filepath in sorted(self._directory.iterdir()):
+            if not filepath.is_file():
+                continue
+            last_offset = self._offsets.get(filepath, 0)
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(last_offset)
+                    new_content = f.read()
+                    if new_content:
+                        self._offsets[filepath] = f.tell()
+                        for line in new_content.splitlines():
+                            if line.strip():
+                                records.append(LogRecord(
+                                    timestamp=time.time(),
+                                    level="INFO",
+                                    component=self._component,
+                                    source=self._source,
+                                    message=f"[{filepath.name}] {_strip_ansi(line)}",
+                                ))
+            except (OSError, IOError):
+                continue
+        return records
+
+
+# Registry for buffered log handlers and file tailers
+_buffered_handlers: dict[str, list[BufferedLogHandler]] = {}
+_file_tailers: list[FileTailer | DirTailer] = []
+
+
+def drain_all_log_buffers() -> list[LogRecord]:
+    """Drain all buffered log records from all components. Called by EventLogger."""
+    all_records: list[LogRecord] = []
+    for handlers in _buffered_handlers.values():
+        for handler in handlers:
+            all_records.extend(handler.drain())
+    for tailer in _file_tailers:
+        all_records.extend(tailer.read_new_content())
+    return all_records
+
+
+def setup_file_tailers(logs_path: Path):
+    """Create file tailers for trainer/inference log files and stdout directories.
+
+    The orchestrator's logs are captured in-process via BufferedLogHandler.
+    Trainer and inference run in separate Ray workers, so we tail their log files instead.
+    """
+    global _file_tailers
+    _file_tailers = []
+    for component in ("trainer", "inference"):
+        # Standard log file
+        _file_tailers.append(FileTailer(
+            logs_path / component / f"{component}.log", component, "log"
+        ))
+        # Detailed log file
+        _file_tailers.append(FileTailer(
+            logs_path / component / f"{component}.detailed.log", component, "detailed"
+        ))
+        # Stdout directory (multiple files)
+        _file_tailers.append(DirTailer(
+            logs_path / "stdout" / component, component, "stdout"
+        ))
+
+
 def is_debug_mode() -> bool:
     """Return True if Telescope was started with --debug."""
     return _debug_mode
@@ -357,7 +539,23 @@ def setup_logging(
         detailed_handler.setLevel(detailed_level)
         detailed_handler.setFormatter(DetailedFormatter(use_colors=False))
         component_logger.addHandler(detailed_handler)
-    
+
+        # Buffered handlers for wandb upload — only for orchestrator which runs
+        # in the same process as EventLogger. Trainer/inference logs are captured
+        # via file tailers (setup_file_tailers) since they run in separate Ray workers.
+        if component == "orchestrator":
+            standard_buffered = BufferedLogHandler(component, "log")
+            standard_buffered.setLevel(file_level)
+            standard_buffered.setFormatter(TelescopeFormatter(use_colors=False))
+            component_logger.addHandler(standard_buffered)
+
+            detailed_buffered = BufferedLogHandler(component, "detailed")
+            detailed_buffered.setLevel(detailed_level)
+            detailed_buffered.setFormatter(DetailedFormatter(use_colors=False))
+            component_logger.addHandler(detailed_buffered)
+
+            _buffered_handlers[component] = [standard_buffered, detailed_buffered]
+
     _initialized = True
     _logs_path = logs_path
     return logs_path

@@ -58,6 +58,7 @@ from telescope.utils.ray_runtime.runtime import (
     resolve_worker_count,
 )
 from telescope.utils.tlog import get_logger, is_debug_mode, setup_logging
+from telescope.utils.tlog.logger import setup_file_tailers
 from telescope.utils.tlog.noise_filter import suppress_third_party_noise
 
 _log = get_logger("orchestrator")
@@ -3127,6 +3128,7 @@ def main():
     # Initialize logging system (debug flag was set by config_loader)
     debug = bool(config.cfg.debug)
     setup_logging(debug=debug)
+    setup_file_tailers(paths.LOGS_DIR)
 
     # Suppress third-party noise unless --debug
     if not debug:
