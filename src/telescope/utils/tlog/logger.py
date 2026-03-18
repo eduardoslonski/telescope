@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -286,7 +287,7 @@ class BufferedLogHandler(logging.Handler):
             level=record.levelname,
             component=self._component,
             source=self._source,
-            message=self.format(record),
+            message=_strip_ansi(record.getMessage()),
         )
         with self._lock:
             self._buffer.append(log_record)
@@ -299,6 +300,25 @@ class BufferedLogHandler(logging.Handler):
             return records
 
 
+# Strip ANSI escape sequences (colors, bold, etc.)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+# Matches: [HH:MM:SS.mmm] [LEVEL   ] [component   ] optional_context message
+# or for detailed: same but with extra [...] suffix
+_LOG_LINE_RE = re.compile(
+    r"^\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+"  # [HH:MM:SS.mmm]
+    r"\[(\w+)\s*\]\s+"                       # [LEVEL   ]
+    r"\[\w+\s*\]\s*"                         # [component   ]
+    r"(?:\[[^\]]*\]\s*)?"                     # optional [step=N, rank=N]
+    r"(.*)"                                   # message
+)
+
+
 class FileTailer:
     """Reads new content from a single log file by tracking the file offset."""
 
@@ -308,16 +328,13 @@ class FileTailer:
         self._source = source
         self._offset: int = 0
 
-    def _parse_level(self, line: str) -> str:
-        """Extract log level from file log format: [HH:MM:SS.mmm] [LEVEL   ] ..."""
-        # Look for the second bracketed section containing the level
-        try:
-            first_close = line.index("]")
-            level_start = line.index("[", first_close + 1)
-            level_end = line.index("]", level_start + 1)
-            return line[level_start + 1 : level_end].strip()
-        except (ValueError, IndexError):
-            return "INFO"
+    def _parse_line(self, line: str) -> tuple[str, str]:
+        """Parse a log line, returning (level, message) with prefix stripped."""
+        clean = _strip_ansi(line)
+        m = _LOG_LINE_RE.match(clean)
+        if m:
+            return m.group(2).strip(), m.group(3)
+        return "INFO", clean
 
     def read_new_content(self) -> list[LogRecord]:
         """Read any new content appended since last call."""
@@ -332,12 +349,13 @@ class FileTailer:
                     self._offset = f.tell()
                     for line in new_content.splitlines():
                         if line.strip():
+                            level, message = self._parse_line(line)
                             records.append(LogRecord(
                                 timestamp=time.time(),
-                                level=self._parse_level(line),
+                                level=level,
                                 component=self._component,
                                 source=self._source,
-                                message=line,
+                                message=message,
                             ))
         except (OSError, IOError):
             pass
@@ -375,7 +393,7 @@ class DirTailer:
                                     level="INFO",
                                     component=self._component,
                                     source=self._source,
-                                    message=f"[{filepath.name}] {line}",
+                                    message=f"[{filepath.name}] {_strip_ansi(line)}",
                                 ))
             except (OSError, IOError):
                 continue
