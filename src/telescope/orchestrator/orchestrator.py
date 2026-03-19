@@ -2312,7 +2312,16 @@ class Orchestrator:
         This method aggregates the returned metrics/events and advances model state.
         """
         step = self.trainer_step
-        self.wandb_logger.log_orchestrator_timeline_event("weight_update", step=step)
+
+        # Use the trainer's wall-clock timestamp for the weight_update event
+        # so it aligns with trainer/inference events.  In multi-node setups,
+        # the delay between the trainer finishing and the orchestrator
+        # processing the result via Ray can be significant (~30s).
+        trainer_end_times = [
+            r["step_end_time"] for r in step_results if "step_end_time" in r
+        ]
+        weight_update_ts = min(trainer_end_times) if trainer_end_times else None
+        self.wandb_logger.log_orchestrator_timeline_event("weight_update", step=step, timestamp=weight_update_ts)
 
         step_metrics = []
         timeline_events = []
