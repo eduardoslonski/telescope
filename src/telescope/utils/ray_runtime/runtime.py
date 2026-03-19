@@ -1839,6 +1839,7 @@ class TrainerRayActor:
             "weight_sync_load_refs": load_refs,
             "eval_step": is_eval_step,
             "weight_sync_group": group_name,
+            "step_end_time": time.time(),
         }
 
     def save_checkpoint(self, step: int) -> dict[str, Any]:
