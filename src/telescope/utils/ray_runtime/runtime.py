@@ -1331,7 +1331,9 @@ class InferenceServerActor:
             f"Ray inference server {self.server_idx} started on {self.public_url}",
             rank=self.server_idx,
         )
-        return self._server_info_payload()
+        info = self._server_info_payload()
+        info["ready_time"] = time.time()
+        return info
 
     def _wait_until_ready(self, timeout_s: int = 600) -> None:
         deadline = time.time() + timeout_s
@@ -1542,6 +1544,7 @@ class TrainerRayActor:
             f"Trainer actor initialized (rank={runtime['rank']}/{runtime['world_size']})",
             rank=runtime["rank"],
         )
+        runtime["ready_time"] = time.time()
         return runtime
 
     def _start_torch_memory_logger(self, runtime: dict[str, Any]) -> None:
@@ -1881,6 +1884,7 @@ class TrainerRayActor:
             "step": step,
             "checkpoint_time_s": elapsed,
             "timeline_events": timeline_events,
+            "save_end_time": time.time(),
         }
 
     def load_checkpoint(self, step: int) -> dict[str, Any]:
