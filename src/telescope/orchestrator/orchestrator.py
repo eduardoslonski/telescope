@@ -384,7 +384,11 @@ class Orchestrator:
             url: collections.deque() for url in self.server_urls
         }
         self.wandb_logger.set_inference_servers(self.inference_group.server_infos)
-        self.wandb_logger.log_orchestrator_timeline_event("inference_servers_ready")
+        inference_ready_times = [
+            info["ready_time"] for info in self.inference_group.server_infos if "ready_time" in info
+        ]
+        inference_ready_ts = max(inference_ready_times) if inference_ready_times else None
+        self.wandb_logger.log_orchestrator_timeline_event("inference_servers_ready", timestamp=inference_ready_ts)
         _log.info(f"Inference servers ready ({self.num_inference_servers})")
 
         # --- Wait for trainer results and set up trainer state ---
@@ -469,7 +473,11 @@ class Orchestrator:
             self.wandb_logger.update_setup(setup_snapshot)
         except Exception as exc:
             _log.warning(f"Failed to collect/update setup snapshot: {exc}")
-        self.wandb_logger.log_orchestrator_timeline_event("trainer_ready")
+        trainer_ready_times = [
+            info["ready_time"] for info in self.trainer_runtime_infos if "ready_time" in info
+        ]
+        trainer_ready_ts = max(trainer_ready_times) if trainer_ready_times else None
+        self.wandb_logger.log_orchestrator_timeline_event("trainer_ready", timestamp=trainer_ready_ts)
 
     def stop_processes(self, force: bool = False):
         """Stop all Ray actors and side services.
@@ -2409,12 +2417,12 @@ class Orchestrator:
                     f"(off_policy_steps > {max_off_policy})"
                 )
                 self.wandb_logger.log_orchestrator_timeline_event(
-                    "rollout_cancelled_off_policy", step=step
+                    "rollout_cancelled_off_policy", step=step, timestamp=weight_update_ts
                 )
 
         if self.waiting_for_trainer:
             self.waiting_for_trainer = False
-            self.wandb_logger.log_orchestrator_timeline_event("rollout_resumed_max_async", step=self.inference_model_step)
+            self.wandb_logger.log_orchestrator_timeline_event("rollout_resumed_max_async", step=self.inference_model_step, timestamp=weight_update_ts)
             self._try_start_pending_rollouts()
 
     def _cancel_queued_individual_samples(self, request_id: int):
@@ -2923,8 +2931,12 @@ class Orchestrator:
                 save_step,
             )
             elapsed = time.time() - start
+            save_end_times = [
+                r["save_end_time"] for r in results if "save_end_time" in r
+            ]
+            checkpoint_done_ts = max(save_end_times) if save_end_times else None
             _log.info(f"Checkpoint saved at step {save_step} in {elapsed:.2f}s", step=save_step)
-            self.wandb_logger.log_orchestrator_timeline_event("checkpoint_save_done", step=save_step)
+            self.wandb_logger.log_orchestrator_timeline_event("checkpoint_save_done", step=save_step, timestamp=checkpoint_done_ts)
 
             # Log checkpoint sub-event timings to wandb (same pattern as train_step)
             timeline_events = []
