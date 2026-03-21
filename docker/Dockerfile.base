@@ -1,4 +1,4 @@
-# Telescope Base: heavy CUDA dependencies (flash-attn, APEX, Transformer Engine)
+# Telescope Base: heavy CUDA dependencies (APEX, Transformer Engine)
 #
 # This image is built RARELY — only when CUDA dependencies change.
 # Build it on a beefy machine (e.g. AWS) and push to GHCR:
@@ -7,8 +7,8 @@
 #   docker push ghcr.io/<owner>/telescope-base:latest
 #
 
-# ── Base: vLLM v0.12.0 (torch, CUDA 12.x, Python 3.12) ─────────────────────
-FROM vllm/vllm-openai:v0.12.0
+# ── Base: vLLM v0.17.0 (torch 2.10, CUDA 12.x, Python 3.12) ────────────────
+FROM vllm/vllm-openai:v0.17.0
 
 ENV MAX_JOBS=32 \
     DEBIAN_FRONTEND=noninteractive \
@@ -38,10 +38,6 @@ RUN UV_INSTALL_DIR="/usr/local/bin" sh /uv-installer.sh && rm /uv-installer.sh
 # System wheel package shadows pip-installed version; remove it first.
 RUN apt-get remove -y --purge python3-wheel 2>/dev/null || true
 RUN uv pip install --system "setuptools>=77.0.3,<80" "wheel>=0.43"
-
-# ── Flash-attention (pre-built wheel, NOT compiled from source) ──────────────
-# Required by FSDP backend (transformers attn_implementation="flash_attention_2").
-RUN uv pip install --system --no-build-isolation flash-attn==2.8.1
 
 # ── NVIDIA APEX (fused LayerNorm, fused Adam, enables sequence parallel) ────
 RUN NVCC_APPEND_FLAGS="--threads 8" \

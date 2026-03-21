@@ -959,7 +959,7 @@ def _all_gather_tp_param(name: str, param: torch.nn.Parameter, tp_group) -> torc
 
 
 # ============================================================================
-# Grad buffer memory management (pattern from SkyRL/verl)
+# Grad buffer memory management
 # ============================================================================
 
 def _free_grad_buffers(model_list: list) -> list[list[int]]:
@@ -2465,7 +2465,7 @@ class MegatronBackend(TrainingBackend):
 
         # Bridge reads share_embeddings_and_output_weights from the model config.
         # Megatron Core stores it on the GPTModel, not on TransformerConfig, so
-        # we temporarily patch it (same pattern as MILES).
+        # we temporarily patch it.
         try:
             from megatron.core.utils import unwrap_model
             unwrapped = unwrap_model(self._model)[0]
