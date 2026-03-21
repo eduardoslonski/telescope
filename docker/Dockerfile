@@ -1,7 +1,7 @@
 # Telescope: RL post-training for LLMs
 #
-# This image layers code on top of telescope-base (which has vLLM, flash-attn,
-# APEX, Transformer Engine pre-built). It builds in minutes, not hours.
+# This image layers code on top of telescope-base (which has vLLM, APEX,
+# Transformer Engine pre-built). It builds in minutes, not hours.
 #
 # Build:
 #   docker build -f docker/Dockerfile -t telescope .
@@ -26,7 +26,7 @@ COPY tools/ tools/
 
 # ── Install telescope ───────────────────────────────────────────────────────
 # Pre-sync .venv so `uv run` doesn't re-sync at runtime.
-# Enable system-site-packages so CUDA packages (flash-attn, apex, TE)
+# Enable system-site-packages so CUDA packages (apex, TE)
 # installed earlier into system Python remain visible in the venv.
 RUN ulimit -n 65536 && uv sync --frozen --no-dev \
     && sed -i 's/include-system-site-packages = false/include-system-site-packages = true/' .venv/pyvenv.cfg
