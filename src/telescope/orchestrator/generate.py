@@ -1,10 +1,14 @@
 """Rollout logic for inference servers."""
 import asyncio
+import http.client as _httpclib
 import inspect
+import json as _json_mod
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 
@@ -20,6 +24,38 @@ from telescope.environments.base import (
 from telescope.utils.tlog import get_logger
 
 _log = get_logger("generate")
+
+# ---------------------------------------------------------------------------
+# Thread-pool HTTP: moves socket I/O off the asyncio event loop.
+#
+# With 2000+ concurrent requests, async httpx creates massive event loop
+# contention (~3s overhead per request from JSON parsing + protocol handling).
+# Running HTTP in threads with stdlib http.client avoids this:
+#   - http.client is a thin socket wrapper; socket I/O releases the GIL.
+#   - No connection pool locks (unlike httpx), so 2000+ threads don't fight.
+#   - JSON parsing stays on the event loop (single-threaded, no GIL contention).
+#   - Pool size must be >= total concurrent requests (threads block for the
+#     full I/O duration of each request).
+# ---------------------------------------------------------------------------
+_http_pool = ThreadPoolExecutor(max_workers=2048, thread_name_prefix="http")
+
+
+def _sync_http_post(url: str, body: bytes) -> tuple[bytes, dict[str, str], float]:
+    """Synchronous HTTP POST using stdlib http.client — runs in the thread pool."""
+    parsed = urlparse(url)
+    _t0 = time.time()
+    conn = _httpclib.HTTPConnection(parsed.hostname, parsed.port, timeout=1200)
+    try:
+        conn.request("POST", parsed.path, body=body,
+                     headers={"Content-Type": "application/json",
+                              "Content-Length": str(len(body))})
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+    finally:
+        conn.close()
+    _dur = time.time() - _t0
+    return resp_body, headers, _dur
 
 
 def get_chat_template_kwargs() -> dict:
@@ -292,7 +328,8 @@ async def _retry_request(coro_factory, max_retries=MAX_RETRIES):
             raise RuntimeError("Shutting down")
         try:
             return await coro_factory()
-        except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+        except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError,
+                ConnectionError, OSError, _httpclib.HTTPException) as e:
             last_exception = e
             if _shutting_down:
                 raise
@@ -452,9 +489,15 @@ async def generate_completion_with_tokens(
         if "start_time" not in timing_out:
             timing_out["start_time"] = start_time
 
+    _req_body = _json_mod.dumps(data).encode()
+    _url = f"{server_url}/v1/completions"
+    loop = asyncio.get_event_loop()
+
     async def make_request():
-        response = await client.post(url=f"{server_url}/v1/completions", json=data)
-        return response.json()
+        _resp_body, _, _ = await loop.run_in_executor(
+            _http_pool, _sync_http_post, _url, _req_body,
+        )
+        return _json_mod.loads(_resp_body)
 
     try:
         result = await _retry_request(make_request)
@@ -559,9 +602,15 @@ async def generate_completion(
         if "start_time" not in timing_out:
             timing_out["start_time"] = start_time
 
+    _req_body = _json_mod.dumps(data).encode()
+    _url = f"{server_url}/v1/completions"
+    loop = asyncio.get_event_loop()
+
     async def make_request():
-        response = await client.post(url=f"{server_url}/v1/completions", json=data)
-        return response.json()
+        _resp_body, _, _ = await loop.run_in_executor(
+            _http_pool, _sync_http_post, _url, _req_body,
+        )
+        return _json_mod.loads(_resp_body)
 
     try:
         result = await _retry_request(make_request)
@@ -1051,10 +1100,11 @@ async def process_sample(
     if on_generation_complete is not None:
         on_generation_complete()
 
-    # Compute rewards using environment's reward function
-    # Support both sync and async compute_reward (async needed for sandbox-based envs like i3-code)
+    # Compute rewards in thread pool to avoid blocking the event loop (can take 50-450ms)
     _reward_t0 = time.monotonic()
-    reward_result = compute_reward_fn(completion_text, sample, eos_token)
+    reward_result = await asyncio.get_event_loop().run_in_executor(
+        None, compute_reward_fn, completion_text, sample, eos_token
+    )
     if inspect.isawaitable(reward_result):
         reward_result = await reward_result
     compute_reward_time = time.monotonic() - _reward_t0
@@ -1170,10 +1220,11 @@ async def process_multiturn_sample(
             "error_message": "No turns completed in rollout",
         }
     
-    # Compute reward for completed trajectory
-    # Support both sync and async compute_reward (async needed for sandbox-based envs)
+    # Compute reward in thread pool to avoid blocking the event loop
     _reward_t0 = time.monotonic()
-    reward_result = env.compute_reward(state, eos_token)
+    reward_result = await asyncio.get_event_loop().run_in_executor(
+        None, env.compute_reward, state, eos_token
+    )
     if inspect.isawaitable(reward_result):
         reward_result = await reward_result
     compute_reward_time = time.monotonic() - _reward_t0
