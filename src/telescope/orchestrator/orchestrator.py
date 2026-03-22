@@ -830,10 +830,13 @@ class Orchestrator:
         else:
             total_capacity = self.max_concurrent_prompts_per_server * len(self.server_urls)
         _log.debug(f"Launching up to {total_capacity} initial dispatches...")
+        _dispatch_yield_interval = max(1, len(self.server_urls))
         for i in range(total_capacity):
             if not self._start_next_prompt():
                 break
             _log.debug(f"Starting initial prompt {i+1}/{total_capacity}")
+            if (i + 1) % _dispatch_yield_interval == 0:
+                await asyncio.sleep(0)
 
         _log.debug(f"Started {self.active_count} initial prompts")
         _log.debug(f"Rollout loop initialized: active={self.active_count}, bucket={len(self.bucket)}")
@@ -868,16 +871,35 @@ class Orchestrator:
         available_slots.remove(lane_slot)
         return lane_slot
 
-    def _start_next_prompt(self) -> bool:
-        """Start generating the next prompt if available and within async limit.
+    # --- Deferred dispatch: consolidates many _start_next_prompt calls ---
+    _dispatch_pending = False
+    _dispatch_task: asyncio.Task | None = None
 
-        In individual sample lanes mode, this dispatches a single sample per
-        call (either from the per-server queue or by selecting a new prompt
-        and enqueuing its GROUP_SIZE samples).  The caller loops until this
-        returns False.
+    def _schedule_dispatch(self):
+        """Request a dispatch cycle without blocking the caller.
 
-        Returns True if work was dispatched, False otherwise.
+        Multiple calls between event-loop yields are coalesced into a
+        single async task that dispatches in batches with periodic yields.
         """
+        if self._dispatch_pending:
+            return
+        self._dispatch_pending = True
+        if self._dispatch_task is None or self._dispatch_task.done():
+            self._dispatch_task = asyncio.ensure_future(self._deferred_dispatch_loop())
+
+    async def _deferred_dispatch_loop(self):
+        """Process pending dispatches with periodic yields."""
+        _yield_interval = max(1, len(self.server_urls))
+        while self._dispatch_pending:
+            self._dispatch_pending = False
+            _count = 0
+            while self._start_next_prompt():
+                _count += 1
+                if _count % _yield_interval == 0:
+                    await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+    def _start_next_prompt(self) -> bool:
         if self.individual_sample_lanes:
             return self._start_next_individual()
 
@@ -1127,8 +1149,8 @@ class Orchestrator:
             lane_freed = True
             if server_url in self.available_server_lane_slots:
                 self.available_server_lane_slots[server_url].add(lane_slot)
-            # A lane just freed — try to dispatch queued samples immediately.
-            self._start_next_prompt()
+            # A lane just freed — schedule dispatch (coalesced, non-blocking).
+            self._schedule_dispatch()
 
         on_gen_complete = _free_lane if self.free_lane_after_generation else None
 
@@ -1225,8 +1247,8 @@ class Orchestrator:
         group["remaining"] -= 1
         group["samples"][sample_idx] = {"error": "cancelled", "error_message": "Task cancelled"}
 
-        # Lane freed — dispatch queued samples or create new groups.
-        self._start_next_prompt()
+        # Lane freed — schedule dispatch (coalesced, non-blocking).
+        self._schedule_dispatch()
 
         if group["remaining"] == 0:
             # Log inference events for completed (non-cancelled) samples
@@ -1456,9 +1478,8 @@ class Orchestrator:
         )
 
         if group["remaining"] > 0:
-            # A lane freed — dispatch queued samples or create new groups.
-            # _start_next_prompt handles both via _start_next_individual.
-            self._start_next_prompt()
+            # A lane freed — schedule dispatch (coalesced, non-blocking).
+            self._schedule_dispatch()
             return
 
         # All samples done — assemble the group
@@ -1703,14 +1724,14 @@ class Orchestrator:
             self.wandb_logger.log_orchestrator_timeline_event(f"rollout_discarded_{error_type}")
             # Continue to next prompt without adding to bucket
             if self._has_pending_prompt_data():
-                self._start_next_prompt()
+                self._schedule_dispatch()
             elif self.active_count == 0:
                 if self.bucket:
                     self._save_batch()
                 if not self._checkpoint_pending:
                     self.rollout_done.set()
             return
-        
+
         # Check if result is within async limit
         model_step = result.get("model_step", 0)
         async_level = self._compute_async_level(model_step)
@@ -1742,7 +1763,7 @@ class Orchestrator:
 
         # Continue or finish
         if self._has_pending_prompt_data():
-            self._start_next_prompt()
+            self._schedule_dispatch()
         elif self.active_count == 0:
             # Only flush remaining bucket if we still need more steps
             if self.bucket and self.inference_step < self.num_steps:
@@ -2142,57 +2163,59 @@ class Orchestrator:
         self._try_start_pending_rollouts()
 
     def _save_batch(self):
-        """Preprocess a rollout batch and submit it to Ray trainer actors."""
+        """Schedule batch preprocessing + submission as an async task to avoid blocking event loop."""
         if self.trainer_group is None:
             raise RuntimeError("Trainer group is not initialized")
 
         batch = self.bucket[:self.batch_size]
         self.bucket = self.bucket[self.batch_size:]
 
-        # Preprocess per DP shard, preserving run-wide sample indices.
-        # For Megatron, TP/PP ranks sharing a DP rank should consume the same shard.
-        trainer_data = preprocess_batch(
-            batch,
-            self.num_trainer_data_shards,
-            start_sample_idx=self.next_sample_idx,
-        )
+        # Capture state needed by the async task
+        _start_idx = self.next_sample_idx
+        _step = self.inference_step
+        _checkpoint_pending = self._checkpoint_pending
 
-        # Log rollouts directly from the orchestrator (no need to route through trainer)
-        self._log_rollouts(batch, self.inference_step)
-        self._step_batches[self.inference_step] = batch
-
-        # Count total samples in batch and increment counter
+        # Count total samples and increment counters synchronously (fast, O(n))
         total_samples = sum(len(group["completion_token_ids"]) for group in batch)
         self.next_sample_idx += total_samples
-
-        # If a checkpoint is pending, buffer this batch instead of submitting to
-        # Ray actors.  This prevents training steps from running ahead of the
-        # checkpoint save (which would corrupt the saved model state).
-        if self._checkpoint_pending:
-            self._pending_batches.append((self.inference_step, trainer_data))
-            _log.info(f"Buffered batch for step {self.inference_step} (checkpoint pending)")
-            self.inference_step += 1
-            return
-
-        # Submit train step asynchronously; watcher consumes completions in order.
-        self.pending_train_step_refs[self.inference_step] = self.trainer_group.submit_train_step(
-            step=self.inference_step,
-            trainer_data_per_rank=trainer_data,
-        )
-
-        self.wandb_logger.log_orchestrator_timeline_event("save_batch", step=self.inference_step)
-        _log.debug(f"Submitted trainer step {self.inference_step} to Ray actors", step=self.inference_step)
-        _log.info(f"Batch submitted to trainer for step {self.inference_step}")
+        self._step_batches[_step] = batch
         self.inference_step += 1
 
-        # Check if the just-submitted step will need a checkpoint.  If so,
-        # pause further batch submissions so the checkpoint save will be the
-        # first item in the Ray actor queue after this step completes.
-        submitted_step = self.inference_step - 1
+        # Check if checkpoint is needed (must be done before next batch)
+        submitted_step = _step
         is_last = (submitted_step == self.num_steps - 1)
         if self._should_save_checkpoint(submitted_step, is_last):
             self._checkpoint_pending = True
             _log.info(f"Checkpoint pending at step {submitted_step}, pausing batch submissions")
+
+        # Schedule heavy work as async task — preprocess_batch and _log_rollouts
+        # run in thread pool to avoid blocking the event loop.
+        asyncio.ensure_future(self._save_batch_async(batch, _start_idx, _step, _checkpoint_pending))
+
+    async def _save_batch_async(self, batch, start_sample_idx, step, checkpoint_pending):
+        """Run heavy batch preprocessing in thread pool, then submit to trainer."""
+        # preprocess_batch does FFD packing, padding, tensor creation — heavy CPU
+        trainer_data = await asyncio.get_event_loop().run_in_executor(
+            None, preprocess_batch, batch, self.num_trainer_data_shards, start_sample_idx,
+        )
+
+        # _log_rollouts does tokenizer encode/decode — heavy CPU
+        asyncio.get_event_loop().run_in_executor(None, self._log_rollouts, batch, step)
+
+        if checkpoint_pending:
+            self._pending_batches.append((step, trainer_data))
+            _log.info(f"Buffered batch for step {step} (checkpoint pending)")
+            return
+
+        # Submit train step to Ray
+        self.pending_train_step_refs[step] = self.trainer_group.submit_train_step(
+            step=step,
+            trainer_data_per_rank=trainer_data,
+        )
+
+        self.wandb_logger.log_orchestrator_timeline_event("save_batch", step=step)
+        _log.debug(f"Submitted trainer step {step} to Ray actors")
+        _log.info(f"Batch submitted to trainer for step {step}")
 
     def _prefetch_active(self) -> bool:
         return self.prefetch_enabled and self.prefetch_buffer_size > 0
