@@ -142,6 +142,7 @@ INFERENCE_EVENT_SCHEMA = pa.schema([
     ("step", pa.int32()),  # Training step (populated for weight_broadcast, -1 for requests)
     ("off_policy_steps", pa.int32()),  # Number of weight updates since this rollout was dispatched
     ("server_lane", pa.int32()),  # Per-server lane slot for this sample
+    ("phase", pa.string()),  # "start" or "end" (empty for backward compat e.g. weight_broadcast)
 ])
 
 # GPU metrics schema - includes gpu_index column
@@ -608,6 +609,7 @@ class InferenceEvent:
     step: int = -1  # Training step (populated for weight_broadcast, -1 for requests)
     off_policy_steps: int = 0  # Number of weight updates since this rollout was dispatched
     server_lane: int = -1  # Per-server lane slot for this sample
+    phase: str = ""  # "start" or "end" (empty for backward compat e.g. weight_broadcast)
 
 
 @dataclass
@@ -704,6 +706,7 @@ class EventLogger:
         # Event buffers
         self._events: list[Event] = []
         self._inference_events: list[InferenceEvent] = []
+        self._inflight_generations: dict[int, InferenceEvent] = {}  # sample_id -> start event
 
         # External metrics loggers (set via set_metrics_loggers)
         self._system_metrics_logger: SystemMetricsLogger | None = None
@@ -1019,6 +1022,7 @@ class EventLogger:
         step: int = -1,
         off_policy_steps: int = 0,
         server_lane: int = -1,
+        phase: str = "",
     ):
         """
         Log an inference event (request or weight broadcast).
@@ -1046,6 +1050,7 @@ class EventLogger:
             step: Training step (populated for weight_broadcast events, -1 for requests)
             off_policy_steps: Number of weight updates since this rollout was dispatched
             server_lane: Per-server lane slot for this sample
+            phase: "start" or "end" (empty for weight_broadcast events)
         """
         event = InferenceEvent(
             event_type=event_type,
@@ -1076,10 +1081,16 @@ class EventLogger:
             step=step,
             off_policy_steps=off_policy_steps,
             server_lane=server_lane,
+            phase=phase,
         )
 
         with self._lock:
             self._inference_events.append(event)
+            # Track inflight generations for snapshot
+            if phase == "start" and sample_id >= 0:
+                self._inflight_generations[sample_id] = event
+            elif phase == "end" and sample_id >= 0:
+                self._inflight_generations.pop(sample_id, None)
 
     def log_step_metric(self, step: int, metric: str, value: float, section: str = "", group: str = ""):
         """Log a per-step metric."""
@@ -1332,6 +1343,7 @@ class EventLogger:
                 "step": pa.array([], type=pa.int32()),
                 "off_policy_steps": pa.array([], type=pa.int32()),
                 "server_lane": pa.array([], type=pa.int32()),
+                "phase": pa.array([], type=pa.string()),
             })
 
         data = {
@@ -1361,6 +1373,7 @@ class EventLogger:
             "step": [e.step if e.step != -1 else None for e in events],
             "off_policy_steps": [e.off_policy_steps for e in events],
             "server_lane": [e.server_lane for e in events],
+            "phase": [e.phase for e in events],
         }
         return pa.table(data, schema=INFERENCE_EVENT_SCHEMA)
 
@@ -2273,6 +2286,7 @@ class EventLogger:
         eval_rollouts: list[EvalRollout] | None = None,
         eval_prompts: list[EvalPrompt] | None = None,
         logs: list[tuple[LogRecord, int]] | None = None,
+        inflight_snapshot: list[dict] | None = None,
     ):
         """Write all event data as separate parquet files in a single zip archive."""
         if self.run is None:
@@ -2409,6 +2423,13 @@ class EventLogger:
             meta["table_schema_versions"] = dict(table_schema_versions)
             zf.writestr("metadata.json", json.dumps(meta))
 
+            # Write inflight snapshot if provided (only for tail.zip)
+            if inflight_snapshot is not None:
+                zf.writestr("inflight.json", json.dumps({
+                    "snapshot_time": time.time(),
+                    "running": inflight_snapshot,
+                }))
+
         self.run.save(str(dest_path), base_path=self.run.dir, policy="now")
 
     def _write_steps_zip_to_wandb(
@@ -2539,6 +2560,19 @@ class EventLogger:
             for p in self._eval_prompts:
                 if p.tail_idx == -1:
                     p.tail_idx = current_tail_idx
+            # Snapshot inflight generations for tail.zip
+            inflight_snapshot = [
+                {
+                    "sample_id": e.sample_id,
+                    "group_id": e.group_id,
+                    "server": e.server,
+                    "server_lane": e.server_lane,
+                    "start_time": e.start_time,
+                    "is_eval": e.is_eval,
+                    "prompt_tokens": e.prompt_tokens,
+                }
+                for e in self._inflight_generations.values()
+            ]
             all_events = list(self._events)
             all_inference_events = list(self._inference_events)
             all_discarded_rollouts = list(self._discarded_rollouts)
@@ -2784,6 +2818,7 @@ class EventLogger:
             eval_rollouts=tail_eval_rollouts,
             eval_prompts=tail_eval_prompts,
             logs=tail_log_records,
+            inflight_snapshot=inflight_snapshot,
         )
 
         # Write block_live.zip with all data
