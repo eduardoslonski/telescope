@@ -621,6 +621,7 @@ class WandbLogger:
         step: int = -1,
         off_policy_steps: int = 0,
         server_lane: int = -1,
+        phase: str = "",
     ):
         """
         Log an inference event (request or weight broadcast).
@@ -647,6 +648,7 @@ class WandbLogger:
             compute_reward_time: Time for compute_reward or compute_eval_metrics (seconds)
             step: Training step (populated for weight_broadcast events, -1 for requests)
             off_policy_steps: Number of weight updates since this rollout was dispatched
+            phase: "start" or "end" (empty for weight_broadcast events)
         """
         if not config.cfg.use_wandb:
             return
@@ -706,6 +708,7 @@ class WandbLogger:
             step=step,
             off_policy_steps=off_policy_steps,
             server_lane=server_lane,
+            phase=phase,
         )
 
     def log_discarded_rollout(
