@@ -170,6 +170,7 @@ class TelescopeConfig(BaseModel, extra="forbid"):
     use_tis: bool
     tis_cap: float = Field(ge=1.0)
     tis_logprob_clamp: float = Field(gt=0)
+    kl_penalty_tau: float = Field(ge=0)
     entropy_chunk_size: int
 
     # Weight sync

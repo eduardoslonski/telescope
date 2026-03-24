@@ -93,6 +93,7 @@ advantage_norm: "group" # "group" = normalize within prompt group; "batch" = nor
 use_tis: false # truncated importance sampling — corrects for async vLLM/trainer logprob mismatch
 tis_cap: 2.0 # max importance weight
 tis_logprob_clamp: 20.0
+kl_penalty_tau: 0.0 # coefficient for KL penalty added to loss (k2 approx: tau * log_ratio²); 0 = disabled
 entropy_chunk_size: 1024
 
 # ── Weight sync ──────────────────────────────────────────────────────────────
