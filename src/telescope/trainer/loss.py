@@ -207,6 +207,11 @@ def compute_rl_loss(
             tis_ratio = torch.exp(logprob_diff).clamp(max=config.cfg.tis_cap).detach()
             policy_loss = policy_loss * tis_ratio
 
+        # --- KL penalty (k2 approximation: tau * log_ratio²) ---
+        if config.cfg.kl_penalty_tau > 0 and vllm_delta is not None:
+            kl_penalty = config.cfg.kl_penalty_tau * vllm_delta.pow(2)
+            policy_loss = policy_loss + kl_penalty
+
         # --- Apply mask and compute loss ---
         policy_loss = policy_loss * shift_loss_mask
         num_tokens = int(shift_loss_mask.sum().item())
@@ -248,6 +253,9 @@ def compute_rl_loss(
         "kl_divergence_inference": kl_value,
         "num_tokens": num_tokens,
     }
+    if config.cfg.kl_penalty_tau > 0 and vllm_delta is not None:
+        kl_pen = (vllm_delta.pow(2) * shift_loss_mask).sum() / shift_loss_mask.sum().clamp_min(1)
+        metrics["kl_penalty"] = float(kl_pen.item())
     
     return scaled_loss, metrics
 
