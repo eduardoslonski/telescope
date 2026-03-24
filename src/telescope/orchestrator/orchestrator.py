@@ -1311,11 +1311,6 @@ class Orchestrator:
         self._schedule_dispatch()
 
         if group["remaining"] == 0:
-            # Log inference events for completed (non-cancelled) samples
-            # whose events would otherwise be lost since the group won't go
-            # through the normal assembly → _on_rollout_complete path.
-            rollout_info = self.inflight_rollout_info.get(request_id)
-            self._log_completed_individual_samples(group, request_id, rollout_info)
             self.active_count -= 1
             del self.pending_individual_groups[request_id]
             self.inflight_rollout_info.pop(request_id, None)
@@ -1386,99 +1381,6 @@ class Orchestrator:
                     span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
             if span_data is not None:
                 timing["otlp_timing"] = span_data
-
-    def _log_completed_individual_samples(
-        self, group: dict, request_id: int,
-        rollout_info: "InflightRolloutInfo | None",
-    ):
-        """Log inference events for completed samples in a partially-cancelled group.
-
-        When a group is resolved through cancellation, completed samples never
-        go through the normal assembly → _on_rollout_complete →
-        _log_inference_request_events path, so their inference events would be
-        lost.  This method logs them directly.
-        """
-        if generate_module._shutting_down:
-            return
-
-        server_url = group["server_url"]
-        server_idx = self._get_server_index(server_url)
-        server_info = self._get_server_info(server_url)
-        lane_slots = group["lane_slots"]
-        off_policy = rollout_info.sample_off_policy_steps if rollout_info else {}
-
-        for sample_idx, sample_result in enumerate(group["samples"]):
-            if sample_result is None or "error" in sample_result:
-                continue
-
-            # Single-turn: "request_timing" (dict)
-            # Multi-turn: "request_timings" (list of dicts)
-            timings = sample_result.get("request_timings")
-            if timings is None:
-                single = sample_result.get("request_timing")
-                timings = [single] if single else []
-
-            # Use pre-assigned sample_id for this sample
-            pre_assigned_ids = rollout_info.sample_ids if rollout_info else {}
-            sample_id = pre_assigned_ids.get(sample_idx, -1)
-
-            for timing in timings:
-                vllm_request_id = timing.get("vllm_request_id", "")
-                vllm_max_tokens = timing.get("max_tokens", 0)
-                queue_time = 0.0
-                time_to_first_token = 0.0
-                prefill_time = 0.0
-                decode_time = 0.0
-                inference_time = 0.0
-                e2e_latency = 0.0
-
-                # Use pre-fetched timing from _fetch_otlp_timing_for_result
-                # if available, otherwise fall back to live lookup.
-                span_data = timing.pop("otlp_timing", None)
-                if span_data is None and self.otlp_receiver is not None and vllm_request_id:
-                    span_key = f"{vllm_request_id}-0"
-                    span_data = self.otlp_receiver.get_and_remove(span_key)
-                    if span_data is None:
-                        span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
-                if span_data is not None:
-                    queue_time = span_data.get("queue_time") or 0.0
-                    time_to_first_token = span_data.get("time_to_first_token") or 0.0
-                    prefill_time = span_data.get("prefill_time") or 0.0
-                    decode_time = span_data.get("decode_time") or 0.0
-                    inference_time = span_data.get("inference_time") or 0.0
-                    e2e_latency = span_data.get("e2e_latency") or 0.0
-
-                server_lane = lane_slots[sample_idx] if sample_idx < len(lane_slots) and lane_slots[sample_idx] is not None else -1
-
-                self.wandb_logger.log_inference_event(
-                    event_type="request",
-                    server=server_idx,
-                    start_time=timing["start_time"],
-                    end_time=timing["end_time"],
-                    node_id=server_info.get("node_id", -1),
-                    node_ip=str(server_info.get("node_ip") or ""),
-                    hostname=str(server_info.get("hostname") or ""),
-                    ray_node_id=str(server_info.get("ray_node_id") or ""),
-                    tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-                    tp_size=int(server_info.get("tp_size", 1)),
-                    prompt_tokens=timing.get("prompt_tokens", 0),
-                    rollout_tokens=timing.get("rollout_tokens", 0),
-                    group_id=request_id,
-                    sample_id=sample_id,
-                    vllm_request_id=vllm_request_id,
-                    queue_time=queue_time,
-                    time_to_first_token=time_to_first_token,
-                    prefill_time=prefill_time,
-                    decode_time=decode_time,
-                    inference_time=inference_time,
-                    e2e_latency=e2e_latency,
-                    vllm_max_tokens=vllm_max_tokens,
-                    is_canceled=True,
-                    compute_reward_time=timing.get("compute_reward_time", 0.0),
-                    off_policy_steps=off_policy.get(sample_idx, 0),
-                    server_lane=server_lane,
-                    phase="end",
-                )
 
     def _on_cancelled_group(
         self, request_id: int, server_url: str, lane_slots: list[int],
@@ -2617,8 +2519,6 @@ class Orchestrator:
         # and no CancelledError handler will fire to clean up.
         group = self.pending_individual_groups.get(request_id)
         if group is not None and group["remaining"] == 0:
-            rollout_info = self.inflight_rollout_info.get(request_id)
-            self._log_completed_individual_samples(group, request_id, rollout_info)
             self.active_count -= 1
             del self.pending_individual_groups[request_id]
             self.inflight_rollout_info.pop(request_id, None)
