@@ -584,6 +584,16 @@ class Orchestrator:
                         eval_server_urls=baseline_urls,
                     )
 
+            # Pre-warm environment resources (e.g. sandbox pools) so they
+            # are ready by the time the first completions need rewards.
+            if config.cfg.eager_prepare_resources:
+                if hasattr(self.scheduler, 'environments'):
+                    _envs = self.scheduler.environments
+                else:
+                    _envs = [self.scheduler.environment]
+                for _env in _envs:
+                    await _env.prepare_resources()
+
             watcher = asyncio.create_task(self._weight_update_watcher())
             rollout = asyncio.create_task(self._rollout_loop())
             metrics = asyncio.create_task(self._metrics_logger())

@@ -214,6 +214,14 @@ class Environment(ABC):
             sample_tags=reward_result.sample_tags,
         )
 
+    async def prepare_resources(self):
+        """Optional hook to pre-warm expensive resources (e.g. sandbox pools).
+
+        Called by the orchestrator before the rollout loop starts.
+        Default is a no-op; override in subclasses that need it.
+        """
+        pass
+
     def get_sample(self, idx: int) -> Sample:
         """Get a sample by index."""
         if self._samples is None:

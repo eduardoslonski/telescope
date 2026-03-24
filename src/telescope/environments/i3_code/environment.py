@@ -243,6 +243,10 @@ class I3CodeEnvironment(SingleTurnEnvironment):
             )
             signal.signal(signal.SIGTERM, lambda _, __: (self._cleanup_sandboxes(), exit(143)))
 
+    async def prepare_resources(self):
+        """Start the sandbox pool early so sandboxes are ready by reward time."""
+        await self.sandbox_pool.start()
+
     metrics_ranges = {
         "passed": {"min": 0, "max": 1},
         "pass_rate": {"min": 0, "max": 1},
@@ -578,7 +582,8 @@ class I3CodeEnvironment(SingleTurnEnvironment):
                 ),
             )
 
-        # Ensure sandbox pool is started (idempotent)
+        # Ensure sandbox pool is started (idempotent — normally started
+        # earlier via prepare_resources(), this is a safety fallback)
         await self.sandbox_pool.start()
 
         verification_info = sample.metadata["verification_info"]

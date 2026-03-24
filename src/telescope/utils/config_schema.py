@@ -122,6 +122,7 @@ class TelescopeConfig(BaseModel, extra="forbid"):
     enable_individual_sample_lanes: bool
     free_lane_after_generation: bool
     max_off_policy_steps: int
+    eager_prepare_resources: bool
 
     # Trainer
     learning_rate: float = Field(gt=0)
