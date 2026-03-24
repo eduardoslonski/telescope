@@ -32,19 +32,24 @@ class Scheduler:
         """
         self.environment = environment
         self._dataset_size = len(environment)
-        # Cap excluded indices to valid dataset range
+        # Pre-compute valid training indices (all indices minus eval-reserved ones)
         if excluded_indices:
-            self._excluded = {i for i in excluded_indices if i < self._dataset_size}
+            excluded = {i for i in excluded_indices if i < self._dataset_size}
         else:
-            self._excluded = set()
+            excluded = set()
+        if excluded:
+            self._valid_indices = np.array(
+                [i for i in range(self._dataset_size) if i not in excluded],
+                dtype=np.intp,
+            )
+            _log.info(
+                f"Scheduler: excluding {len(excluded)} eval samples, "
+                f"{len(self._valid_indices)}/{self._dataset_size} available for training"
+            )
+        else:
+            self._valid_indices = None  # sample from full range
         self._rng = np.random.RandomState(np.random.randint(0, 2**31))
         self.current_idx = 0
-        if self._excluded:
-            effective = self._dataset_size - len(self._excluded)
-            _log.info(
-                f"Scheduler: excluding {len(self._excluded)} eval samples, "
-                f"{effective}/{self._dataset_size} available for training"
-            )
         _log.debug(f"Scheduler initialized (infinite): env={environment.name}, dataset_size={self._dataset_size}")
 
     def get_next_sample(self) -> dict:
@@ -57,20 +62,10 @@ class Scheduler:
             - env_name: Environment name for logging
             - env: Environment instance (for formatting and multi-turn)
         """
-        idx = self._rng.randint(0, self._dataset_size)
-        if self._excluded:
-            # Resample to avoid eval-reserved indices
-            for _ in range(100):
-                if idx not in self._excluded:
-                    break
-                idx = self._rng.randint(0, self._dataset_size)
-            else:
-                if idx in self._excluded:
-                    _log.warning(
-                        f"Rejection sampling failed after 100 attempts "
-                        f"(excluded {len(self._excluded)}/{self._dataset_size}). "
-                        f"Using eval-reserved index {idx}."
-                    )
+        if self._valid_indices is not None:
+            idx = self._rng.choice(self._valid_indices)
+        else:
+            idx = self._rng.randint(0, self._dataset_size)
         progress = self.current_idx
         self.current_idx += 1
         
@@ -118,15 +113,24 @@ class MultiEnvScheduler:
         """
         self.environments = environments
         self._dataset_sizes = [len(env) for env in environments]
-        # Cap excluded indices to valid dataset range per environment
-        env_sizes = {env.name: len(env) for env in environments}
-        if excluded_indices:
-            self._excluded = {
-                name: {i for i in exc if i < env_sizes.get(name, 0)}
-                for name, exc in excluded_indices.items()
-            }
-        else:
-            self._excluded = {}
+        # Pre-compute valid training indices per environment
+        self._valid_indices: dict[str, np.ndarray | None] = {}
+        for env in environments:
+            size = len(env)
+            exc = (excluded_indices or {}).get(env.name)
+            if exc:
+                excluded = {i for i in exc if i < size}
+                valid = np.array(
+                    [i for i in range(size) if i not in excluded],
+                    dtype=np.intp,
+                )
+                self._valid_indices[env.name] = valid
+                _log.info(
+                    f"MultiEnvScheduler: excluding {len(excluded)} eval samples "
+                    f"from '{env.name}', {len(valid)}/{size} available for training"
+                )
+            else:
+                self._valid_indices[env.name] = None
 
         # Normalize weights to probabilities
         weights_arr = np.array(weights, dtype=float)
@@ -136,12 +140,6 @@ class MultiEnvScheduler:
         self.current_idx = 0
 
         env_names = [e.name for e in environments]
-        for env_name, exc in self._excluded.items():
-            if exc:
-                _log.info(
-                    f"MultiEnvScheduler: excluding {len(exc)} eval samples "
-                    f"from '{env_name}'"
-                )
         _log.debug(f"MultiEnvScheduler initialized (infinite): environments={env_names}")
         _log.debug(f"  weights={weights}, normalized_probs={self.probs.tolist()}")
 
@@ -156,21 +154,12 @@ class MultiEnvScheduler:
             - env: Environment instance (for formatting and multi-turn)
         """
         env_idx = self._rng.choice(len(self.environments), p=self.probs)
-        sample_idx = self._rng.randint(0, self._dataset_sizes[env_idx])
         env = self.environments[env_idx]
-        env_excluded = self._excluded.get(env.name)
-        if env_excluded:
-            for _ in range(100):
-                if sample_idx not in env_excluded:
-                    break
-                sample_idx = self._rng.randint(0, self._dataset_sizes[env_idx])
-            else:
-                if sample_idx in env_excluded:
-                    _log.warning(
-                        f"Rejection sampling failed after 100 attempts for '{env.name}' "
-                        f"(excluded {len(env_excluded)}/{self._dataset_sizes[env_idx]}). "
-                        f"Using eval-reserved index {sample_idx}."
-                    )
+        valid = self._valid_indices.get(env.name)
+        if valid is not None:
+            sample_idx = self._rng.choice(valid)
+        else:
+            sample_idx = self._rng.randint(0, self._dataset_sizes[env_idx])
         progress = self.current_idx
         self.current_idx += 1
         sample = env.get_sample(sample_idx)
