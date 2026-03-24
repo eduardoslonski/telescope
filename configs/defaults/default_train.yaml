@@ -46,6 +46,7 @@ prompt_prefetch_buffer_size: 24
 enable_individual_sample_lanes: true # true = each sample gets its own lane slot instead of one per group
 max_off_policy_steps: 8 # cancel in-flight rollouts after this many weight updates (-1 = disabled)
 free_lane_after_generation: true # free inference lane after generation (before compute_reward); requires enable_individual_sample_lanes
+eager_prepare_resources: false # call prepare_resources() on environments before the rollout loop (e.g. pre-warm sandbox pools)
 
 # ── Trainer ──────────────────────────────────────────────────────────────────
 learning_rate: 1.0e-6
