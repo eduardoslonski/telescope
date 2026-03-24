@@ -1260,8 +1260,14 @@ class Orchestrator:
         # The BatchSpanProcessor flushes every ~200ms, so fetching here
         # (right after sample completion) is much more reliable than deferring
         # to batch-save time when spans may have been pruned or not yet flushed.
-        if "error" not in result:
-            await self._fetch_otlp_timing_for_result(result)
+        # Guard against CancelledError during the OTLP fetch (which contains
+        # an asyncio.sleep await point): the generation result is already
+        # available, so we must still record it even if the task is cancelled.
+        try:
+            if "error" not in result:
+                await self._fetch_otlp_timing_for_result(result)
+        except asyncio.CancelledError:
+            pass
 
         self._on_individual_sample_complete(request_id, sample_idx, result)
 
@@ -1493,6 +1499,41 @@ class Orchestrator:
                 phase="end",
             )
 
+    def _log_individual_sample_error_end_event(
+        self, request_id: int, sample_idx: int, group: dict,
+    ):
+        """Log inference end event for a failed individual-mode sample."""
+        rollout_info = self.inflight_rollout_info.get(request_id)
+        sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
+        off_policy = rollout_info.sample_off_policy_steps.get(sample_idx, 0) if rollout_info else 0
+        timing = rollout_info.sample_timings.get(sample_idx, {}) if rollout_info else {}
+
+        server_url = group["server_url"]
+        server_idx = self._get_server_index(server_url)
+        server_info = self._get_server_info(server_url)
+        lane_slots = group["lane_slots"]
+        server_lane = lane_slots[sample_idx] if sample_idx < len(lane_slots) and lane_slots[sample_idx] is not None else -1
+
+        now = time.time()
+        self.wandb_logger.log_inference_event(
+            event_type="request",
+            server=server_idx,
+            start_time=timing.get("start_time", now),
+            end_time=timing.get("end_time", now),
+            node_id=server_info.get("node_id", -1),
+            node_ip=str(server_info.get("node_ip") or ""),
+            hostname=str(server_info.get("hostname") or ""),
+            ray_node_id=str(server_info.get("ray_node_id") or ""),
+            tp_group_id=int(server_info.get("tp_group_id", server_idx)),
+            tp_size=int(server_info.get("tp_size", 1)),
+            group_id=request_id,
+            sample_id=sample_id,
+            is_canceled=True,
+            off_policy_steps=off_policy,
+            server_lane=server_lane,
+            phase="end",
+        )
+
     def _on_individual_sample_complete(self, request_id: int, sample_idx: int, result: dict):
         """Store individual sample result; assemble group when all samples are done."""
         group = self.pending_individual_groups.get(request_id)
@@ -1504,8 +1545,11 @@ class Orchestrator:
         group["remaining"] -= 1
 
         # Log end event for this sample immediately (per-sample, not waiting for group)
-        if "error" not in result and not generate_module._shutting_down:
-            self._log_individual_sample_end_event(request_id, sample_idx, result, group)
+        if not generate_module._shutting_down:
+            if "error" not in result:
+                self._log_individual_sample_end_event(request_id, sample_idx, result, group)
+            else:
+                self._log_individual_sample_error_end_event(request_id, sample_idx, group)
 
         _log.debug(
             f"Individual sample complete: request_id={request_id}, "
