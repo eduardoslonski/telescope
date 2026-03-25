@@ -293,6 +293,14 @@ def _compute_rl_loss_vocab_parallel(
         if vllm_logprobs is not None:
             vllm_delta = log_probs - vllm_logprobs[..., 1:]
 
+        # --- Sequence-level IS masking (off-policy rejection) ---
+        # Applied before algorithm dispatch so GSPO's sequence-level computations
+        # use the cleaned mask (matching loss.py ordering).
+        _pre_mask_tokens = shift_loss_mask.sum().item()  # for metric
+        if config.cfg.seq_is_masking and vllm_delta is not None:
+            from telescope.trainer.loss import _apply_seq_is_masking
+            shift_loss_mask = _apply_seq_is_masking(shift_loss_mask, vllm_delta, position_ids)
+
         # --- Policy loss (algorithm dispatch) ---
         algo = config.cfg.algorithm
         adv = shift_advantages.squeeze(-1)
@@ -363,13 +371,40 @@ def _compute_rl_loss_vocab_parallel(
             pg_loss2 = -clipped_ratio * adv
             policy_loss = torch.max(pg_loss1, pg_loss2)
 
+        # --- Dual-clip PPO (cap loss magnitude for negative advantages) ---
+        _dual_clip_frac = 0.0  # for metric
+        if config.cfg.clip_ratio_c is not None:
+            c = config.cfg.clip_ratio_c
+            pg_loss3 = torch.sign(adv) * c * adv
+            _dual_clip_active = (pg_loss3.detach() < policy_loss.detach()) & (shift_loss_mask > 0)
+            _dual_clip_frac = float(_dual_clip_active.sum().item() / max(shift_loss_mask.sum().item(), 1))
+            policy_loss = torch.min(policy_loss, pg_loss3)
+
         # --- TIS correction (always uses vllm_delta = distance from rollout policy) ---
+        _tis_mean = 0.0  # for metric
+        _tis_zero_frac = 0.0  # for metric (ICE-POP)
         if config.cfg.use_tis and vllm_delta is not None:
             logprob_diff = vllm_delta.clamp(
                 -config.cfg.tis_logprob_clamp, config.cfg.tis_logprob_clamp
             )
-            tis_ratio = torch.exp(logprob_diff).clamp(max=config.cfg.tis_cap).detach()
+            if config.cfg.tis_mode == "icepop":
+                tis_ratio = torch.exp(logprob_diff).detach()
+                in_bounds = (tis_ratio >= config.cfg.tis_floor) & (tis_ratio <= config.cfg.tis_cap)
+                _valid = shift_loss_mask.sum().clamp_min(1)
+                _tis_zero_frac = float(((~in_bounds) & (shift_loss_mask > 0)).sum().item() / _valid.item())
+                tis_ratio = tis_ratio * in_bounds.to(tis_ratio.dtype)
+            else:
+                tis_ratio = torch.exp(logprob_diff).clamp(max=config.cfg.tis_cap).detach()
+            _tis_mean = float((tis_ratio * shift_loss_mask).sum().item() / shift_loss_mask.sum().clamp_min(1).item())
             policy_loss = policy_loss * tis_ratio
+
+        # --- KL penalty ---
+        if config.cfg.kl_penalty_tau > 0 and vllm_delta is not None:
+            from telescope.trainer.loss import _compute_kl_penalty
+            kl_penalty = config.cfg.kl_penalty_tau * _compute_kl_penalty(
+                vllm_delta, config.cfg.kl_estimator
+            )
+            policy_loss = policy_loss + kl_penalty
 
         policy_loss = policy_loss * shift_loss_mask
         num_tokens = int(shift_loss_mask.sum().item())
@@ -389,10 +424,19 @@ def _compute_rl_loss_vocab_parallel(
             loss = policy_loss.sum() / max(denom_val, 1.0)
         else:
             loss = policy_loss.sum() / token_denom
+
+        # --- Entropy bonus ---
+        entropy_value = None
+        if config.cfg.entropy_coef > 0:
+            _ent_mean = (entropy * shift_loss_mask).sum() / token_denom
+            loss = loss - config.cfg.entropy_coef * _ent_mean
+            entropy_value = float(_ent_mean.detach().item())
+
         scaled_loss = loss / num_micro_batches
 
     with _track("compute_entropy"):
-        entropy_value = float(((entropy * shift_loss_mask).sum() / token_denom).item())
+        if entropy_value is None:
+            entropy_value = float(((entropy * shift_loss_mask).sum() / token_denom).item())
 
     with _track("compute_kl"):
         kl_value = 0.0
@@ -406,6 +450,22 @@ def _compute_rl_loss_vocab_parallel(
         "kl_divergence_inference": kl_value,
         "num_tokens": num_tokens,
     }
+    if config.cfg.kl_penalty_tau > 0 and vllm_delta is not None:
+        from telescope.trainer.loss import _compute_kl_penalty
+        kl_pen = _compute_kl_penalty(vllm_delta.detach(), config.cfg.kl_estimator)
+        kl_pen = (kl_pen * shift_loss_mask).sum() / shift_loss_mask.sum().clamp_min(1)
+        metrics["kl_penalty"] = float(kl_pen.item())
+    if config.cfg.seq_is_masking:
+        _post_mask_tokens = shift_loss_mask.sum().item()
+        metrics["seq_is_masked_frac"] = 1.0 - _post_mask_tokens / max(_pre_mask_tokens, 1)
+    if config.cfg.clip_ratio_c is not None:
+        metrics["dual_clip_frac"] = _dual_clip_frac
+    if config.cfg.use_tis:
+        metrics["tis_mean"] = _tis_mean
+        if config.cfg.tis_mode == "icepop":
+            metrics["tis_zero_frac"] = _tis_zero_frac
+    if config.cfg.entropy_coef > 0:
+        metrics["entropy_bonus"] = config.cfg.entropy_coef * entropy_value
     return scaled_loss, metrics
 
 
@@ -2001,6 +2061,8 @@ class MegatronBackend(TrainingBackend):
         weighted_entropy = 0.0
         weighted_kl = 0.0
         all_grad_norms: list[float] = []
+        _extra_weighted: dict[str, float] = {}
+        _CORE_KEYS = {"grad_norm", "entropy", "kl_divergence_inference"}
 
         use_minibatch = len(groups) > 1
         for group_idx, group in enumerate(groups):
@@ -2112,14 +2174,15 @@ class MegatronBackend(TrainingBackend):
             # Collect metrics for this group
             group_metrics = self._collect_metrics(losses_reduced, grad_norm, num_mb_in_group)
 
-            # With PP > 1, entropy/KL are only valid on the last pipeline stage.
-            # Broadcast them so the reporting rank (pp_rank=0) has correct values.
+            # With PP > 1, loss-derived metrics (entropy, KL, etc.) are only
+            # valid on the last pipeline stage. Broadcast all of them so the
+            # reporting rank (pp_rank=0) has correct values.
             from megatron.core import parallel_state as mpu
             pp_size = mpu.get_pipeline_model_parallel_world_size()
             if pp_size > 1:
+                _pp_keys = sorted(k for k in group_metrics if k != "grad_norm")
                 metrics_tensor = torch.tensor(
-                    [group_metrics.get("entropy", 0.0),
-                     group_metrics.get("kl_divergence_inference", 0.0)],
+                    [group_metrics.get(k, 0.0) for k in _pp_keys],
                     device=self._device, dtype=torch.float32,
                 )
                 dist.broadcast(
@@ -2127,8 +2190,8 @@ class MegatronBackend(TrainingBackend):
                     src=mpu.get_pipeline_model_parallel_last_rank(),
                     group=mpu.get_pipeline_model_parallel_group(),
                 )
-                group_metrics["entropy"] = metrics_tensor[0].item()
-                group_metrics["kl_divergence_inference"] = metrics_tensor[1].item()
+                for i, k in enumerate(_pp_keys):
+                    group_metrics[k] = metrics_tensor[i].item()
 
             all_grad_norms.append(group_metrics.get("grad_norm", 0.0))
 
@@ -2138,6 +2201,9 @@ class MegatronBackend(TrainingBackend):
             # _collect_metrics and not easily extractable).
             weighted_entropy += group_metrics.get("entropy", 0.0) * num_mb_in_group
             weighted_kl += group_metrics.get("kl_divergence_inference", 0.0) * num_mb_in_group
+            for k, v in group_metrics.items():
+                if k not in _CORE_KEYS:
+                    _extra_weighted[k] = _extra_weighted.get(k, 0.0) + v * num_mb_in_group
             total_tokens += num_mb_in_group
 
         # Step the LR scheduler once per train_step (NOT per minibatch group).
@@ -2151,10 +2217,16 @@ class MegatronBackend(TrainingBackend):
             "entropy": weighted_entropy / denom,
             "kl_divergence_inference": weighted_kl / denom,
         }
+        for k in _extra_weighted:
+            metrics[k] = _extra_weighted[k] / denom
         metrics["learning_rate"] = (
             self._scheduler.get_last_lr()[0] if self._scheduler is not None
             else config.cfg.learning_rate
         )
+        # Pass through filter stats from batch preprocessing (if present)
+        filter_stats = trainer_data.get("filter_stats")
+        if filter_stats:
+            metrics.update(filter_stats)
         return metrics
 
     def _prepare_megatron_data(self, micro_batches: list[dict]) -> list[dict]:

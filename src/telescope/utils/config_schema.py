@@ -167,11 +167,33 @@ class TelescopeConfig(BaseModel, extra="forbid"):
     dr_grpo_loss_agg_mode: Literal["token_mean", "token_sum_norm"]
     advantage_norm: Literal["group", "batch"]
     use_ppo_clip: bool
+    clip_ratio_c: float | None  # dual-clip PPO: caps loss for negative advantages (must be > 1.0 if set)
     use_tis: bool
-    tis_cap: float = Field(ge=1.0)
+    tis_cap: float = Field(gt=0)
     tis_logprob_clamp: float = Field(gt=0)
+    tis_mode: Literal["truncate", "icepop"]  # truncate = clamp IS weights; icepop = zero tokens outside bounds
+    tis_floor: float = Field(ge=0)  # lower bound for IS weight (icepop only)
     kl_penalty_tau: float = Field(ge=0)
+    kl_estimator: Literal["k2", "k3"]  # k2 = log_ratio^2 (default); k3 = exp(-log_ratio)-1+log_ratio (lower variance)
+    entropy_coef: float = Field(ge=0)  # entropy bonus: subtract entropy_coef * entropy from loss (0 = disabled)
     entropy_chunk_size: int
+
+    # Sequence-level IS masking (off-policy rejection sampling)
+    seq_is_masking: bool  # zero entire sequences whose geometric-mean IS ratio is outside [low, high]
+    seq_is_mask_low: float = Field(gt=0, lt=1)  # must be < 1.0 (on-policy center)
+    seq_is_mask_high: float = Field(gt=1)  # must be > 1.0 (on-policy center)
+
+    # Overlong filtering
+    filter_overlong: bool  # zero loss mask for truncated responses (no EOS)
+    overlong_penalty_factor: float = Field(ge=0)  # soft penalty coefficient (0 = disabled)
+    overlong_buffer_tokens: int = Field(ge=1)  # buffer zone before max_tokens for graduated penalty
+
+    # Output quality filters
+    filter_gibberish: bool  # zero loss mask for gibberish (rare tokens at high entropy)
+    gibberish_token_threshold: int = Field(ge=1)  # token IDs above this are considered rare
+    gibberish_logprob_offset: float = Field(gt=0)  # flag if logprob < -log(vocab_size) - offset
+    filter_repetition: bool  # zero loss mask for repetitive completions
+    repetition_compression_threshold: float = Field(gt=1)  # flag if compression ratio exceeds this
 
     # Weight sync
     weight_broadcast_mode: Literal["flattened_bucket", "per_tensor"]
@@ -265,6 +287,19 @@ class TelescopeConfig(BaseModel, extra="forbid"):
                 f"use_ppo_clip=true is incompatible with algorithm={self.algorithm!r}. "
                 f"{self.algorithm!r} has its own clipping mechanism."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_clip_ratio_c(self) -> TelescopeConfig:
+        if self.clip_ratio_c is not None:
+            if self.clip_ratio_c <= 1.0:
+                raise ValueError("clip_ratio_c must be > 1.0 when set")
+            has_clipping = self.use_ppo_clip or self.algorithm in ("cispo", "gspo")
+            if not has_clipping:
+                raise ValueError(
+                    "clip_ratio_c (dual-clip PPO) requires ratio clipping to be active. "
+                    "Set use_ppo_clip=true or use an algorithm with built-in clipping (cispo, gspo)."
+                )
         return self
 
     @model_validator(mode="after")

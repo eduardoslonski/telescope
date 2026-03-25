@@ -273,6 +273,10 @@ class FSDPBackend(TrainingBackend):
         weighted_entropy = 0.0
         weighted_kl = 0.0
         all_grad_norms: list[float] = []
+        # Accumulate extra per-microbatch metrics (token-weighted like entropy/KL).
+        _extra_keys: set[str] = set()
+        _extra_weighted: dict[str, float] = {}
+        _CORE_KEYS = {"loss", "entropy", "kl_divergence_inference", "num_tokens"}
 
         use_minibatch = len(groups) > 1
         for group_idx, group in enumerate(groups):
@@ -300,6 +304,11 @@ class FSDPBackend(TrainingBackend):
                 group_tokens += nt
                 group_entropy += mb_metrics["entropy"] * nt
                 group_kl += mb_metrics["kl_divergence_inference"] * nt
+                # Accumulate any extra metrics from new stability features
+                for k, v in mb_metrics.items():
+                    if k not in _CORE_KEYS:
+                        _extra_keys.add(k)
+                        _extra_weighted[k] = _extra_weighted.get(k, 0.0) + v * nt
 
             # Gradient clipping
             with _track("grad_norm", minibatch=mb_idx):
@@ -343,10 +352,16 @@ class FSDPBackend(TrainingBackend):
             "entropy": weighted_entropy / denom,
             "kl_divergence_inference": weighted_kl / denom,
         }
+        for k in _extra_keys:
+            metrics[k] = _extra_weighted[k] / denom
         metrics["learning_rate"] = (
             self._scheduler.get_last_lr()[0] if self._scheduler is not None
             else config.cfg.learning_rate
         )
+        # Pass through filter stats from batch preprocessing (if present)
+        filter_stats = trainer_data.get("filter_stats")
+        if filter_stats:
+            metrics.update(filter_stats)
         return metrics
 
     def _process_micro_batch(

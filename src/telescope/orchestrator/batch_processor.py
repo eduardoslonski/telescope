@@ -1,6 +1,7 @@
 """Batch processing for preparing trainer data with micro batching and sequence packing."""
 
 import math
+import zlib
 
 from telescope.utils import config
 from telescope.utils.tlog import get_logger
@@ -13,6 +14,36 @@ from telescope.trainer.micro_batch import (
 )
 
 _log = get_logger("orchestrator")
+
+
+def _detect_gibberish(comp_ids: list[int], vllm_logprobs: list[float]) -> bool:
+    """Detect gibberish: rare BPE tokens sampled at high entropy.
+
+    A token is flagged if token_id > threshold AND logprob < -log(vocab_size) - offset.
+    Returns True if any token matches.
+    """
+    threshold = config.cfg.gibberish_token_threshold
+    # Approximate log(vocab_size) ~ 11.5 for 100K+ vocabs
+    logprob_floor = -11.5 - config.cfg.gibberish_logprob_offset
+    for i, tid in enumerate(comp_ids):
+        if tid > threshold and i < len(vllm_logprobs) and vllm_logprobs[i] < logprob_floor:
+            return True
+    return False
+
+
+def _detect_repetition(completion_text: str) -> bool:
+    """Detect repetitive completions using zlib compression ratio.
+
+    If the compression ratio (original/compressed) exceeds the threshold,
+    the completion is flagged as repetitive.
+    """
+    if len(completion_text) < 100:
+        return False
+    # Use the tail of the completion for detection (most repetition occurs at the end)
+    tail = completion_text[-10000:].encode("utf-8", errors="replace")
+    compressed = zlib.compress(tail, level=1)
+    ratio = len(tail) / max(len(compressed), 1)
+    return ratio > config.cfg.repetition_compression_threshold
 
 
 def preprocess_batch(
@@ -49,7 +80,7 @@ def preprocess_batch(
         pad_to_multiple_of = math.lcm(pad_to_multiple_of, cp_size)
 
     # Explode groups into per-sample list
-    samples = _explode_groups(all_groups_results)
+    samples, filter_stats = _explode_groups(all_groups_results)
     _normalize_advantages_batch_level(samples)
 
     # Assign run-wide unique sample_idx to each sample
@@ -104,6 +135,7 @@ def preprocess_batch(
         rank_data = {
             "micro_batches": tensor_micro_batches,
             "num_micro_batches": len(tensor_micro_batches),
+            "filter_stats": filter_stats,
         }
         
         trainer_data_per_rank.append(rank_data)
@@ -129,10 +161,18 @@ def _normalize_advantages_batch_level(samples: list[dict]) -> None:
         s["advantage"] = float((all_adv[i] - mean) / std)
 
 
-def _explode_groups(all_groups_results: list[dict]) -> list[dict]:
-    """Expand group results into individual samples."""
+def _explode_groups(all_groups_results: list[dict]) -> tuple[list[dict], dict]:
+    """Expand group results into individual samples.
+
+    Returns:
+        Tuple of (samples list, filter_stats dict with counts of filtered samples).
+    """
     samples = []
-    
+    _n_total = 0
+    _n_overlong = 0
+    _n_gibberish = 0
+    _n_repetition = 0
+
     for group in all_groups_results:
         n = len(group["completion_token_ids"])
         prompt_text = group.get("prompt_text", "")
@@ -150,6 +190,8 @@ def _explode_groups(all_groups_results: list[dict]) -> list[dict]:
         # Get total_tokens list from group if available, otherwise compute from token IDs
         total_tokens_list = group.get("total_tokens", [])
         
+        is_truncated_list = group.get("is_truncated", [False] * n)
+
         for j in range(n):
             prompt_ids = group["prompt_token_ids"][j]
             comp_ids = group["completion_token_ids"][j]
@@ -158,15 +200,46 @@ def _explode_groups(all_groups_results: list[dict]) -> list[dict]:
             sample_tags = sample_tags_list[j] if j < len(sample_tags_list) else {}
             vllm_logprobs = vllm_logprobs_list[j] if j < len(vllm_logprobs_list) else []
             turns = turns_list[j] if j < len(turns_list) else []
-            
+
             # Get completion_mask if available (multi-turn interleaved)
             comp_mask = None
             if completion_masks_list is not None and j < len(completion_masks_list):
                 comp_mask = completion_masks_list[j]
-            
+
             # Use total_tokens from group if available, otherwise compute
             total_tokens = total_tokens_list[j] if j < len(total_tokens_list) else len(prompt_ids) + len(comp_ids)
-            
+
+            is_truncated = is_truncated_list[j] if j < len(is_truncated_list) else False
+
+            _n_total += 1
+
+            # --- Output quality filters: zero completion mask for flagged samples ---
+
+            # Overlong hard filter: zero out completion for truncated responses
+            if config.cfg.filter_overlong and is_truncated:
+                _n_overlong += 1
+                if comp_mask is not None:
+                    comp_mask = [0] * len(comp_mask)
+                else:
+                    comp_mask = [0] * len(comp_ids)
+
+            # Gibberish filter: rare BPE tokens at high entropy
+            if config.cfg.filter_gibberish and _detect_gibberish(comp_ids, vllm_logprobs):
+                _n_gibberish += 1
+                if comp_mask is not None:
+                    comp_mask = [0] * len(comp_mask)
+                else:
+                    comp_mask = [0] * len(comp_ids)
+
+            # Repetition filter: high compression ratio
+            completion_text = completion_texts[j] if j < len(completion_texts) else ""
+            if config.cfg.filter_repetition and _detect_repetition(completion_text):
+                _n_repetition += 1
+                if comp_mask is not None:
+                    comp_mask = [0] * len(comp_mask)
+                else:
+                    comp_mask = [0] * len(comp_ids)
+
             samples.append({
                 "prompt_ids": prompt_ids,
                 "comp_ids": comp_ids,
@@ -187,7 +260,16 @@ def _explode_groups(all_groups_results: list[dict]) -> list[dict]:
                 "system_prompt": group.get("system_prompt", ""),
                 "tokens_system_prompt": group.get("tokens_system_prompt", 0),
             })
-    
-    return samples
+
+    filter_stats = {}
+    if _n_total > 0:
+        if config.cfg.filter_overlong:
+            filter_stats["filter/overlong_frac"] = _n_overlong / _n_total
+        if config.cfg.filter_gibberish:
+            filter_stats["filter/gibberish_frac"] = _n_gibberish / _n_total
+        if config.cfg.filter_repetition:
+            filter_stats["filter/repetition_frac"] = _n_repetition / _n_total
+
+    return samples, filter_stats
 
 
