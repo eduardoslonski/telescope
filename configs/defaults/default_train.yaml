@@ -86,6 +86,7 @@ use_ppo_clip: false # apply PPO ratio clipping to the policy loss
 ppo_clip_ref_logprobs: "rollout" # "rollout" = vLLM logprobs; "batch" = recompute with trainer before update
 clip_low: 0.4 # PPO clip lower bound (1 - clip_low)
 clip_high: 0.5 # PPO clip upper bound (1 + clip_high)
+clip_ratio_c: null # dual-clip PPO: caps loss magnitude for negative advantages (must be > 1.0); null = disabled
 sapo_tau_pos: 1.0 # sigmoid sharpness for positive advantages (sapo only)
 sapo_tau_neg: 1.05 # sigmoid sharpness for negative advantages (sapo only)
 dr_grpo_loss_agg_mode: "token_mean" # "token_mean" or "token_sum_norm" (removes response-level length bias per DR-GRPO paper)
@@ -93,8 +94,29 @@ advantage_norm: "group" # "group" = normalize within prompt group; "batch" = nor
 use_tis: false # truncated importance sampling — corrects for async vLLM/trainer logprob mismatch
 tis_cap: 2.0 # max importance weight
 tis_logprob_clamp: 20.0
-kl_penalty_tau: 0.0 # coefficient for KL penalty added to loss (k2 approx: tau * log_ratio²); 0 = disabled
+tis_mode: "truncate" # "truncate" = clamp IS weights at bounds; "icepop" = zero tokens outside bounds
+tis_floor: 0.0 # lower bound for IS weight (icepop mode; 0 = no lower bound in truncate mode)
+kl_penalty_tau: 0.0 # coefficient for KL penalty added to loss; 0 = disabled
+kl_estimator: "k2" # "k2" = log_ratio² (original); "k3" = exp(-log_ratio)-1+log_ratio (lower variance, non-negative)
+entropy_coef: 0.0 # entropy bonus: subtract entropy_coef * entropy from loss to prevent collapse; 0 = disabled
 entropy_chunk_size: 1024
+
+# ── Sequence-level IS masking ───────────────────────────────────────────────
+seq_is_masking: false # zero entire sequences whose geometric-mean IS ratio falls outside [low, high]
+seq_is_mask_low: 0.8 # lower bound for geometric-mean IS ratio (must be < 1.0; on-policy center is 1.0)
+seq_is_mask_high: 1.2 # upper bound for geometric-mean IS ratio (must be > 1.0; on-policy center is 1.0)
+
+# ── Overlong filtering ──────────────────────────────────────────────────────
+filter_overlong: false # zero loss mask for truncated responses (hit max_tokens without EOS)
+overlong_penalty_factor: 0.0 # graduated reward penalty as response approaches max_tokens; 0 = disabled
+overlong_buffer_tokens: 256 # buffer zone before max_tokens where penalty ramps linearly
+
+# ── Output quality filters ──────────────────────────────────────────────────
+filter_gibberish: false # zero loss mask for completions with rare tokens at high entropy
+gibberish_token_threshold: 100000 # token IDs above this threshold are considered rare
+gibberish_logprob_offset: 2.0 # flag if logprob < -log(vocab_size) - offset
+filter_repetition: false # zero loss mask for repetitive completions (detected via compression ratio)
+repetition_compression_threshold: 10.0 # flag if zlib compression ratio exceeds this
 
 # ── Weight sync ──────────────────────────────────────────────────────────────
 weight_broadcast_mode: "flattened_bucket" # "flattened_bucket" or "per_tensor"

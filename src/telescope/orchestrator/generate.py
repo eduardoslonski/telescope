@@ -1400,6 +1400,18 @@ async def process_multiturn_group(
         for s in group_samples
     ]
 
+    # --- Overlong soft penalty: graduated reward penalty as response approaches max_tokens ---
+    # For multi-turn, use model-generated tokens only (exclude env response tokens).
+    if config.cfg.overlong_penalty_factor > 0:
+        max_resp_len = config.cfg.max_tokens
+        buffer = config.cfg.overlong_buffer_tokens
+        for i, s in enumerate(group_samples):
+            resp_len = sum(s["completion_mask"])  # count model tokens only (1s in mask)
+            exceed = resp_len - (max_resp_len - buffer)
+            if exceed > 0:
+                penalty = min(-exceed / buffer * config.cfg.overlong_penalty_factor, 0.0)
+                rewards[i] += penalty
+
     # Compute advantages (standardized rewards)
     advantages = compute_advantages(rewards)
 
@@ -1446,6 +1458,7 @@ async def process_multiturn_group(
         "system_prompt": system_prompt,  # Raw system prompt (no chat template)
         "tokens_system_prompt": tokens_system_prompt,
         "compute_reward_times": compute_reward_times,
+        "is_truncated": [s["stop_reason"] == "context_exhausted" for s in group_samples],
     }
 
 
@@ -1544,6 +1557,23 @@ async def process_group(
     # Extract vLLM logprobs for TIS/PPO clipping
     vllm_logprobs = [s["vllm_logprobs"] for s in group_samples]
 
+    # Per-sample truncation flags (finish_reason == "length" means hit max_tokens without EOS)
+    is_truncated_list = [
+        s["data_completion"]["choices"][0].get("finish_reason", "") == "length"
+        for s in group_samples
+    ]
+
+    # --- Overlong soft penalty: graduated reward penalty as response approaches max_tokens ---
+    if config.cfg.overlong_penalty_factor > 0:
+        max_resp_len = config.cfg.max_tokens
+        buffer = config.cfg.overlong_buffer_tokens
+        for i, s in enumerate(group_samples):
+            resp_len = s["data_completion"]["usage"].get("completion_tokens", 0)
+            exceed = resp_len - (max_resp_len - buffer)
+            if exceed > 0:
+                penalty = min(-exceed / buffer * config.cfg.overlong_penalty_factor, 0.0)
+                rewards[i] += penalty
+
     # Compute advantages (standardized rewards)
     advantages = compute_advantages(rewards)
 
@@ -1603,6 +1633,7 @@ async def process_group(
         "system_prompt": system_prompt,  # Raw system prompt (no chat template)
         "tokens_system_prompt": tokens_system_prompt,
         "compute_reward_times": compute_reward_times,
+        "is_truncated": is_truncated_list,
     }
 
 
