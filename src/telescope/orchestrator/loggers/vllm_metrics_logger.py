@@ -24,19 +24,18 @@ from telescope.utils.tlog import get_logger
 _log = get_logger("orchestrator")
 
 
-# Gauge metrics - single value per scrape
+# Gauge metrics - single value per scrape (vLLM v1 names)
 GAUGE_METRICS = {
     "num_requests_running",      # Requests currently being processed
     "num_requests_waiting",      # Requests waiting in queue
-    "gpu_cache_usage_perc",      # KV cache utilization (0-1)
-    "gpu_prefix_cache_hit_rate", # Prefix cache hit rate (0-1)
+    "kv_cache_usage_perc",       # KV cache utilization (0-1)
 }
 
 # Counter metrics - cumulative totals (we sum across labels like finished_reason)
 COUNTER_METRICS = {
     "request_success_total",       # Total successful requests
     "prompt_tokens_total",         # Total input tokens processed
-    "rollout_tokens_total",     # Total output tokens generated
+    "generation_tokens_total",     # Total output tokens generated
     "num_preemptions_total",       # Total preemptions (want this low)
     "prefix_cache_hits_total",     # Cache hits (tokens)
     "prefix_cache_queries_total",  # Cache queries (tokens)
@@ -44,9 +43,16 @@ COUNTER_METRICS = {
 
 # Histogram metrics - we compute mean from _sum/_count
 HISTOGRAM_METRICS = {
-    "time_to_first_token_seconds",  # Time to first token (TTFT)
-    "e2e_request_latency_seconds",  # End-to-end request latency
-    "inter_token_latency_seconds",  # Inter-token latency (ITL)
+    "time_to_first_token_seconds",       # Time to first token (TTFT)
+    "e2e_request_latency_seconds",       # End-to-end request latency
+    "inter_token_latency_seconds",       # Inter-token latency (ITL)
+    "request_queue_time_seconds",        # Time spent waiting in queue (WAITING phase)
+    "request_inference_time_seconds",    # Time spent in RUNNING phase (prefill + decode)
+    "request_prefill_time_seconds",      # Time spent in PREFILL phase
+    "request_decode_time_seconds",       # Time spent in DECODE phase
+    "iteration_tokens_total",            # Total tokens per engine step (batching density)
+    "request_generation_tokens",         # Generation tokens per request (distribution)
+    "request_prompt_tokens",             # Prompt tokens per request (distribution)
 }
 
 
@@ -71,17 +77,31 @@ class VllmMetricsLogger:
     every 1 second and provides data to EventLogger for unified upload.
     
     Collects simplified metrics suitable for UI dashboards:
-    - requests_running: Current batch size
-    - requests_waiting: Queue depth  
+
+    Gauges:
+    - requests_running: Current batch size (in-flight requests)
+    - requests_waiting: Queue depth (waiting to be scheduled)
     - cache_usage: KV cache utilization %
-    - cache_hit_rate: Prefix cache efficiency %
+
+    Counters:
     - requests_total: Cumulative successful requests
     - prompt_tokens_total: Cumulative input tokens
-    - rollout_tokens_total: Cumulative output tokens
-    - preemptions_total: Cumulative preemptions
+    - generation_tokens_total: Cumulative output tokens
+    - preemptions_total: Cumulative preemptions (KV cache evictions)
+    - cache_hits_total: Cumulative prefix cache hits
+    - cache_queries_total: Cumulative prefix cache queries
+
+    Histogram means:
     - ttft_mean: Mean time to first token (seconds)
     - e2e_latency_mean: Mean end-to-end latency (seconds)
     - itl_mean: Mean inter-token latency (seconds)
+    - queue_time_mean: Mean time waiting in queue (seconds)
+    - inference_time_mean: Mean time in RUNNING phase (seconds)
+    - prefill_time_mean: Mean time in PREFILL phase (seconds)
+    - decode_time_mean: Mean time in DECODE phase (seconds)
+    - iteration_tokens_mean: Mean tokens per engine step (batching density)
+    - generation_tokens_per_request_mean: Mean generation tokens per request
+    - prompt_tokens_per_request_mean: Mean prompt tokens per request
     
     Usage:
         logger = VllmMetricsLogger()
@@ -233,8 +253,7 @@ class VllmMetricsLogger:
         gauge_name_map = {
             "num_requests_running": "requests_running",
             "num_requests_waiting": "requests_waiting",
-            "gpu_cache_usage_perc": "cache_usage",
-            "gpu_prefix_cache_hit_rate": "cache_hit_rate",
+            "kv_cache_usage_perc": "cache_usage",
         }
         for metric, value in gauge_values.items():
             samples.append(VllmMetricSample(
@@ -254,7 +273,7 @@ class VllmMetricsLogger:
         counter_name_map = {
             "request_success_total": "requests_total",
             "prompt_tokens_total": "prompt_tokens_total",
-            "rollout_tokens_total": "rollout_tokens_total",
+            "generation_tokens_total": "generation_tokens_total",
             "num_preemptions_total": "preemptions_total",
             "prefix_cache_hits_total": "cache_hits_total",
             "prefix_cache_queries_total": "cache_queries_total",
@@ -278,6 +297,13 @@ class VllmMetricsLogger:
             "time_to_first_token_seconds": "ttft_mean",
             "e2e_request_latency_seconds": "e2e_latency_mean",
             "inter_token_latency_seconds": "itl_mean",
+            "request_queue_time_seconds": "queue_time_mean",
+            "request_inference_time_seconds": "inference_time_mean",
+            "request_prefill_time_seconds": "prefill_time_mean",
+            "request_decode_time_seconds": "decode_time_mean",
+            "iteration_tokens_total": "iteration_tokens_mean",
+            "request_generation_tokens": "generation_tokens_per_request_mean",
+            "request_prompt_tokens": "prompt_tokens_per_request_mean",
         }
         for hist_name in HISTOGRAM_METRICS:
             if hist_name in histogram_sums and hist_name in histogram_counts:
