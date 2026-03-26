@@ -133,6 +133,9 @@ class TelescopeConfig(BaseModel, extra="forbid"):
     min_lr_ratio: float = Field(ge=0, le=1)
     train_backend: Literal["fsdp", "megatron"]
 
+    # FSDP context parallelism (ring attention)
+    fsdp_context_parallel_size: int = Field(ge=1)
+
     # Megatron
     megatron_tensor_parallel_size: int = Field(ge=1)
     megatron_pipeline_parallel_size: int = Field(ge=1)
@@ -325,4 +328,19 @@ class TelescopeConfig(BaseModel, extra="forbid"):
                 f"inference_num_workers ({self.inference_num_workers}) must be divisible by "
                 f"inference_tensor_parallel_size ({self.inference_tensor_parallel_size})"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_fsdp_cp(self) -> TelescopeConfig:
+        cp = self.fsdp_context_parallel_size
+        if cp > 1:
+            if self.train_backend != "fsdp":
+                raise ValueError(
+                    "fsdp_context_parallel_size > 1 requires train_backend='fsdp'"
+                )
+            if self.seq_len % (cp * 2) != 0:
+                raise ValueError(
+                    f"seq_len ({self.seq_len}) must be divisible by "
+                    f"2 * fsdp_context_parallel_size ({cp * 2}) for ring attention load balancing"
+                )
         return self

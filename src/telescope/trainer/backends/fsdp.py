@@ -2,13 +2,13 @@
 FSDP (Fully Sharded Data Parallel) training backend.
 
 Uses PyTorch native FSDP2 (fully_shard) for data parallelism with
-optional mixed precision. Good for research/prototyping and models
-that fit on a reasonable number of GPUs with data parallelism alone.
+optional mixed precision and optional context parallelism (ring attention).
 
-In FSDP mode:
-- dp_rank == global_rank (every GPU is a data parallel replica)
-- dp_world_size == world_size
-- Model is sharded across all GPUs for memory efficiency
+When ``fsdp_context_parallel_size > 1``, a 2D device mesh ``(dp, cp)`` is
+created and flattened into a single FSDP shard dimension so that CP ranks
+also participate in parameter sharding (same approach as prime-rl / Composer 2).
+Ring attention is enabled via ``ring-flash-attn`` which monkey-patches
+HuggingFace flash attention kernels.
 """
 from __future__ import annotations
 
@@ -28,8 +28,11 @@ import torch.distributed as dist
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, get_state_dict, set_state_dict
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from telescope.trainer.context_parallel import setup_cp_params, shard_for_cp
 
 from telescope.utils import config
 from telescope.utils.tlog import get_logger, setup_logging
@@ -55,12 +58,11 @@ def _get_torch_dtype(dtype_str: str | None) -> torch.dtype:
 
 
 class FSDPBackend(TrainingBackend):
-    """
-    FSDP2 training backend using PyTorch native fully_shard.
-    
-    This is the default backend. It shards model parameters, gradients,
-    and optimizer states across all GPUs. Every GPU holds a full copy
-    of the data (data parallel), and FSDP handles the parameter sharding.
+    """FSDP2 training backend using PyTorch native fully_shard.
+
+    When ``fsdp_context_parallel_size > 1``, ring attention is used to
+    distribute the sequence dimension across CP ranks while FSDP still
+    shards parameters across *all* ranks (DP + CP folded together).
     """
     
     def __init__(self):
@@ -73,25 +75,56 @@ class FSDPBackend(TrainingBackend):
         self._scheduler = None
         self._tokenizer = None
         self._hf_config = None
+        # Context parallelism (ring attention)
+        self._cp_size = 1
+        self._cp_rank = 0
+        self._cp_group: dist.ProcessGroup | None = None
+        self._cp_mesh = None
+        self._fsdp_mesh = None
 
     def init(self) -> dict:
         """Initialize FSDP: dist process group, model, optimizer."""
         setup_logging()
-        
+
         dist.init_process_group(backend="nccl")
         self._world_size = int(os.environ["WORLD_SIZE"])
         self._rank = int(os.environ["RANK"])
         self._local_rank = int(os.environ["LOCAL_RANK"])
         self._device = torch.device(f"cuda:{self._local_rank}")
         torch.cuda.set_device(self._local_rank)
-        
+
+        # --- Context parallelism setup ---
+        self._cp_size = max(1, config.cfg.fsdp_context_parallel_size)
+        if self._cp_size > 1:
+            if self._world_size % self._cp_size != 0:
+                raise ValueError(
+                    f"WORLD_SIZE ({self._world_size}) must be divisible by "
+                    f"fsdp_context_parallel_size ({self._cp_size})"
+                )
+            dp_size = self._world_size // self._cp_size
+            # 2D mesh: (dp_shard, cp).  FSDP shards across both dimensions
+            # (folded into one) so CP ranks also participate in param sharding.
+            self._cp_mesh = init_device_mesh(
+                "cuda",
+                (dp_size, self._cp_size),
+                mesh_dim_names=("dp", "cp"),
+            )
+            self._cp_group = self._cp_mesh.get_group("cp")
+            self._cp_rank = self._cp_mesh.get_local_rank("cp")
+
+            # Flatten (dp, cp) into a single FSDP shard dimension.
+            self._fsdp_mesh = self._cp_mesh._flatten("dp_shard_cp")
+        else:
+            self._fsdp_mesh = None  # Use default process group
+
         _log.banner("FSDP Backend Init")
         _log.info(
             f"world_size={self._world_size}, rank={self._rank}, "
-            f"local_rank={self._local_rank}",
+            f"local_rank={self._local_rank}, cp_size={self._cp_size}, "
+            f"cp_rank={self._cp_rank}, dp_world_size={self.dp_world_size}",
             rank=self._rank,
         )
-        
+
         # Cache tokenizer + HF config for checkpoint metadata (parallel I/O)
         with ThreadPoolExecutor(max_workers=2) as pool:
             tok_future = pool.submit(AutoTokenizer.from_pretrained, config.cfg.model, trust_remote_code=True)
@@ -104,6 +137,15 @@ class FSDPBackend(TrainingBackend):
         self._optimizer = self._build_optimizer()
         self._scheduler = self._build_scheduler()
 
+        # Patch attention for ring attention after model is built.
+        if self._cp_size > 1:
+            from ring_flash_attn import substitute_hf_flash_attn
+            substitute_hf_flash_attn(self._cp_group, heads_k_stride=1)
+            _log.info(
+                f"Ring attention enabled: cp_size={self._cp_size}",
+                rank=self._rank,
+            )
+
         return {
             "rank": self._rank,
             "local_rank": self._local_rank,
@@ -111,13 +153,12 @@ class FSDPBackend(TrainingBackend):
             "dp_rank": self.dp_rank,
             "dp_world_size": self.dp_world_size,
             "device": self._device,
-            # FSDP is pure data parallel — no TP/PP/CP/EP.
             "tp_rank": 0,
             "tp_size": 1,
             "pp_rank": 0,
             "pp_size": 1,
-            "cp_rank": 0,
-            "cp_size": 1,
+            "cp_rank": self._cp_rank,
+            "cp_size": self._cp_size,
             "ep_rank": 0,
             "ep_size": 1,
         }
@@ -131,6 +172,11 @@ class FSDPBackend(TrainingBackend):
             import flash_attn  # noqa: F401
             attn_impl = "flash_attention_2"
         except ImportError:
+            if self._cp_size > 1:
+                raise ImportError(
+                    "flash-attn is required for ring attention (fsdp_context_parallel_size > 1). "
+                    "Install it: uv add flash-attn"
+                )
             attn_impl = "sdpa"
             _log.warning(
                 "flash-attn not installed — using PyTorch SDPA attention. "
@@ -149,6 +195,12 @@ class FSDPBackend(TrainingBackend):
         else:
             mp_policy = MixedPrecisionPolicy()
 
+        # When CP > 1 the flattened (dp, cp) mesh is passed so FSDP shards
+        # across both DP *and* CP ranks (prime-rl / Composer 2 approach).
+        fsdp_kwargs: dict = {"mp_policy": mp_policy}
+        if self._fsdp_mesh is not None:
+            fsdp_kwargs["mesh"] = self._fsdp_mesh
+
         # Use HF's _no_split_modules to discover transformer layer classes
         # (model-agnostic — works for Llama, Qwen2, Mistral, DeepSeek, etc.).
         # Also shard embeddings separately when embed_tokens and lm_head are
@@ -161,12 +213,12 @@ class FSDPBackend(TrainingBackend):
                 or (isinstance(module, torch.nn.Embedding) and not model.config.tie_word_embeddings)
             ]
             for module in modules_to_shard:
-                fully_shard(module, mp_policy=mp_policy)
+                fully_shard(module, **fsdp_kwargs)
         else:
             _log.warning("Model does not define _no_split_modules, falling back to model.model.layers")
             for transformer_block in model.model.layers:
-                fully_shard(transformer_block, mp_policy=mp_policy)
-        fully_shard(model, mp_policy=mp_policy)
+                fully_shard(transformer_block, **fsdp_kwargs)
+        fully_shard(model, **fsdp_kwargs)
 
         _log.section(f"Model Loaded: {config.cfg.model}")
         _log.info(f"FSDP wrapped with {config.cfg.mixed_precision_dtype or 'native dtype'} mixed precision")
@@ -189,6 +241,10 @@ class FSDPBackend(TrainingBackend):
 
         Stores ``batch_logprobs`` in each micro-batch dict, in the same shape as
         ``vllm_logprobs`` (``[batch, seq_len]`` with 0.0 at position 0).
+
+        With CP the forward runs on sharded sequences but the stored logprobs
+        retain the *full* sequence length so that downstream sharding in
+        ``_process_micro_batch`` works identically.
         """
         self._model.eval()
         with torch.no_grad():
@@ -199,6 +255,15 @@ class FSDPBackend(TrainingBackend):
                 position_ids = mb.get("position_ids")
                 if position_ids is not None and not position_ids.is_cuda:
                     position_ids = position_ids.to(self._device, non_blocking=True)
+
+                full_seq_len = input_ids.shape[1]
+
+                # Shard for CP before forward (same as _process_micro_batch).
+                if self._cp_size > 1 and position_ids is not None:
+                    input_ids, position_ids = setup_cp_params(
+                        input_ids, position_ids,
+                        self._cp_rank, self._cp_size, self._cp_group,
+                    )
 
                 if position_ids is not None:
                     outputs = self._model(input_ids=input_ids, position_ids=position_ids)
@@ -211,13 +276,20 @@ class FSDPBackend(TrainingBackend):
                 log_probs = shift_logits.log_softmax(dim=-1)
                 log_probs = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
 
-                # Pad to [batch, seq_len] with 0.0 at position 0 (same layout as vllm_logprobs)
-                batch_logprobs = torch.zeros(
-                    input_ids.shape[0], input_ids.shape[1],
+                local_len = input_ids.shape[1]
+                local_logprobs = torch.zeros(
+                    input_ids.shape[0], local_len,
                     device=log_probs.device, dtype=log_probs.dtype,
                 )
-                batch_logprobs[..., 1:] = log_probs
-                mb["batch_logprobs"] = batch_logprobs
+                local_logprobs[..., 1:] = log_probs
+
+                if self._cp_size > 1:
+                    # Gather chunks from all CP ranks → full-sequence logprobs.
+                    chunks = [torch.zeros_like(local_logprobs) for _ in range(self._cp_size)]
+                    dist.all_gather(chunks, local_logprobs, group=self._cp_group)
+                    mb["batch_logprobs"] = torch.cat(chunks, dim=1)
+                else:
+                    mb["batch_logprobs"] = local_logprobs
         self._model.train()
 
     def train_step(
@@ -389,15 +461,28 @@ class FSDPBackend(TrainingBackend):
             advantages = micro_batch["advantages"]
             if not advantages.is_cuda:
                 advantages = advantages.to(self._device, non_blocking=True)
-            
+
             vllm_logprobs = micro_batch.get("vllm_logprobs")
             if vllm_logprobs is not None and not vllm_logprobs.is_cuda:
                 vllm_logprobs = vllm_logprobs.to(self._device, non_blocking=True)
-            
+
             position_ids = micro_batch.get("position_ids")
             if position_ids is not None and not position_ids.is_cuda:
                 position_ids = position_ids.to(self._device, non_blocking=True)
-        
+
+        # --- Context parallelism: shard all per-token tensors ---
+        if self._cp_size > 1 and position_ids is not None:
+            # setup_cp_params registers cu_seqlens with the ring kernel
+            # (must be called before forward) and shards input_ids + position_ids.
+            input_ids, position_ids = setup_cp_params(
+                input_ids, position_ids,
+                self._cp_rank, self._cp_size, self._cp_group,
+            )
+            loss_mask = shard_for_cp(loss_mask, self._cp_rank, self._cp_size)
+            advantages = shard_for_cp(advantages, self._cp_rank, self._cp_size)
+            if vllm_logprobs is not None:
+                vllm_logprobs = shard_for_cp(vllm_logprobs, self._cp_rank, self._cp_size)
+
         # Forward pass
         with _track("forward"):
             if position_ids is not None:
@@ -411,6 +496,8 @@ class FSDPBackend(TrainingBackend):
             batch_lp = micro_batch.get("batch_logprobs")
             if batch_lp is not None:
                 ref_logprobs = batch_lp if batch_lp.is_cuda else batch_lp.to(self._device, non_blocking=True)
+                if self._cp_size > 1:
+                    ref_logprobs = shard_for_cp(ref_logprobs, self._cp_rank, self._cp_size)
 
         # Compute loss + fine-grained RL metrics with tracked sub-events.
         scaled_loss, metrics = compute_rl_loss(
@@ -455,13 +542,15 @@ class FSDPBackend(TrainingBackend):
 
     @property
     def dp_rank(self) -> int:
-        # In FSDP, every rank is a data parallel replica
+        # With CP, multiple ranks share the same data — dp_rank groups them.
+        if self._cp_mesh is not None:
+            return self._cp_mesh.get_local_rank("dp")
         return self._rank
 
     @property
     def dp_world_size(self) -> int:
-        # In FSDP, dp_world_size == world_size
-        return self._world_size
+        # With CP, dp_world_size is the number of independent data shards.
+        return self._world_size // self._cp_size
 
     @property
     def device(self) -> torch.device:
