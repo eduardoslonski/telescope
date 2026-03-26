@@ -56,6 +56,8 @@ lr_scheduler: "constant" # "none" = fixed LR; "constant" = warmup then constant;
 warmup_steps: 0 # number of linear warmup steps (0 = no warmup)
 min_lr_ratio: 0.0 # minimum LR as fraction of learning_rate (linear/cosine decay; 0.0 = decay to zero)
 train_backend: "fsdp" # "fsdp" or "megatron"
+# ── FSDP context parallelism (ring attention) ───────────────────────────────
+fsdp_context_parallel_size: 1 # 1 = disabled; >1 = ring attention with this many CP ranks
 # ── Megatron (ignored for FSDP) ─────────────────────────────────────────────
 megatron_tensor_parallel_size: 1
 megatron_pipeline_parallel_size: 1
