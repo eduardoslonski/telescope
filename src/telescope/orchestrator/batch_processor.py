@@ -75,9 +75,13 @@ def preprocess_batch(
     pad_to_multiple_of = config.cfg.pad_to_multiple_of
 
     # Context parallelism requires sequences divisible by cp_size for chunking.
-    cp_size = config.cfg.megatron_context_parallel_size
-    if cp_size > 1:
-        pad_to_multiple_of = math.lcm(pad_to_multiple_of, cp_size)
+    # FSDP ring attention needs cp_size * 2 (zigzag load balancing).
+    megatron_cp = config.cfg.megatron_context_parallel_size
+    if megatron_cp > 1:
+        pad_to_multiple_of = math.lcm(pad_to_multiple_of, megatron_cp)
+    fsdp_cp = config.cfg.fsdp_context_parallel_size
+    if fsdp_cp > 1:
+        pad_to_multiple_of = math.lcm(pad_to_multiple_of, fsdp_cp * 2)
 
     # Explode groups into per-sample list
     samples, filter_stats = _explode_groups(all_groups_results)

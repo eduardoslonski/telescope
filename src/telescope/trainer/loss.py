@@ -81,8 +81,7 @@ def _compute_kl_penalty(
     if estimator == "k2":
         return vllm_delta.pow(2)
     # k3: exp(-delta) - 1 + delta  (Schulman's lower-variance, non-negative estimator)
-    # Input clamp prevents exp() overflow; output clamp caps extreme divergence values
-    # (matches verl/RLinf which clamp output to [-10, 10]).
+    # Input clamp prevents exp() overflow; output clamp caps extreme divergence values.
     clamped = vllm_delta.clamp(-20.0, 20.0)
     return (torch.exp(-clamped) - 1.0 + clamped).clamp(max=10.0)
 
