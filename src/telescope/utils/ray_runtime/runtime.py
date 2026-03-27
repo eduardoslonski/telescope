@@ -1088,39 +1088,65 @@ def _collect_node_infra_metrics_snapshot() -> dict[str, Any]:
 
         pynvml.nvmlInit()
         num_gpus = int(pynvml.nvmlDeviceGetCount())
+        base = {
+            "timestamp": timestamp,
+            "node_id": -1,
+            "node_ip": node_ip,
+            "hostname": hostname,
+            "ray_node_id": ray_node_id,
+        }
         for gpu_idx in range(num_gpus):
             handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_idx)
+            gpu_base = {**base, "gpu_index": gpu_idx}
+
+            # Memory info
             try:
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                gpu_samples.append(
-                    {
-                        "timestamp": timestamp,
-                        "node_id": -1,
-                        "node_ip": node_ip,
-                        "hostname": hostname,
-                        "ray_node_id": ray_node_id,
-                        "gpu_index": gpu_idx,
-                        "metric_name": "gpu_memory_used_gb",
-                        "value": float(mem_info.used / (1024**3)),
-                    }
-                )
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_memory_used_gb", "value": float(mem_info.used / (1024**3))})
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_memory_free_gb", "value": float(mem_info.free / (1024**3))})
+                if mem_info.total > 0:
+                    gpu_samples.append({**gpu_base, "metric_name": "gpu_memory_used_percent", "value": float((mem_info.used / mem_info.total) * 100.0)})
             except Exception:
-                continue
+                pass
 
+            # Temperature
+            try:
+                temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_temperature_c", "value": float(temp)})
+            except Exception:
+                pass
+
+            # Power usage
+            try:
+                power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW to W
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_power_w", "value": float(power)})
+            except Exception:
+                pass
+
+            # Utilization
             try:
                 util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                gpu_samples.append(
-                    {
-                        "timestamp": timestamp,
-                        "node_id": -1,
-                        "node_ip": node_ip,
-                        "hostname": hostname,
-                        "ray_node_id": ray_node_id,
-                        "gpu_index": gpu_idx,
-                        "metric_name": "gpu_utilization_percent",
-                        "value": float(util.gpu),
-                    }
-                )
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_utilization_percent", "value": float(util.gpu)})
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_memory_bandwidth_utilization_percent", "value": float(util.memory)})
+            except Exception:
+                pass
+
+            # Clock speeds
+            try:
+                sm_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_clock_sm_mhz", "value": float(sm_clock)})
+            except Exception:
+                pass
+            try:
+                mem_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_clock_mem_mhz", "value": float(mem_clock)})
+            except Exception:
+                pass
+
+            # Fan speed
+            try:
+                fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
+                gpu_samples.append({**gpu_base, "metric_name": "gpu_fan_speed_percent", "value": float(fan_speed)})
             except Exception:
                 pass
         pynvml.nvmlShutdown()
