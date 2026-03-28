@@ -2458,11 +2458,12 @@ class EventLogger:
             zf.writestr("metadata.json", json.dumps(meta))
 
             # Write inflight snapshot if provided (only for tail.zip)
+            # "running" includes both generation (event_type="request") and compute_reward
+            # (event_type="compute_reward") inflight samples.
             if inflight_snapshot is not None:
                 zf.writestr("inflight.json", json.dumps({
                     "snapshot_time": time.time(),
                     "running": inflight_snapshot,
-                    "computing_reward": inflight_compute_reward or [],
                 }))
 
         self.run.save(str(dest_path), base_path=self.run.dir, policy="now")
@@ -2605,6 +2606,7 @@ class EventLogger:
                     "start_time": e.start_time,
                     "is_eval": e.is_eval,
                     "prompt_tokens": e.prompt_tokens,
+                    "event_type": e.event_type,
                 }
                 for e in self._inflight_generations.values()
             ]
