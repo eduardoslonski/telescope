@@ -896,7 +896,7 @@ class EventLogger:
             # Track inflight compute_reward for snapshot
             if event_type == "compute_reward_start" and sample_id >= 0:
                 gen_event = self._ended_generation_info.get(sample_id)
-                self._inflight_compute_reward[sample_id] = {
+                entry = {
                     "sample_id": sample_id,
                     "group_id": group_id,
                     "server": gen_event.server if gen_event else -1,
@@ -905,6 +905,7 @@ class EventLogger:
                     "is_eval": gen_event.is_eval if gen_event else False,
                     "prompt_tokens": gen_event.prompt_tokens if gen_event else 0,
                 }
+                self._inflight_compute_reward[sample_id] = entry
             elif event_type == "compute_reward_end" and sample_id >= 0:
                 self._inflight_compute_reward.pop(sample_id, None)
                 self._ended_generation_info.pop(sample_id, None)
