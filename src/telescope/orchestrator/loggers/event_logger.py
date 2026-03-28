@@ -94,6 +94,8 @@ ORCHESTRATOR_EVENT_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("node_id", pa.int32()),
     ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this event was first uploaded
+    ("group_id", pa.int32()),  # Request group ID (shared by all samples in a group, -1 if N/A)
+    ("sample_id", pa.int32()),  # Run-wide unique sample index (-1 if N/A)
 ])
 
 # Trainer events schema - duration events with rank info and hierarchy
@@ -483,6 +485,8 @@ class Event:
     microbatch: int = -1  # Micro batch index (-1 if not a per-microbatch event)
     minibatch: int = -1  # Mini batch index (-1 if not applicable or only 1 minibatch)
     tail_idx: int = -1  # Index of the tail upload cycle when this event was first uploaded
+    group_id: int = -1  # Request group ID (for orchestrator events that relate to a specific group)
+    sample_id: int = -1  # Run-wide unique sample index (for orchestrator events that relate to a specific sample)
 
 
 @dataclass
@@ -707,6 +711,8 @@ class EventLogger:
         self._events: list[Event] = []
         self._inference_events: list[InferenceEvent] = []
         self._inflight_generations: dict[int, InferenceEvent] = {}  # sample_id -> start event
+        self._ended_generation_info: dict[int, InferenceEvent] = {}  # sample_id -> start event (stashed after phase="end")
+        self._inflight_compute_reward: dict[int, dict] = {}  # sample_id -> {group_id, server, ...}
 
         # External metrics loggers (set via set_metrics_loggers)
         self._system_metrics_logger: SystemMetricsLogger | None = None
@@ -862,6 +868,8 @@ class EventLogger:
         hostname: str = "",
         ray_node_id: str = "",
         timestamp: float | None = None,
+        group_id: int = -1,
+        sample_id: int = -1,
     ):
         """Log an instant event (e.g., weight update signal)."""
         ts = timestamp if timestamp is not None else time.time()
@@ -879,10 +887,28 @@ class EventLogger:
             ray_node_id=ray_node_id,
             start_time=ts,
             end_time=ts,
+            group_id=group_id,
+            sample_id=sample_id,
         )
 
         with self._lock:
             self._events.append(event)
+            # Track inflight compute_reward for snapshot
+            if event_type == "compute_reward_start" and sample_id >= 0:
+                # Look up server/lane info from the ended generation (stashed after phase="end")
+                gen_event = self._ended_generation_info.get(sample_id)
+                self._inflight_compute_reward[sample_id] = {
+                    "sample_id": sample_id,
+                    "group_id": group_id,
+                    "server": gen_event.server if gen_event else -1,
+                    "server_lane": gen_event.server_lane if gen_event else -1,
+                    "start_time": gen_event.start_time if gen_event else ts,
+                    "is_eval": gen_event.is_eval if gen_event else False,
+                    "prompt_tokens": gen_event.prompt_tokens if gen_event else 0,
+                }
+            elif event_type == "compute_reward_end" and sample_id >= 0:
+                self._inflight_compute_reward.pop(sample_id, None)
+                self._ended_generation_info.pop(sample_id, None)
 
     def log_rollout(
         self,
@@ -1090,7 +1116,10 @@ class EventLogger:
             if phase == "start" and sample_id >= 0:
                 self._inflight_generations[sample_id] = event
             elif phase == "end" and sample_id >= 0:
-                self._inflight_generations.pop(sample_id, None)
+                # Stash server/lane info for compute_reward tracking before removing
+                start_ev = self._inflight_generations.pop(sample_id, None)
+                if start_ev is not None:
+                    self._ended_generation_info[sample_id] = start_ev
 
     def log_step_metric(self, step: int, metric: str, value: float, section: str = "", group: str = ""):
         """Log a per-step metric."""
@@ -1266,6 +1295,8 @@ class EventLogger:
                 "step": pa.array([], type=pa.int32()),
                 "node_id": pa.array([], type=pa.int32()),
                 "tail_idx": pa.array([], type=pa.int32()),
+                "group_id": pa.array([], type=pa.int32()),
+                "sample_id": pa.array([], type=pa.int32()),
             })
 
         data = {
@@ -1274,6 +1305,8 @@ class EventLogger:
             "step": [e.step for e in events],
             "node_id": [e.node_id for e in events],
             "tail_idx": [e.tail_idx for e in events],
+            "group_id": [e.group_id for e in events],
+            "sample_id": [e.sample_id for e in events],
         }
         return pa.table(data, schema=ORCHESTRATOR_EVENT_SCHEMA)
 
@@ -2287,6 +2320,7 @@ class EventLogger:
         eval_prompts: list[EvalPrompt] | None = None,
         logs: list[tuple[LogRecord, int]] | None = None,
         inflight_snapshot: list[dict] | None = None,
+        inflight_compute_reward: list[dict] | None = None,
     ):
         """Write all event data as separate parquet files in a single zip archive."""
         if self.run is None:
@@ -2428,6 +2462,7 @@ class EventLogger:
                 zf.writestr("inflight.json", json.dumps({
                     "snapshot_time": time.time(),
                     "running": inflight_snapshot,
+                    "computing_reward": inflight_compute_reward or [],
                 }))
 
         self.run.save(str(dest_path), base_path=self.run.dir, policy="now")
@@ -2573,6 +2608,8 @@ class EventLogger:
                 }
                 for e in self._inflight_generations.values()
             ]
+            # Snapshot inflight compute_reward for tail.zip
+            inflight_compute_reward_snapshot = list(self._inflight_compute_reward.values())
             all_events = list(self._events)
             all_inference_events = list(self._inference_events)
             all_discarded_rollouts = list(self._discarded_rollouts)
@@ -2819,6 +2856,7 @@ class EventLogger:
             eval_prompts=tail_eval_prompts,
             logs=tail_log_records,
             inflight_snapshot=inflight_snapshot,
+            inflight_compute_reward=inflight_compute_reward_snapshot,
         )
 
         # Write block_live.zip with all data

@@ -563,10 +563,13 @@ class WandbLogger:
         except Exception as exc:
             _log.warning(f"Failed to log model architecture: {exc}")
 
-    def log_orchestrator_timeline_event(self, event_type: str, timestamp: float = None, step: int = -1):
+    def log_orchestrator_timeline_event(
+        self, event_type: str, timestamp: float = None, step: int = -1,
+        group_id: int = -1, sample_id: int = -1,
+    ):
         """
         Log an instant event to the timeline (orchestrator events).
-        
+
         Used for orchestrator lifecycle events like:
         - inference_processes_start
         - trainer_process_start
@@ -575,6 +578,7 @@ class WandbLogger:
         - weight_update
         - save_batch
         - inference_call
+        - compute_reward_start / compute_reward_end
         """
         if not config.cfg.use_wandb:
             return
@@ -589,6 +593,8 @@ class WandbLogger:
             node_ip=self.driver_node_ip,
             hostname=self.driver_hostname,
             ray_node_id=self.driver_ray_node_id,
+            group_id=group_id,
+            sample_id=sample_id,
         )
 
     def log_inference_event(
