@@ -902,7 +902,7 @@ class EventLogger:
                     "group_id": group_id,
                     "server": gen_event.server if gen_event else -1,
                     "server_lane": gen_event.server_lane if gen_event else -1,
-                    "start_time": gen_event.start_time if gen_event else ts,
+                    "start_time": ts,  # compute_reward start time (not generation start)
                     "is_eval": gen_event.is_eval if gen_event else False,
                     "prompt_tokens": gen_event.prompt_tokens if gen_event else 0,
                 }
