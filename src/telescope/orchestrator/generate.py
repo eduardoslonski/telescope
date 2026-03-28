@@ -88,6 +88,18 @@ RETRY_BACKOFF_BASE = 0.5  # seconds
 _shutting_down = False
 
 
+@dataclass
+class SampleLifecycleCallbacks:
+    """Callbacks for sample lifecycle events, created per-sample by the orchestrator.
+
+    The orchestrator builds closures that capture request context
+    (request_id, sample_idx, server info) and log the appropriate events.
+    """
+    on_inference_end: Callable[[], None] | None = None    # Log phase="end" inference event + free lane
+    on_reward_start: Callable[[], None] | None = None     # Log compute_reward_start orchestrator event
+    on_reward_end: Callable[[float], None] | None = None   # Log compute_reward_end (receives duration in seconds)
+
+
 # =============================================================================
 # Local Tokenization Helper
 # =============================================================================
@@ -1032,6 +1044,7 @@ async def process_sample(
     tokenizer: Any = None,
     timing_out: dict | None = None,
     on_generation_complete: Callable[[], None] | None = None,
+    lifecycle: SampleLifecycleCallbacks | None = None,
 ) -> dict:
     """
     Process a single prompt and compute rewards.
@@ -1045,6 +1058,7 @@ async def process_sample(
         tokenizer: HuggingFace tokenizer for formatting prompts with chat template
         on_generation_complete: Optional callback invoked after generation succeeds
             but before compute_reward starts (used to free lane slots early).
+        lifecycle: Optional per-sample lifecycle callbacks for decoupled event logging.
 
     Returns:
         Dict with completion data, rewards, timing info.
@@ -1099,8 +1113,12 @@ async def process_sample(
 
     if on_generation_complete is not None:
         on_generation_complete()
+    if lifecycle is not None and lifecycle.on_inference_end is not None:
+        lifecycle.on_inference_end()
 
     # Compute rewards in thread pool to avoid blocking the event loop (can take 50-450ms)
+    if lifecycle is not None and lifecycle.on_reward_start is not None:
+        lifecycle.on_reward_start()
     _reward_t0 = time.monotonic()
     reward_result = await asyncio.get_event_loop().run_in_executor(
         None, compute_reward_fn, completion_text, sample, eos_token
@@ -1108,6 +1126,8 @@ async def process_sample(
     if inspect.isawaitable(reward_result):
         reward_result = await reward_result
     compute_reward_time = time.monotonic() - _reward_t0
+    if lifecycle is not None and lifecycle.on_reward_end is not None:
+        lifecycle.on_reward_end(compute_reward_time)
     total_reward = reward_result.total_reward
     sample_metrics = reward_result.sample_metrics
     golden_answers = reward_result.golden_answers
@@ -1163,6 +1183,7 @@ async def process_multiturn_sample(
     prompt_data: dict | None = None,
     timing_out: dict | None = None,
     on_generation_complete: Callable[[], None] | None = None,
+    lifecycle: SampleLifecycleCallbacks | None = None,
 ) -> dict:
     """
     Process a single multi-turn sample.
@@ -1172,6 +1193,7 @@ async def process_multiturn_sample(
     Args:
         on_generation_complete: Optional callback invoked after rollout succeeds
             but before compute_reward starts (used to free lane slots early).
+        lifecycle: Optional per-sample lifecycle callbacks for decoupled event logging.
 
     Returns:
         Dict with trajectory data, rewards, timing info.
@@ -1205,6 +1227,8 @@ async def process_multiturn_sample(
 
     if on_generation_complete is not None:
         on_generation_complete()
+    if lifecycle is not None and lifecycle.on_inference_end is not None:
+        lifecycle.on_inference_end()
 
     # Check for errors in state (but context_exhausted is OK)
     if state.error:
@@ -1212,15 +1236,17 @@ async def process_multiturn_sample(
             "error": "rollout_error",
             "error_message": state.error,
         }
-    
+
     # Need at least one turn for valid training data
     if state.num_turns == 0:
         return {
             "error": "empty_trajectory",
             "error_message": "No turns completed in rollout",
         }
-    
+
     # Compute reward in thread pool to avoid blocking the event loop
+    if lifecycle is not None and lifecycle.on_reward_start is not None:
+        lifecycle.on_reward_start()
     _reward_t0 = time.monotonic()
     reward_result = await asyncio.get_event_loop().run_in_executor(
         None, env.compute_reward, state, eos_token
@@ -1228,6 +1254,8 @@ async def process_multiturn_sample(
     if inspect.isawaitable(reward_result):
         reward_result = await reward_result
     compute_reward_time = time.monotonic() - _reward_t0
+    if lifecycle is not None and lifecycle.on_reward_end is not None:
+        lifecycle.on_reward_end(compute_reward_time)
     
     # Build interleaved completion data.
     # The completion_ids include env response tokens between model completions,
@@ -1296,12 +1324,13 @@ async def process_multiturn_group(
     tokenizer: Any = None,
     http_client: httpx.AsyncClient = None,
     sample_timings: list[dict] | None = None,
+    sample_lifecycles: list[SampleLifecycleCallbacks] | None = None,
 ) -> dict:
     """
     Process a group of multi-turn samples.
-    
+
     Each sample runs an independent rollout with the same initial prompt.
-    
+
     Args:
         prompt_data: Dict with 'prompt', 'sample', 'env_name'
         eos_token: EOS token for reward computation
@@ -1309,12 +1338,13 @@ async def process_multiturn_group(
         env: Multi-turn environment instance
         tokenizer: Optional tokenizer for formatting
         http_client: Optional HTTP client (if None, creates one)
-        
+        sample_lifecycles: Optional per-sample lifecycle callbacks.
+
     Returns:
         Dict with all rollout data, rewards, advantages, request timings.
     """
     sample = prompt_data["sample"]
-    
+
     # Use provided client or create a new one
     if http_client is not None:
         tasks = [
@@ -1327,6 +1357,7 @@ async def process_multiturn_group(
                 tokenizer,
                 prompt_data=prompt_data,
                 timing_out=sample_timings[i] if sample_timings else None,
+                lifecycle=sample_lifecycles[i] if sample_lifecycles else None,
             )
             for i in range(config.cfg.group_size)
         ]
@@ -1344,6 +1375,7 @@ async def process_multiturn_group(
                     tokenizer,
                     prompt_data=prompt_data,
                     timing_out=sample_timings[i] if sample_timings else None,
+                    lifecycle=sample_lifecycles[i] if sample_lifecycles else None,
                 )
                 for i in range(config.cfg.group_size)
             ]
@@ -1471,12 +1503,13 @@ async def process_group(
     tokenizer: Any = None,
     http_client: httpx.AsyncClient = None,
     sample_timings: list[dict] | None = None,
+    sample_lifecycles: list[SampleLifecycleCallbacks] | None = None,
 ) -> dict:
     """
     Process a group of samples (same prompt, multiple completions).
-    
+
     Automatically handles both single-turn and multi-turn environments.
-    
+
     Args:
         prompt_data: Dict with 'prompt' (raw question), 'sample', 'env_name', 'env'
         eos_token: EOS token for reward computation
@@ -1485,11 +1518,12 @@ async def process_group(
         env: Optional multi-turn environment instance
         tokenizer: Tokenizer for chat template formatting (required for single-turn)
         http_client: Optional HTTP client (if None, creates one)
-        
+        sample_lifecycles: Optional per-sample lifecycle callbacks.
+
     Returns:
         Dict with all completion data, rewards, advantages, request timings, and vllm logprobs.
         If the prompt is too long, returns dict with "error" key set.
-        
+
     Note:
         prompt_data['prompt'] should be the raw question text. The chat template
         formatting is applied at rollout time using the environment's format_prompt()
@@ -1500,13 +1534,15 @@ async def process_group(
         return await process_multiturn_group(
             prompt_data, eos_token, server_url, env, tokenizer, http_client,
             sample_timings=sample_timings,
+            sample_lifecycles=sample_lifecycles,
         )
 
     # Single-turn processing - use provided client or create a new one
     if http_client is not None:
         tasks = [
             process_sample(http_client, prompt_data, eos_token, server_url, compute_reward_fn, tokenizer,
-                           timing_out=sample_timings[i] if sample_timings else None)
+                           timing_out=sample_timings[i] if sample_timings else None,
+                           lifecycle=sample_lifecycles[i] if sample_lifecycles else None)
             for i in range(config.cfg.group_size)
         ]
         group_samples = await asyncio.gather(*tasks)
@@ -1515,7 +1551,8 @@ async def process_group(
         async with httpx.AsyncClient(limits=limits, timeout=httpx.Timeout(1200.0)) as client:
             tasks = [
                 process_sample(client, prompt_data, eos_token, server_url, compute_reward_fn, tokenizer,
-                               timing_out=sample_timings[i] if sample_timings else None)
+                               timing_out=sample_timings[i] if sample_timings else None,
+                               lifecycle=sample_lifecycles[i] if sample_lifecycles else None)
                 for i in range(config.cfg.group_size)
             ]
             group_samples = await asyncio.gather(*tasks)

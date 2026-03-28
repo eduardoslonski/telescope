@@ -39,6 +39,7 @@ from telescope.orchestrator.loggers.event_logger import (
 )
 from telescope.orchestrator import generate as generate_module
 from telescope.orchestrator.generate import (
+    SampleLifecycleCallbacks,
     compute_advantages,
     get_chat_template_kwargs,
     init_interleaved_tokenizer,
@@ -955,7 +956,7 @@ class Orchestrator:
             f"(env={env_name}, active={self.active_count}, "
             f"lane_slots={lane_slots})"
         )
-        self.wandb_logger.log_orchestrator_timeline_event("inference_call")
+        self.wandb_logger.log_orchestrator_timeline_event("inference_call", group_id=request_id)
 
         # Pre-assign sample_ids and log start events for each sample in the group
         sample_ids = {}
@@ -1053,7 +1054,7 @@ class Orchestrator:
             f"Created individual group request_id={request_id} on {server_url} "
             f"(env={env_name}, active={self.active_count})"
         )
-        self.wandb_logger.log_orchestrator_timeline_event("inference_call")
+        self.wandb_logger.log_orchestrator_timeline_event("inference_call", group_id=request_id)
         self.inflight_rollout_info[request_id] = InflightRolloutInfo(server_url=server_url)
 
         # Enqueue GROUP_SIZE samples for this group.
@@ -1134,6 +1135,86 @@ class Orchestrator:
 
     # ----- End individual sample dispatch -----
 
+    def _make_sample_lifecycle(
+        self,
+        request_id: int,
+        sample_idx: int,
+        server_url: str,
+        lane_slot: int,
+        timing: dict,
+        free_lane_on_inference_end: bool = False,
+    ) -> SampleLifecycleCallbacks:
+        """Create per-sample lifecycle callbacks for decoupled event logging.
+
+        The returned callbacks log:
+        - on_inference_end: phase="end" inference event at generation-complete time, optionally frees lane
+        - on_reward_start: compute_reward_start orchestrator event
+        - on_reward_end: compute_reward_end orchestrator event
+        """
+        server_idx = self._get_server_index(server_url)
+        server_info = self._get_server_info(server_url)
+        lane_freed = False
+
+        def on_inference_end():
+            nonlocal lane_freed
+            rollout_info = self.inflight_rollout_info.get(request_id)
+            sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
+
+            # Log phase="end" inference event with generation timing (no OTLP, no compute_reward_time)
+            self.wandb_logger.log_inference_event(
+                event_type="request",
+                server=server_idx,
+                start_time=timing.get("start_time", 0),
+                end_time=timing.get("end_time", 0),
+                node_id=server_info.get("node_id", -1),
+                node_ip=str(server_info.get("node_ip") or ""),
+                hostname=str(server_info.get("hostname") or ""),
+                ray_node_id=str(server_info.get("ray_node_id") or ""),
+                tp_group_id=int(server_info.get("tp_group_id", server_idx)),
+                tp_size=int(server_info.get("tp_size", 1)),
+                prompt_tokens=timing.get("prompt_tokens", 0),
+                rollout_tokens=timing.get("rollout_tokens", 0),
+                group_id=request_id,
+                sample_id=sample_id,
+                off_policy_steps=(rollout_info.sample_off_policy_steps.get(sample_idx, 0) if rollout_info else 0),
+                server_lane=lane_slot,
+                phase="end",
+            )
+            timing["inference_end_logged"] = True
+
+            # Optionally free lane slot (individual mode with free_lane_after_generation)
+            if free_lane_on_inference_end and not lane_freed:
+                lane_freed = True
+                if server_url in self.available_server_lane_slots:
+                    self.available_server_lane_slots[server_url].add(lane_slot)
+                self._schedule_dispatch()
+
+        # sample_id resolved at reward_start time and captured for reward_end,
+        # because rollout_info may be popped by _on_rollout_complete before reward_end fires.
+        _reward_sample_id = -1
+
+        def on_reward_start():
+            nonlocal _reward_sample_id
+            rollout_info = self.inflight_rollout_info.get(request_id)
+            _reward_sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
+            self.wandb_logger.log_orchestrator_timeline_event(
+                "compute_reward_start", group_id=request_id, sample_id=_reward_sample_id,
+            )
+
+        def on_reward_end(compute_reward_time: float):
+            self.wandb_logger.log_orchestrator_timeline_event(
+                "compute_reward_end", group_id=request_id, sample_id=_reward_sample_id,
+            )
+
+        lifecycle = SampleLifecycleCallbacks(
+            on_inference_end=on_inference_end,
+            on_reward_start=on_reward_start,
+            on_reward_end=on_reward_end,
+        )
+        # Expose lane_freed state so _run_individual_sample can check it
+        lifecycle._lane_freed = lambda: lane_freed  # type: ignore[attr-defined]
+        return lifecycle
+
     async def _run_prompt(
         self,
         prompt_data: dict,
@@ -1151,6 +1232,20 @@ class Orchestrator:
         rollout_info = self.inflight_rollout_info.get(request_id)
         if rollout_info:
             rollout_info.sample_timings = {i: sample_timings[i] for i in range(config.cfg.group_size)}
+
+        # Create per-sample lifecycle callbacks for decoupled event logging
+        sample_lifecycles = [
+            self._make_sample_lifecycle(
+                request_id=request_id,
+                sample_idx=i,
+                server_url=server_url,
+                lane_slot=lane_slots[i] if i < len(lane_slots) else -1,
+                timing=sample_timings[i],
+                free_lane_on_inference_end=False,  # group mode frees all lanes together
+            )
+            for i in range(config.cfg.group_size)
+        ]
+
         try:
             result = await process_group(
                 prompt_data,
@@ -1161,6 +1256,7 @@ class Orchestrator:
                 tokenizer=self.tokenizer,
                 http_client=self.http_client,
                 sample_timings=sample_timings,
+                sample_lifecycles=sample_lifecycles,
             )
         except asyncio.CancelledError:
             self._on_cancelled_group(request_id, server_url, lane_slots, sample_timings)
@@ -1197,22 +1293,15 @@ class Orchestrator:
         if rollout_info:
             rollout_info.sample_timings[sample_idx] = timing
 
-        # When free_lane_after_generation is enabled, the callback frees the
-        # lane slot as soon as generation/rollout finishes (before compute_reward).
-        # The flag prevents the post-try fallback from double-freeing.
-        lane_freed = False
-
-        def _free_lane():
-            nonlocal lane_freed
-            if lane_freed:
-                return
-            lane_freed = True
-            if server_url in self.available_server_lane_slots:
-                self.available_server_lane_slots[server_url].add(lane_slot)
-            # A lane just freed — schedule dispatch (coalesced, non-blocking).
-            self._schedule_dispatch()
-
-        on_gen_complete = _free_lane if self.free_lane_after_generation else None
+        # Create lifecycle callbacks for decoupled event logging + lane freeing.
+        lifecycle = self._make_sample_lifecycle(
+            request_id=request_id,
+            sample_idx=sample_idx,
+            server_url=server_url,
+            lane_slot=lane_slot,
+            timing=timing,
+            free_lane_on_inference_end=self.free_lane_after_generation,
+        )
 
         try:
             if is_multiturn:
@@ -1225,7 +1314,7 @@ class Orchestrator:
                     self.tokenizer,
                     prompt_data=prompt_data,
                     timing_out=timing,
-                    on_generation_complete=on_gen_complete,
+                    lifecycle=lifecycle,
                 )
             else:
                 result = await process_sample(
@@ -1236,9 +1325,10 @@ class Orchestrator:
                     self.scheduler.compute_reward,
                     self.tokenizer,
                     timing_out=timing,
-                    on_generation_complete=on_gen_complete,
+                    lifecycle=lifecycle,
                 )
         except asyncio.CancelledError:
+            lane_freed = lifecycle._lane_freed()  # type: ignore[attr-defined]
             now = time.time()
             self._handle_cancelled_sample(
                 request_id, sample_idx, server_url, lane_slot,
@@ -1251,7 +1341,8 @@ class Orchestrator:
                 _log.warning(f"Individual sample error: request_id={request_id}, idx={sample_idx}: {e}")
             result = {"error": "sample_error", "error_message": str(e)}
 
-        # Free lane slot if not already freed by the on_generation_complete callback.
+        # Free lane slot if not already freed by the lifecycle on_inference_end callback.
+        lane_freed = lifecycle._lane_freed()  # type: ignore[attr-defined]
         if not lane_freed:
             if server_url in self.available_server_lane_slots:
                 self.available_server_lane_slots[server_url].add(lane_slot)
@@ -1455,6 +1546,9 @@ class Orchestrator:
 
         for timing in timings:
             if not timing:
+                continue
+            # Skip if already logged by lifecycle callback at generation-complete time
+            if timing.get("inference_end_logged"):
                 continue
             vllm_request_id = timing.get("vllm_request_id", "")
             vllm_max_tokens = timing.get("max_tokens", 0)
@@ -1803,7 +1897,7 @@ class Orchestrator:
             elif not generate_module._shutting_down:
                 _log.warning(f"Discarding group due to error: {error_type} - {error_msg}")
             
-            self.wandb_logger.log_orchestrator_timeline_event(f"rollout_discarded_{error_type}")
+            self.wandb_logger.log_orchestrator_timeline_event(f"rollout_discarded_{error_type}", group_id=request_id)
             # Continue to next prompt without adding to bucket
             if self._has_pending_prompt_data():
                 self._schedule_dispatch()
@@ -1821,15 +1915,15 @@ class Orchestrator:
         if async_level > config.cfg.max_async_rollout:
             # Discard stale rollout
             _log.debug(f"Discarding stale rollout: model_step={model_step}, async_level={async_level}")
-            self.wandb_logger.log_orchestrator_timeline_event("rollout_discarded_max_async", step=model_step)
+            self.wandb_logger.log_orchestrator_timeline_event("rollout_discarded_max_async", step=model_step, group_id=request_id)
             self._log_discarded_rollouts(result, "max_async")
         elif self._should_discard_zero_advantage_group(result):
             # Discard group with all zero advantages
             _log.debug(f"Discarding group with all zero advantages: model_step={model_step}")
-            self.wandb_logger.log_orchestrator_timeline_event("rollout_discarded_zero_advantage", step=model_step)
+            self.wandb_logger.log_orchestrator_timeline_event("rollout_discarded_zero_advantage", step=model_step, group_id=request_id)
             self._log_discarded_rollouts(result, "zero_advantage")
         else:
-            self.wandb_logger.log_orchestrator_timeline_event("rollouts_group_done", step=self.inference_step)
+            self.wandb_logger.log_orchestrator_timeline_event("rollouts_group_done", step=self.inference_step, group_id=request_id)
             # Add to bucket
             self.bucket.append(result)
             rewards = result.get("rewards", [])
@@ -2043,6 +2137,9 @@ class Orchestrator:
         tp_size = int(server_info.get("tp_size", 1))
         _off_policy = off_policy_steps or {}
         for timing in request_timings:
+            # Skip if already logged by lifecycle callback at generation-complete time
+            if timing.get("inference_end_logged"):
+                continue
             sample_idx_in_group = timing.get("sample_idx_in_group", -1)
             sample_id = sample_idx_map.get(sample_idx_in_group, -1)
 

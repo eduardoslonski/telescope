@@ -12,7 +12,7 @@ schema_version = "0.2.0"
 # Bump the version for a table whenever its schema (columns, types, semantics) changes.
 table_schema_versions = {
     # events zip tables
-    "orchestrator": "0.1",
+    "orchestrator": "0.2",
     "trainer": "0.2",
     "inference": "0.6",
     "gpu": "0.1",
