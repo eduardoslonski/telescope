@@ -1154,13 +1154,6 @@ class Orchestrator:
         server_idx = self._get_server_index(server_url)
         server_info = self._get_server_info(server_url)
         lane_freed = False
-        reward_start_ts = 0.0
-        _node_id = server_info.get("node_id", -1)
-        _node_ip = str(server_info.get("node_ip") or "")
-        _hostname = str(server_info.get("hostname") or "")
-        _ray_node_id = str(server_info.get("ray_node_id") or "")
-        _tp_group_id = int(server_info.get("tp_group_id", server_idx))
-        _tp_size = int(server_info.get("tp_size", 1))
 
         def on_inference_end():
             nonlocal lane_freed
@@ -1173,12 +1166,12 @@ class Orchestrator:
                 server=server_idx,
                 start_time=timing.get("start_time", 0),
                 end_time=timing.get("end_time", 0),
-                node_id=_node_id,
-                node_ip=_node_ip,
-                hostname=_hostname,
-                ray_node_id=_ray_node_id,
-                tp_group_id=_tp_group_id,
-                tp_size=_tp_size,
+                node_id=server_info.get("node_id", -1),
+                node_ip=str(server_info.get("node_ip") or ""),
+                hostname=str(server_info.get("hostname") or ""),
+                ray_node_id=str(server_info.get("ray_node_id") or ""),
+                tp_group_id=int(server_info.get("tp_group_id", server_idx)),
+                tp_size=int(server_info.get("tp_size", 1)),
                 prompt_tokens=timing.get("prompt_tokens", 0),
                 rollout_tokens=timing.get("rollout_tokens", 0),
                 group_id=request_id,
@@ -1197,49 +1190,17 @@ class Orchestrator:
                 self._schedule_dispatch()
 
         def on_reward_start():
-            nonlocal reward_start_ts
-            reward_start_ts = time.time()
             rollout_info = self.inflight_rollout_info.get(request_id)
             sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
-            # Orchestrator event (vertical line)
             self.wandb_logger.log_orchestrator_timeline_event(
                 "compute_reward_start", group_id=request_id, sample_id=sample_id,
             )
-            # Inference event (bar on lane) — phase="start" for inflight tracking
-            self.wandb_logger.log_inference_event(
-                event_type="compute_reward",
-                server=server_idx,
-                start_time=reward_start_ts,
-                end_time=reward_start_ts,
-                node_id=_node_id, node_ip=_node_ip, hostname=_hostname,
-                ray_node_id=_ray_node_id, tp_group_id=_tp_group_id, tp_size=_tp_size,
-                group_id=request_id,
-                sample_id=sample_id,
-                server_lane=lane_slot,
-                phase="start",
-            )
 
         def on_reward_end(compute_reward_time: float):
-            reward_end_ts = time.time()
             rollout_info = self.inflight_rollout_info.get(request_id)
             sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
-            # Orchestrator event (vertical line)
             self.wandb_logger.log_orchestrator_timeline_event(
                 "compute_reward_end", group_id=request_id, sample_id=sample_id,
-            )
-            # Inference event (bar on lane) — phase="end" for completed bar
-            self.wandb_logger.log_inference_event(
-                event_type="compute_reward",
-                server=server_idx,
-                start_time=reward_start_ts,
-                end_time=reward_end_ts,
-                node_id=_node_id, node_ip=_node_ip, hostname=_hostname,
-                ray_node_id=_ray_node_id, tp_group_id=_tp_group_id, tp_size=_tp_size,
-                group_id=request_id,
-                sample_id=sample_id,
-                compute_reward_time=compute_reward_time,
-                server_lane=lane_slot,
-                phase="end",
             )
 
         lifecycle = SampleLifecycleCallbacks(
