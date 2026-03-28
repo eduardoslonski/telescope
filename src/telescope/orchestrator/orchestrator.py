@@ -1189,18 +1189,21 @@ class Orchestrator:
                     self.available_server_lane_slots[server_url].add(lane_slot)
                 self._schedule_dispatch()
 
+        # sample_id resolved at reward_start time and captured for reward_end,
+        # because rollout_info may be popped by _on_rollout_complete before reward_end fires.
+        _reward_sample_id = -1
+
         def on_reward_start():
+            nonlocal _reward_sample_id
             rollout_info = self.inflight_rollout_info.get(request_id)
-            sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
+            _reward_sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
             self.wandb_logger.log_orchestrator_timeline_event(
-                "compute_reward_start", group_id=request_id, sample_id=sample_id,
+                "compute_reward_start", group_id=request_id, sample_id=_reward_sample_id,
             )
 
         def on_reward_end(compute_reward_time: float):
-            rollout_info = self.inflight_rollout_info.get(request_id)
-            sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
             self.wandb_logger.log_orchestrator_timeline_event(
-                "compute_reward_end", group_id=request_id, sample_id=sample_id,
+                "compute_reward_end", group_id=request_id, sample_id=_reward_sample_id,
             )
 
         lifecycle = SampleLifecycleCallbacks(
