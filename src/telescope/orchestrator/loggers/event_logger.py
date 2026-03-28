@@ -711,6 +711,8 @@ class EventLogger:
         self._events: list[Event] = []
         self._inference_events: list[InferenceEvent] = []
         self._inflight_generations: dict[int, InferenceEvent] = {}  # sample_id -> start event
+        self._ended_generation_info: dict[int, InferenceEvent] = {}  # sample_id -> stashed start event after phase="end"
+        self._inflight_compute_reward: dict[int, dict] = {}  # sample_id -> compute_reward inflight info
 
         # External metrics loggers (set via set_metrics_loggers)
         self._system_metrics_logger: SystemMetricsLogger | None = None
@@ -891,6 +893,21 @@ class EventLogger:
 
         with self._lock:
             self._events.append(event)
+            # Track inflight compute_reward for snapshot
+            if event_type == "compute_reward_start" and sample_id >= 0:
+                gen_event = self._ended_generation_info.get(sample_id)
+                self._inflight_compute_reward[sample_id] = {
+                    "sample_id": sample_id,
+                    "group_id": group_id,
+                    "server": gen_event.server if gen_event else -1,
+                    "server_lane": gen_event.server_lane if gen_event else -1,
+                    "start_time": ts,
+                    "is_eval": gen_event.is_eval if gen_event else False,
+                    "prompt_tokens": gen_event.prompt_tokens if gen_event else 0,
+                }
+            elif event_type == "compute_reward_end" and sample_id >= 0:
+                self._inflight_compute_reward.pop(sample_id, None)
+                self._ended_generation_info.pop(sample_id, None)
 
     def log_rollout(
         self,
@@ -1098,7 +1115,10 @@ class EventLogger:
             if phase == "start" and sample_id >= 0:
                 self._inflight_generations[sample_id] = event
             elif phase == "end" and sample_id >= 0:
-                self._inflight_generations.pop(sample_id, None)
+                # Stash server/lane info for compute_reward inflight tracking
+                start_ev = self._inflight_generations.pop(sample_id, None)
+                if start_ev is not None:
+                    self._ended_generation_info[sample_id] = start_ev
 
     def log_step_metric(self, step: int, metric: str, value: float, section: str = "", group: str = ""):
         """Log a per-step metric."""
@@ -2299,6 +2319,7 @@ class EventLogger:
         eval_prompts: list[EvalPrompt] | None = None,
         logs: list[tuple[LogRecord, int]] | None = None,
         inflight_snapshot: list[dict] | None = None,
+        inflight_compute_reward: list[dict] | None = None,
     ):
         """Write all event data as separate parquet files in a single zip archive."""
         if self.run is None:
@@ -2437,10 +2458,13 @@ class EventLogger:
 
             # Write inflight snapshot if provided (only for tail.zip)
             if inflight_snapshot is not None:
-                zf.writestr("inflight.json", json.dumps({
+                inflight_data = {
                     "snapshot_time": time.time(),
                     "running": inflight_snapshot,
-                }))
+                }
+                if inflight_compute_reward:
+                    inflight_data["running_compute_reward"] = inflight_compute_reward
+                zf.writestr("inflight.json", json.dumps(inflight_data))
 
         self.run.save(str(dest_path), base_path=self.run.dir, policy="now")
 
@@ -2585,6 +2609,8 @@ class EventLogger:
                 }
                 for e in self._inflight_generations.values()
             ]
+            # Snapshot inflight compute_reward for tail.zip
+            inflight_compute_reward_snapshot = list(self._inflight_compute_reward.values())
             all_events = list(self._events)
             all_inference_events = list(self._inference_events)
             all_discarded_rollouts = list(self._discarded_rollouts)
@@ -2831,6 +2857,7 @@ class EventLogger:
             eval_prompts=tail_eval_prompts,
             logs=tail_log_records,
             inflight_snapshot=inflight_snapshot,
+            inflight_compute_reward=inflight_compute_reward_snapshot,
         )
 
         # Write block_live.zip with all data
