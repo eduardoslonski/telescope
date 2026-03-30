@@ -20,10 +20,10 @@ from dataclasses import dataclass, field
 from telescope.environments.base import (
     MultiTurnEnvironment,
     Sample,
-    RewardResult,
     RolloutState,
     ChatMessage,
 )
+from telescope.environments.rewards import Rubric
 
 logger = logging.getLogger(__name__)
 
@@ -245,12 +245,15 @@ class WordleEnvironment(MultiTurnEnvironment):
         self._valid_words: set[str] | None = None
         self._initial_observation: str | None = None
 
-    metrics_ranges = {
-        "correct_answer": {"min": 0, "max": 1},
-        "partial_answer": {"min": 0, "max": 1},
-        "length_bonus": {"min": 0, "max": 1},
-        "format_reward": {"min": 0, "max": 1},
-    }
+        self.rubric = Rubric()
+        self.rubric.add_reward(self._reward_correct, range_min=0, range_max=1)
+        self.rubric.add_reward(self._reward_partial, range_min=0, range_max=1)
+        self.rubric.add_reward(self._reward_length, range_min=0, range_max=1)
+        self.rubric.add_reward(self._reward_fmt, name="format_reward", weight=0.2, range_min=0, range_max=1)
+
+    @property
+    def metrics_ranges(self):
+        return self.rubric.metrics_ranges
 
     # ------------------------------------------------------------------
     # One-time initialisation
@@ -351,7 +354,7 @@ class WordleEnvironment(MultiTurnEnvironment):
     # Multi-turn interaction
     # ------------------------------------------------------------------
 
-    def env_response(
+    async def env_response(
         self,
         messages: list[ChatMessage],
         state: RolloutState,
@@ -496,38 +499,24 @@ class WordleEnvironment(MultiTurnEnvironment):
     # Reward computation
     # ------------------------------------------------------------------
 
-    def compute_reward(
-        self,
-        state: RolloutState,
-        eos_token: str = "",
-    ) -> RewardResult:
-        """
-        Compute reward for completed Wordle game.
+    # -- rubric wrappers (take state, delegate to existing helpers) --------
 
-        Reward structure:
-        - correct_answer (weight=1.0)
-        - partial_answer (weight=1.0)
-        - length_bonus   (weight=1.0)
-        - format_reward   (weight=0.2)
-        """
+    def _reward_correct(self, state: RolloutState) -> tuple[float, str]:
         answer = state.sample.answer or ""
         messages = self._get_all_messages(state)
+        return self._reward_correct_answer(messages, answer), answer
 
-        correct  = self._reward_correct_answer(messages, answer)
-        partial  = self._reward_partial_answer(messages, answer)
-        length   = self._reward_length_bonus(messages, answer)
-        fmt      = self._reward_format(messages)
+    def _reward_partial(self, state: RolloutState) -> float:
+        answer = state.sample.answer or ""
+        return self._reward_partial_answer(self._get_all_messages(state), answer)
 
-        total = 1.0 * correct + 1.0 * partial + 1.0 * length + 0.2 * fmt
+    def _reward_length(self, state: RolloutState) -> float:
+        answer = state.sample.answer or ""
+        return self._reward_length_bonus(self._get_all_messages(state), answer)
 
-        return RewardResult(
-            total_reward=total,
-            sample_metrics={
-                "correct_answer": correct,
-                "partial_answer": partial,
-                "length_bonus": length,
-                "format_reward": fmt,
-            },
-            golden_answers={"correct_answer": answer},
-        )
+    def _reward_fmt(self, state: RolloutState) -> float:
+        return self._reward_format(self._get_all_messages(state))
+
+    async def compute_reward(self, state: RolloutState, eos_token: str = ""):
+        return await self.rubric.score(state=state)
 

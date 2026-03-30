@@ -10,8 +10,9 @@ import logging
 
 from datasets import load_dataset
 
-from telescope.environments.base import Sample, RewardResult, SingleTurnEnvironment
+from telescope.environments.base import Sample, SingleTurnEnvironment
 from telescope.environments.countdown.rewards import compute_format_reward, compute_equation_reward
+from telescope.environments.rewards import Rubric
 
 
 logger = logging.getLogger(__name__)
@@ -52,11 +53,14 @@ class CountdownEnvironment(SingleTurnEnvironment):
         self.dataset_name = dataset_name
         self.dataset_subset = dataset_subset
         self.dataset_split = dataset_split
-    
-    metrics_ranges = {
-        "format_reward": {"min": 0, "max": 1},
-        "equation_reward": {"min": 0, "max": 1},
-    }
+
+        self.rubric = Rubric()
+        self.rubric.add_reward(self._format_reward, range_min=0, range_max=1)
+        self.rubric.add_reward(self._equation_reward, range_min=0, range_max=1)
+
+    @property
+    def metrics_ranges(self):
+        return self.rubric.metrics_ranges
     
     def load_dataset(
         self,
@@ -116,38 +120,17 @@ class CountdownEnvironment(SingleTurnEnvironment):
         logger.info(f"Loaded {len(samples)} samples from {self.name}")
         return samples
     
-    def compute_reward(
-        self,
-        completion: str,
-        sample: Sample,
-        eos_token: str = ""
-    ) -> RewardResult:
-        """
-        Compute reward for a countdown completion.
-        
-        Reward has two components:
-        - format_reward: Checks if response follows <think>...</think><answer>...</answer> format
-        - equation_reward: Checks if equation uses given numbers and evaluates to target
-        """
-        # Strip EOS token if present
-        if eos_token and completion.endswith(eos_token):
-            completion = completion[:-len(eos_token)]
-        
+    @staticmethod
+    def _format_reward(completion: str) -> float:
+        return compute_format_reward(completion)
+
+    @staticmethod
+    def _equation_reward(completion: str, sample: Sample) -> tuple[float, str]:
         nums = sample.metadata["nums"]
         target = sample.metadata["target"]
-        
-        format_reward = compute_format_reward(completion)
-        equation_reward = compute_equation_reward(completion, nums, target)
-        
-        total_reward = format_reward + equation_reward
-        
-        return RewardResult(
-            total_reward=total_reward,
-            sample_metrics={
-                "format_reward": format_reward,
-                "equation_reward": equation_reward,
-            },
-            golden_answers={
-                "target": str(target),
-            },
-        )
+        return compute_equation_reward(completion, nums, target), str(target)
+
+    async def compute_reward(self, completion: str, sample: Sample, eos_token: str = ""):
+        if eos_token and completion.endswith(eos_token):
+            completion = completion[: -len(eos_token)]
+        return await self.rubric.score(completion=completion, sample=sample)

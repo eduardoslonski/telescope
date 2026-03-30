@@ -569,20 +569,21 @@ class ToolEnvironment(MultiTurnEnvironment):
     # Tool Execution
     # =========================================================================
     
-    def execute_tool(self, tool_call: ToolCall) -> ToolResult:
+    async def execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """
         Execute a single tool call.
-        
+
         Override for custom execution logic (e.g., async tools, sandboxing).
-        
+        Supports both sync and async tool functions.
+
         Args:
             tool_call: Parsed tool call to execute
-            
+
         Returns:
             ToolResult with execution outcome
         """
         tool_name = tool_call.name
-        
+
         if tool_name not in self.tool_map:
             return ToolResult(
                 tool_name=tool_name,
@@ -590,11 +591,15 @@ class ToolEnvironment(MultiTurnEnvironment):
                 success=False,
                 error="unknown_tool"
             )
-        
+
         tool_func = self.tool_map[tool_name]
-        
+
         try:
-            result = tool_func(**tool_call.arguments)
+            import asyncio
+            if asyncio.iscoroutinefunction(tool_func):
+                result = await tool_func(**tool_call.arguments)
+            else:
+                result = tool_func(**tool_call.arguments)
             return ToolResult(
                 tool_name=tool_name,
                 result=str(result),
@@ -665,36 +670,36 @@ class ToolEnvironment(MultiTurnEnvironment):
         
         return state
     
-    def env_response(
+    async def env_response(
         self,
         messages: list[ChatMessage],
         state: RolloutState,
     ) -> list[ChatMessage]:
         """
         Parse tool calls, execute them, and return results.
-        
+
         If no tool calls are detected (final answer), returns empty list
         to signal end of rollout.
         """
         # Get the last assistant message
         last_message = messages[-1]
         completion = last_message.get("content", "")
-        
+
         # Check if this is a final answer (no tool calls)
         if self.is_final_answer(completion, state):
             return []
-        
+
         # Parse tool calls
         tool_calls = self.parse_tool_calls(completion)
-        
+
         if not tool_calls:
             # No tool calls found - treat as final answer
             return []
-        
+
         # Execute each tool call
         results: list[ToolResult] = []
         for call in tool_calls:
-            result = self.execute_tool(call)
+            result = await self.execute_tool(call)
             results.append(result)
             
             # Track tool usage
@@ -774,23 +779,23 @@ class ToolEnvironment(MultiTurnEnvironment):
         
         return metrics
     
-    def compute_reward(
+    async def compute_reward(
         self,
         state: RolloutState,
         eos_token: str = "",
     ) -> RewardResult:
         """
         Compute reward for completed trajectory.
-        
+
         This is an abstract method - subclasses MUST implement task-specific
         reward computation.
-        
+
         Tool metrics are available via self.get_tool_metrics(state).
-        
+
         Args:
             state: Completed rollout state with full trajectory
             eos_token: EOS token to strip from completions
-            
+
         Returns:
             RewardResult with total reward and component breakdown
         """

@@ -82,13 +82,13 @@ class Scheduler:
             "env": self.environment,
         }
 
-    def compute_reward(self, completion: str, sample: Sample, eos_token: str):
+    async def compute_reward(self, completion: str, sample: Sample, eos_token: str):
         """
         Compute reward using the environment's reward function.
-        
+
         Returns RewardResult with total_reward and components dict.
         """
-        return self.environment.compute_reward(completion, sample, eos_token)
+        return await self.environment.compute_reward(completion, sample, eos_token)
 
 
 class MultiEnvScheduler:
@@ -177,17 +177,17 @@ class MultiEnvScheduler:
             "env": env,
         }
 
-    def compute_reward(self, completion: str, sample: Sample, eos_token: str):
+    async def compute_reward(self, completion: str, sample: Sample, eos_token: str):
         """
         Compute reward using the sample's environment.
-        
+
         The sample knows which environment it came from via metadata.
         """
         # Find environment by name (stored in sample metadata)
         env_name = sample.metadata.get("_env_name")
         for env in self.environments:
             if env.name == env_name:
-                return env.compute_reward(completion, sample, eos_token)
+                return await env.compute_reward(completion, sample, eos_token)
         raise ValueError(f"No environment found for env_name={env_name!r}")
 
 

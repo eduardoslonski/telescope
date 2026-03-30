@@ -10,7 +10,6 @@ metrics and rewards.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import math
 import time
 from dataclasses import dataclass, field
@@ -463,9 +462,7 @@ class EvalRunner:
 
         eos_token = getattr(env, "eos_token", "")
         metrics_start = time.time()
-        eval_result = env.compute_eval_metrics(completion_text, sample, eos_token)
-        if inspect.isawaitable(eval_result):
-            eval_result = await eval_result
+        eval_result = await env.compute_eval_metrics(completion_text, sample, eos_token)
         compute_eval_metrics_time = time.time() - metrics_start
 
         prompt_text = sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
@@ -539,9 +536,7 @@ class EvalRunner:
 
         eos_token = getattr(env, "eos_token", "")
         metrics_start = time.time()
-        eval_result = env.compute_eval_metrics(state, eos_token)
-        if inspect.isawaitable(eval_result):
-            eval_result = await eval_result
+        eval_result = await env.compute_eval_metrics(state, eos_token)
         compute_eval_metrics_time = time.time() - metrics_start
 
         total_prompt_tokens = 0

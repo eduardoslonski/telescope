@@ -142,7 +142,7 @@ class DapoMathEnvironment(SingleTurnEnvironment):
         logger.info(f"Loaded {len(samples)} samples from {self.name}")
         return samples
 
-    def compute_reward(
+    async def compute_reward(
         self,
         completion: str,
         sample: Sample,

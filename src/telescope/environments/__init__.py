@@ -53,6 +53,7 @@ from telescope.environments.parsers import (
     extract_xml_tag,
     strip_think_tags,
 )
+from telescope.environments.rewards import Rubric
 from telescope.environments.registry import get_environment, list_environments, check_environments
 
 __all__ = [
@@ -78,6 +79,8 @@ __all__ = [
     "extract_code_block",
     "extract_xml_tag",
     "strip_think_tags",
+    # Rewards
+    "Rubric",
     # Tool utilities
     "func_to_tool_schema",
     "parse_xml_tool_calls",
