@@ -1,14 +1,14 @@
 """
 DeepDive Environment — Multi-turn web research agent with judge-based reward.
 
-Adapted from prime-envs/deepdive for the telescope framework.
+Adapted from https://app.primeintellect.ai/dashboard/environments/primeintellect/deepdive
 
 The agent uses search_web, scan_page, and open_lines tools to research
 questions on the web, then provides a final answer via the finish tool
 (or \\boxed{} when finish_with_tool=False). A judge model evaluates
 correctness against a gold answer.
 
-Requires: aiohttp, diskcache, pdfminer.six, openai, httpx
+Requires: uv add aiohttp diskcache pdfminer.six openai httpx
 """
 
 REQUIRED_PACKAGES = ["aiohttp", "diskcache", "pdfminer", "openai", "httpx"]
@@ -137,6 +137,7 @@ class DeepDiveEnvironment(ToolEnvironment):
         dataset_seed: int = 2025,
         redundancy_penalty_weight: float = 0.0,
         finish_with_tool: bool = True,
+        strip_think_tags: bool = True,
         tool_call_format: str = "xml",
         log_level: str | int = "INFO",
         # Cache / fetch configuration
@@ -170,6 +171,7 @@ class DeepDiveEnvironment(ToolEnvironment):
         self._dataset_seed = dataset_seed
         self._redundancy_penalty_weight = redundancy_penalty_weight
         self._finish_with_tool = finish_with_tool
+        self._strip_think_tags = strip_think_tags
 
         # --- Open-one infrastructure ---
         configure_thread_pool(max_workers=open_max_workers)
@@ -534,9 +536,11 @@ class DeepDiveEnvironment(ToolEnvironment):
     # -- rubric reward functions -------------------------------------------
 
     async def _judge_reward(self, state: RolloutState) -> tuple[float, str]:
-        from telescope.environments.parsers import strip_think_tags
         raw = state.custom.get("final_answer") or self._get_last_completion(state)
-        final_answer = strip_think_tags(raw) if raw else raw
+        if raw and self._strip_think_tags:
+            from telescope.environments.parsers import strip_think_tags
+            raw = strip_think_tags(raw)
+        final_answer = raw
         gold = state.sample.answer
         raw_question = state.sample.metadata.get("raw_question", "")
         gid = state.sample.metadata.get("_group_id", "?")

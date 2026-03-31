@@ -687,13 +687,14 @@ class ToolEnvironment(MultiTurnEnvironment):
 
         # Check if this is a final answer (no tool calls)
         if self.is_final_answer(completion, state):
+            state.custom["_no_more_turns"] = True
             return []
 
         # Parse tool calls
         tool_calls = self.parse_tool_calls(completion)
 
         if not tool_calls:
-            # No tool calls found - treat as final answer
+            state.custom["_no_more_turns"] = True
             return []
 
         # Execute each tool call
@@ -735,15 +736,11 @@ class ToolEnvironment(MultiTurnEnvironment):
         }]
     
     def is_done(self, state: RolloutState) -> tuple[bool, str | None]:
-        """
-        Check if rollout should terminate.
-
-        Terminates when max turns reached. Final-answer detection (no tool
-        calls in last completion) is handled by env_response returning [].
-        """
+        """Check if rollout should terminate."""
+        if state.custom.get("_no_more_turns"):
+            return True, "final_answer"
         if state.num_turns >= self.max_turns:
             return True, "max_turns_reached"
-
         return False, None
     
     # =========================================================================

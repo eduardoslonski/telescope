@@ -383,6 +383,7 @@ class WordleEnvironment(MultiTurnEnvironment):
         if done:
             logger.debug(f"Game completed! {game.game_info=}")
             state.custom["game_info"] = game.game_info
+            state.custom["game_over"] = True
             return []
 
         # Extract feedback portion (mirrors _parse_feedback on TextArena obs)
@@ -400,11 +401,8 @@ class WordleEnvironment(MultiTurnEnvironment):
     # ------------------------------------------------------------------
 
     def is_done(self, state: RolloutState) -> tuple[bool, str | None]:
-        """
-        Game-over from the game engine is handled by env_response returning []
-        (empty), which the orchestrator catches as 'empty_env_response'.
-        This only provides the max_turns safety net.
-        """
+        if state.custom.get("game_over"):
+            return True, "game_over"
         if self.max_turns > 0 and state.num_turns >= self.max_turns:
             return True, "max_turns_reached"
         return False, None

@@ -412,7 +412,9 @@ class MultiTurnEnvironment(Environment):
 
         Returns:
             List of messages to append (typically one user message with feedback).
-            Return empty list to signal no response needed (for final turn).
+            Return empty list when there is no feedback to add. Termination is
+            controlled exclusively by ``is_done()`` — an empty return does NOT
+            stop the rollout on its own.
 
             Messages can include an optional "turn_type" key to specify the type
             of this turn for logging purposes (e.g., "tool_call", "tool_result",
