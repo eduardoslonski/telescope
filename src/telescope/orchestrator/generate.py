@@ -1,7 +1,6 @@
 """Rollout logic for inference servers."""
 import asyncio
 import http.client as _httpclib
-import inspect
 import json as _json_mod
 import time
 from collections.abc import Callable
@@ -858,57 +857,43 @@ async def run_multiturn_rollout(
             
             # Get environment response for next turn
             # env_response processes the model's action (e.g. evaluates a guess,
-            # executes tool calls) and returns feedback messages, or [] to signal
-            # that no further interaction is needed (game over, final answer, etc.).
+            # executes tool calls) and returns feedback messages.
             full_messages = messages + [{"role": "assistant", "content": completion_text}]
             _env_resp_t0 = time.monotonic()
-            env_messages = env.env_response(full_messages, state)
-            # Support both sync and async env_response (async needed for sandbox-based envs)
-            if inspect.isawaitable(env_messages):
-                env_messages = await env_messages
+            env_messages = await env.env_response(full_messages, state)
             _env_resp_time = time.monotonic() - _env_resp_t0
-            
-            # Check stop conditions (after env_response so is_done can see
-            # state changes from environment processing, e.g. game_won flags).
-            # Called even when env_response returns [] so environments can
-            # provide a specific stop_reason instead of generic "empty_env_response".
+
+            # Termination is controlled exclusively by is_done().
             is_done, stop_reason = env.is_done(state)
-
-            if not env_messages:
-                # Empty response signals end of rollout
-                state.is_completed = True
-                state.stop_reason = stop_reason if is_done else "empty_env_response"
-                break
-
-            # Log env response turn(s) before checking is_done so the last
-            # env response is captured even when the rollout terminates
-            env_turn_type = "env_response"
-            if isinstance(env_messages[0], dict):
-                env_turn_type = env_messages[0].get("turn_type", "env_response")
-
-            # Concatenate env message contents for logging
-            env_content = "\n".join(
-                msg.get("content", "") for msg in env_messages
-                if isinstance(msg, dict) and msg.get("content")
-            )
-            if env_content:
-                env_tokens = 0
-                if tokenizer is not None:
-                    env_tokens = len(tokenizer.encode(env_content))
-
-                logged_turns.append({
-                    "turn_order": turn_order,
-                    "turn_type": env_turn_type,
-                    "content": env_content,
-                    "tokens": env_tokens,
-                    "environment_response_time": _env_resp_time,
-                })
-                turn_order += 1
 
             if is_done:
                 state.is_completed = True
                 state.stop_reason = stop_reason
                 break
+
+            # Log env response turn(s) for mid-rollout feedback
+            if env_messages:
+                env_turn_type = "env_response"
+                if isinstance(env_messages[0], dict):
+                    env_turn_type = env_messages[0].get("turn_type", "env_response")
+
+                env_content = "\n".join(
+                    msg.get("content", "") for msg in env_messages
+                    if isinstance(msg, dict) and msg.get("content")
+                )
+                if env_content:
+                    env_tokens = 0
+                    if tokenizer is not None:
+                        env_tokens = len(tokenizer.encode(env_content))
+
+                    logged_turns.append({
+                        "turn_order": turn_order,
+                        "turn_type": env_turn_type,
+                        "content": env_content,
+                        "tokens": env_tokens,
+                        "environment_response_time": _env_resp_time,
+                    })
+                    turn_order += 1
 
             # Build next prompt messages (for message tracking and non-interleaved mode)
             messages = env.get_next_prompt_messages(state, env_messages)
@@ -1116,15 +1101,10 @@ async def process_sample(
     if lifecycle is not None and lifecycle.on_inference_end is not None:
         lifecycle.on_inference_end()
 
-    # Compute rewards in thread pool to avoid blocking the event loop (can take 50-450ms)
     if lifecycle is not None and lifecycle.on_reward_start is not None:
         lifecycle.on_reward_start()
     _reward_t0 = time.monotonic()
-    reward_result = await asyncio.get_event_loop().run_in_executor(
-        None, compute_reward_fn, completion_text, sample, eos_token
-    )
-    if inspect.isawaitable(reward_result):
-        reward_result = await reward_result
+    reward_result = await compute_reward_fn(completion_text, sample, eos_token)
     compute_reward_time = time.monotonic() - _reward_t0
     if lifecycle is not None and lifecycle.on_reward_end is not None:
         lifecycle.on_reward_end(compute_reward_time)
@@ -1244,15 +1224,10 @@ async def process_multiturn_sample(
             "error_message": "No turns completed in rollout",
         }
 
-    # Compute reward in thread pool to avoid blocking the event loop
     if lifecycle is not None and lifecycle.on_reward_start is not None:
         lifecycle.on_reward_start()
     _reward_t0 = time.monotonic()
-    reward_result = await asyncio.get_event_loop().run_in_executor(
-        None, env.compute_reward, state, eos_token
-    )
-    if inspect.isawaitable(reward_result):
-        reward_result = await reward_result
+    reward_result = await env.compute_reward(state, eos_token)
     compute_reward_time = time.monotonic() - _reward_t0
     if lifecycle is not None and lifecycle.on_reward_end is not None:
         lifecycle.on_reward_end(compute_reward_time)

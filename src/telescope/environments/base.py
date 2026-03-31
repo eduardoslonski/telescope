@@ -173,26 +173,26 @@ class Environment(ABC):
         pass
     
     @abstractmethod
-    def compute_reward(
-        self, 
-        completion: str, 
-        sample: Sample, 
+    async def compute_reward(
+        self,
+        completion: str,
+        sample: Sample,
         eos_token: str = ""
     ) -> RewardResult:
         """
         Compute reward for a completion given the original sample.
-        
+
         Args:
             completion: Model's completion string.
             sample: Original sample with prompt and metadata.
             eos_token: End of sequence token to strip.
-            
+
         Returns:
             RewardResult with total reward and component breakdown.
         """
         pass
-    
-    def compute_eval_metrics(
+
+    async def compute_eval_metrics(
         self,
         completion: str,
         sample: Sample,
@@ -206,7 +206,7 @@ class Environment(ABC):
         ``compute_reward`` and lifts ``sample_metrics`` into an
         ``EvalMetricsResult``.  Override in subclasses for eval-specific logic.
         """
-        reward_result = self.compute_reward(completion, sample, eos_token)
+        reward_result = await self.compute_reward(completion, sample, eos_token)
         return EvalMetricsResult(
             metrics=reward_result.sample_metrics,
             golden_answers=reward_result.golden_answers,
@@ -395,27 +395,29 @@ class MultiTurnEnvironment(Environment):
         
         return messages
     
-    def env_response(
-        self, 
-        messages: list[ChatMessage], 
+    async def env_response(
+        self,
+        messages: list[ChatMessage],
         state: RolloutState,
     ) -> list[ChatMessage]:
         """
         Generate environment response after model completion.
-        
+
         This is called after each model rollout. The returned messages
         are appended to the conversation for the next turn.
-        
+
         Args:
             messages: Full conversation so far (including latest model response)
             state: Current rollout state (can be mutated to track custom state)
-            
+
         Returns:
             List of messages to append (typically one user message with feedback).
-            Return empty list to signal no response needed (for final turn).
-            
+            Return empty list when there is no feedback to add. Termination is
+            controlled exclusively by ``is_done()`` — an empty return does NOT
+            stop the rollout on its own.
+
             Messages can include an optional "turn_type" key to specify the type
-            of this turn for logging purposes (e.g., "tool_call", "tool_result", 
+            of this turn for logging purposes (e.g., "tool_call", "tool_result",
             "context", "feedback"). If not specified, defaults to "env_response".
             Example: {"role": "user", "content": "...", "turn_type": "tool_result"}
         """
@@ -482,26 +484,26 @@ class MultiTurnEnvironment(Environment):
         
         return messages
     
-    def compute_reward(
+    async def compute_reward(
         self,
         state: RolloutState,
         eos_token: str = "",
     ) -> RewardResult:
         """
         Compute reward for a completed trajectory.
-        
+
         Override this to define task-specific reward computation.
-        
+
         Args:
             state: Completed rollout state with full trajectory
             eos_token: EOS token to strip from completions
-            
+
         Returns:
             RewardResult with total reward and component breakdown
         """
         raise NotImplementedError("Subclasses must implement compute_reward()")
-    
-    def compute_eval_metrics(
+
+    async def compute_eval_metrics(
         self,
         state: RolloutState,
         eos_token: str = "",
@@ -512,7 +514,7 @@ class MultiTurnEnvironment(Environment):
         Default implementation delegates to ``compute_reward`` and lifts
         ``sample_metrics``.  Override for eval-specific logic.
         """
-        reward_result = self.compute_reward(state, eos_token)
+        reward_result = await self.compute_reward(state, eos_token)
         return EvalMetricsResult(
             metrics=reward_result.sample_metrics,
             golden_answers=reward_result.golden_answers,

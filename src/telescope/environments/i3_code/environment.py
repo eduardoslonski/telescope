@@ -538,9 +538,6 @@ class I3CodeEnvironment(SingleTurnEnvironment):
         """
         Compute reward by executing generated code against test cases in a sandbox.
 
-        This is an async method (the framework supports both sync and async
-        compute_reward via inspect.isawaitable).
-
         Flow:
         1. Extract code from completion (markdown code block)
         2. Acquire sandbox from pool
