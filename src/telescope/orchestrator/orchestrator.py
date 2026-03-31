@@ -1926,6 +1926,8 @@ class Orchestrator:
             self.wandb_logger.log_orchestrator_timeline_event("rollouts_group_done", step=self.inference_step, group_id=request_id)
             # Add to bucket
             self.bucket.append(result)
+            # Log kept rollout immediately (don't wait for batch completion)
+            self._log_kept_rollout_group(result)
             rewards = result.get("rewards", [])
             avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
             env_name = result.get("env_name", "unknown")
@@ -2114,6 +2116,109 @@ class Orchestrator:
                 individual_lane_slots=individual_lane_slots,
             )
 
+    def _log_kept_rollout_group(self, result: dict):
+        """
+        Log all samples from a kept rollout group immediately.
+
+        Called directly when a rollout group is kept, so generations
+        appear in wandb files without waiting for batch completion.
+
+        Args:
+            result: The rollout result dict from process_group
+        """
+        prompt_text = result.get("prompt_text", "")
+        env_name = result.get("env_name", "")
+        group_id = result.get("group_id", -1)
+        turns_list = result.get("turns", [])  # Per-sample turns
+        rewards = result.get("rewards", [])
+        advantages = result.get("advantages", [])
+        sample_metrics_list = result.get("sample_metrics", [])
+        golden_answers_list = result.get("golden_answers", [])
+        info_turns_list = result.get("info_turns", [])
+        sample_tags_list = result.get("sample_tags", [])
+        request_timings = result.get("request_timings", [])
+        system_prompt = result.get("system_prompt", "")
+        prompt_token_ids = result.get("prompt_token_ids", [])
+        completion_token_ids = result.get("completion_token_ids", [])
+        full_token_ids = result.get("full_token_ids", [])  # Full sequence for raw_string
+        total_tokens_list = result.get("total_tokens", [])
+        compute_reward_times = result.get("compute_reward_times", [])
+
+        # Compute tokens_system_prompt and tokens_prompt if we have a tokenizer
+        tokens_system_prompt = 0
+        tokens_prompt = 0
+        if self.tokenizer is not None:
+            if system_prompt:
+                tokens_system_prompt = len(self.tokenizer.encode(system_prompt))
+            if prompt_text:
+                tokens_prompt = len(self.tokenizer.encode(prompt_text))
+
+        num_samples = len(turns_list)
+        pre_assigned = result.get("pre_assigned_sample_ids", {})
+        sample_idx_map: dict[int, int] = {}
+
+        individual_lane_slots = result.get("individual_lane_slots")
+
+        for idx in range(num_samples):
+            turns = turns_list[idx] if idx < len(turns_list) else []
+            reward = rewards[idx] if idx < len(rewards) else 0.0
+            advantage = advantages[idx] if idx < len(advantages) else 0.0
+            sample_metrics = sample_metrics_list[idx] if idx < len(sample_metrics_list) else {}
+            golden_answers = golden_answers_list[idx] if idx < len(golden_answers_list) else {}
+            info_turns = info_turns_list[idx] if idx < len(info_turns_list) else []
+            sample_tags = sample_tags_list[idx] if idx < len(sample_tags_list) else {}
+
+            prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
+            comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
+            full_ids = full_token_ids[idx] if idx < len(full_token_ids) else []
+            total_tokens = total_tokens_list[idx] if idx < len(total_tokens_list) else len(prompt_ids) + len(comp_ids)
+
+            raw_string = ""
+            if self.tokenizer is not None:
+                if full_ids:
+                    raw_string = self.tokenizer.decode(full_ids, skip_special_tokens=False)
+                elif prompt_ids or comp_ids:
+                    raw_string = self.tokenizer.decode(prompt_ids + comp_ids, skip_special_tokens=False)
+
+            sample_idx = pre_assigned.get(idx, self.next_sample_idx)
+            if idx not in pre_assigned:
+                self.next_sample_idx += 1
+            sample_idx_map[idx] = sample_idx
+
+            compute_reward_time = compute_reward_times[idx] if idx < len(compute_reward_times) else 0.0
+
+            self.wandb_logger.event_logger.log_rollout(
+                step=self.inference_step,
+                group_id=group_id,
+                sample_idx=sample_idx,
+                prompt=prompt_text,
+                turns=turns,
+                reward=reward,
+                advantage=advantage,
+                env=env_name,
+                sample_metrics=sample_metrics,
+                golden_answers=golden_answers,
+                info_turns=info_turns,
+                sample_tags=sample_tags,
+                tokens_prompt=tokens_prompt,
+                system_prompt=system_prompt,
+                tokens_system_prompt=tokens_system_prompt,
+                total_tokens=total_tokens,
+                raw_string=raw_string,
+                compute_reward_time=compute_reward_time,
+            )
+
+        # Skip if inference end events were already logged per-sample (individual mode)
+        if not result.get("inference_events_logged_per_sample"):
+            self._log_inference_request_events(
+                request_timings=request_timings,
+                group_id=group_id,
+                server_url=result.get("server_url", ""),
+                sample_idx_map=sample_idx_map,
+                off_policy_steps=result.get("off_policy_steps"),
+                individual_lane_slots=individual_lane_slots,
+            )
+
     def _log_inference_request_events(
         self,
         request_timings: list[dict],
@@ -2205,119 +2310,6 @@ class Orchestrator:
                 phase="end",
             )
 
-    def _log_rollouts(self, batch: list[dict], step: int):
-        """
-        Log all samples from a batch of rollout groups.
-        
-        Called directly from orchestrator when saving a batch, so rollout
-        logging doesn't need to route through the trainer.
-        
-        Args:
-            batch: List of rollout result dicts from process_group
-            step: Training step this batch is for
-        """
-        # Track sample index across all groups in the batch
-        sample_offset = 0
-        
-        for group in batch:
-            prompt_text = group.get("prompt_text", "")
-            env_name = group.get("env_name", "")
-            group_id = group.get("group_id", -1)
-            turns_list = group.get("turns", [])
-            rewards = group.get("rewards", [])
-            advantages = group.get("advantages", [])
-            sample_metrics_list = group.get("sample_metrics", [])
-            golden_answers_list = group.get("golden_answers", [])
-            info_turns_list = group.get("info_turns", [])
-            sample_tags_list = group.get("sample_tags", [])
-            system_prompt = group.get("system_prompt", "")
-            prompt_token_ids = group.get("prompt_token_ids", [])
-            completion_token_ids = group.get("completion_token_ids", [])
-            full_token_ids = group.get("full_token_ids", [])  # Full sequence for raw_string
-            total_tokens_list = group.get("total_tokens", [])
-            compute_reward_times = group.get("compute_reward_times", [])
-            
-            # Compute tokens_system_prompt and tokens_prompt if we have a tokenizer
-            tokens_system_prompt = 0
-            tokens_prompt = 0
-            if self.tokenizer is not None:
-                if system_prompt:
-                    tokens_system_prompt = len(self.tokenizer.encode(system_prompt))
-                if prompt_text:
-                    tokens_prompt = len(self.tokenizer.encode(prompt_text))
-            
-            num_samples = len(turns_list) if turns_list else len(rewards)
-            pre_assigned = group.get("pre_assigned_sample_ids", {})
-            sample_idx_map = {
-                idx: pre_assigned.get(idx, self.next_sample_idx + sample_offset + idx)
-                for idx in range(num_samples)
-            }
-
-            individual_lane_slots = group.get("individual_lane_slots")
-
-            # Skip if inference end events were already logged per-sample (individual mode)
-            if not group.get("inference_events_logged_per_sample"):
-                self._log_inference_request_events(
-                    request_timings=group.get("request_timings", []),
-                    group_id=group_id,
-                    server_url=group.get("server_url", ""),
-                    sample_idx_map=sample_idx_map,
-                    off_policy_steps=group.get("off_policy_steps"),
-                    individual_lane_slots=individual_lane_slots,
-                )
-            for idx in range(num_samples):
-                turns = turns_list[idx] if idx < len(turns_list) else []
-                reward = rewards[idx] if idx < len(rewards) else 0.0
-                advantage = advantages[idx] if idx < len(advantages) else 0.0
-                sample_metrics = sample_metrics_list[idx] if idx < len(sample_metrics_list) else {}
-                golden_answers = golden_answers_list[idx] if idx < len(golden_answers_list) else {}
-                info_turns = info_turns_list[idx] if idx < len(info_turns_list) else []
-                sample_tags = sample_tags_list[idx] if idx < len(sample_tags_list) else {}
-
-                # Get total_tokens and compute raw_string
-                prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
-                comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
-                full_ids = full_token_ids[idx] if idx < len(full_token_ids) else []
-                total_tokens = total_tokens_list[idx] if idx < len(total_tokens_list) else len(prompt_ids) + len(comp_ids)
-
-                # Decode raw_string if tokenizer is available
-                # Use full_token_ids if available (includes env responses), otherwise fallback to prompt+completion
-                raw_string = ""
-                if self.tokenizer is not None:
-                    if full_ids:
-                        raw_string = self.tokenizer.decode(full_ids, skip_special_tokens=False)
-                    elif prompt_ids or comp_ids:
-                        raw_string = self.tokenizer.decode(prompt_ids + comp_ids, skip_special_tokens=False)
-
-                # Use run-wide unique sample_idx
-                sample_idx = sample_idx_map[idx]
-
-                compute_reward_time = compute_reward_times[idx] if idx < len(compute_reward_times) else 0.0
-
-                self.wandb_logger.event_logger.log_rollout(
-                    step=step,
-                    group_id=group_id,
-                    sample_idx=sample_idx,
-                    prompt=prompt_text,
-                    turns=turns,
-                    reward=reward,
-                    advantage=advantage,
-                    env=env_name,
-                    sample_metrics=sample_metrics,
-                    golden_answers=golden_answers,
-                    info_turns=info_turns,
-                    sample_tags=sample_tags,
-                    tokens_prompt=tokens_prompt,
-                    system_prompt=system_prompt,
-                    tokens_system_prompt=tokens_system_prompt,
-                    total_tokens=total_tokens,
-                    raw_string=raw_string,
-                    compute_reward_time=compute_reward_time,
-                )
-            
-            # Increment offset for next group
-            sample_offset += num_samples
-
     def _try_start_pending_rollouts(self):
         """Try to start new rollouts after weights are updated."""
         while self._has_pending_prompt_data():
@@ -2374,8 +2366,9 @@ class Orchestrator:
             self._checkpoint_pending = True
             _log.info(f"Checkpoint pending at step {submitted_step}, pausing batch submissions")
 
-        # Schedule heavy work as async task — preprocess_batch and _log_rollouts
-        # run in thread pool to avoid blocking the event loop.
+        # Schedule heavy work as async task — preprocess_batch runs in thread pool
+        # to avoid blocking the event loop. Rollout logging is now done immediately
+        # per-group in _log_kept_rollout_group (called when group is added to bucket).
         asyncio.ensure_future(self._save_batch_async(batch, _start_idx, _step, _checkpoint_pending))
 
     async def _save_batch_async(self, batch, start_sample_idx, step, checkpoint_pending):
@@ -2384,9 +2377,6 @@ class Orchestrator:
         trainer_data = await asyncio.get_event_loop().run_in_executor(
             None, preprocess_batch, batch, self.num_trainer_data_shards, start_sample_idx,
         )
-
-        # _log_rollouts does tokenizer encode/decode — heavy CPU
-        asyncio.get_event_loop().run_in_executor(None, self._log_rollouts, batch, step)
 
         if checkpoint_pending:
             self._pending_batches.append((step, trainer_data))
