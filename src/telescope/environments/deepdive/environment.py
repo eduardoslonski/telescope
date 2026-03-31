@@ -11,7 +11,7 @@ correctness against a gold answer.
 Requires: aiohttp, diskcache, pdfminer.six, openai, httpx
 """
 
-REQUIRED_PACKAGES = ["aiohttp", "diskcache", "pdfminer.six", "openai", "httpx"]
+REQUIRED_PACKAGES = ["aiohttp", "diskcache", "pdfminer", "openai", "httpx"]
 
 import asyncio
 import json
@@ -61,6 +61,10 @@ from .web_tools import (
 )
 
 logger = logging.getLogger("deepdive")
+
+# Telescope's orchestrator logger — goes to orchestrator.detailed.log
+from telescope.utils.tlog import get_logger as _get_tlog
+_orch_log = _get_tlog("orchestrator")
 
 # Judge prompt template
 JUDGE_PROMPT = """\
@@ -512,11 +516,13 @@ class DeepDiveEnvironment(ToolEnvironment):
             if val is not None:
                 sample_tags[tag_key] = str(val)
 
+        last_turn = len(state.trajectory) - 1 if state.trajectory else 0
+
         return await self.rubric.score(
             state=state,
             extra_info_turns=[
                 {
-                    "turn_order": 0,
+                    "turn_order": last_turn,
                     "info_key": "final_answer",
                     "info_value": final_answer or "(none)",
                     "info_type": "text",
@@ -528,10 +534,16 @@ class DeepDiveEnvironment(ToolEnvironment):
     # -- rubric reward functions -------------------------------------------
 
     async def _judge_reward(self, state: RolloutState) -> tuple[float, str]:
-        final_answer = state.custom.get("final_answer") or self._get_last_completion(state)
+        from telescope.environments.parsers import strip_think_tags
+        raw = state.custom.get("final_answer") or self._get_last_completion(state)
+        final_answer = strip_think_tags(raw) if raw else raw
         gold = state.sample.answer
         raw_question = state.sample.metadata.get("raw_question", "")
+        gid = state.sample.metadata.get("_group_id", "?")
+        sids = state.sample.metadata.get("_sample_ids", "?")
+        _orch_log.debug(f"[deepdive judge] group_id={gid} sample_ids={sids} | calling _judge_evaluate")
         score = await self._judge_evaluate(raw_question, final_answer or "", gold)
+        _orch_log.debug(f"[deepdive judge] group_id={gid} sample_ids={sids} | judge_score={score}")
         return score, gold
 
     def _redundancy_penalty_reward(self, state: RolloutState) -> float:
@@ -577,8 +589,11 @@ class DeepDiveEnvironment(ToolEnvironment):
         if not completion:
             return 0.0
         try:
+            _orch_log.debug(f"[deepdive judge] dispatching to {self._judge_model} | answer={answer[:60]!r}")
             judge_response = await self._call_judge(question, completion, answer)
-            return 1.0 if "yes" in judge_response.lower() else 0.0
+            score = 1.0 if "yes" in judge_response.lower() else 0.0
+            _orch_log.debug(f"[deepdive judge] response={judge_response!r} | score={score}")
+            return score
         except Exception as e:
             logger.warning(f"Judge evaluation failed: {e}")
             return 0.0

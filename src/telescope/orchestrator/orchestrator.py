@@ -1228,6 +1228,14 @@ class Orchestrator:
 
         _log.debug(f"Starting rollout group request_id={request_id} on {server_url} (env={env_name}, model_step={self.inference_model_step}, group_size={config.cfg.group_size})")
 
+        # Inject IDs into sample metadata for debug tracing in compute_reward
+        sample = prompt_data.get("sample")
+        if sample is not None:
+            rollout_info = self.inflight_rollout_info.get(request_id)
+            sample.metadata["_group_id"] = request_id
+            if rollout_info and rollout_info.sample_ids:
+                sample.metadata["_sample_ids"] = dict(rollout_info.sample_ids)
+
         sample_timings = [{} for _ in range(config.cfg.group_size)]
         rollout_info = self.inflight_rollout_info.get(request_id)
         if rollout_info:
