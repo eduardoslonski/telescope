@@ -1206,10 +1206,26 @@ class Orchestrator:
                 "compute_reward_end", group_id=request_id, sample_id=_reward_sample_id,
             )
 
+        def on_env_response_start():
+            rollout_info = self.inflight_rollout_info.get(request_id)
+            sid = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
+            self.wandb_logger.log_orchestrator_timeline_event(
+                "env_response_start", group_id=request_id, sample_id=sid,
+            )
+
+        def on_env_response_end():
+            rollout_info = self.inflight_rollout_info.get(request_id)
+            sid = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
+            self.wandb_logger.log_orchestrator_timeline_event(
+                "env_response_end", group_id=request_id, sample_id=sid,
+            )
+
         lifecycle = SampleLifecycleCallbacks(
             on_inference_end=on_inference_end,
             on_reward_start=on_reward_start,
             on_reward_end=on_reward_end,
+            on_env_response_start=on_env_response_start,
+            on_env_response_end=on_env_response_end,
         )
         # Expose lane_freed state so _run_individual_sample can check it
         lifecycle._lane_freed = lambda: lane_freed  # type: ignore[attr-defined]

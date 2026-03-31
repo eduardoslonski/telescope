@@ -97,6 +97,8 @@ class SampleLifecycleCallbacks:
     on_inference_end: Callable[[], None] | None = None    # Log phase="end" inference event + free lane
     on_reward_start: Callable[[], None] | None = None     # Log compute_reward_start orchestrator event
     on_reward_end: Callable[[float], None] | None = None   # Log compute_reward_end (receives duration in seconds)
+    on_env_response_start: Callable[[], None] | None = None  # Log env_response_start orchestrator event
+    on_env_response_end: Callable[[], None] | None = None    # Log env_response_end orchestrator event
 
 
 # =============================================================================
@@ -703,6 +705,7 @@ async def run_multiturn_rollout(
     sampling_params: dict | None = None,
     interleaved: bool | None = None,
     timing_out: dict | None = None,
+    lifecycle: SampleLifecycleCallbacks | None = None,
 ) -> tuple[RolloutState, list[dict]]:
     """
     Run a complete multi-turn rollout with an environment.
@@ -859,9 +862,13 @@ async def run_multiturn_rollout(
             # env_response processes the model's action (e.g. evaluates a guess,
             # executes tool calls) and returns feedback messages.
             full_messages = messages + [{"role": "assistant", "content": completion_text}]
+            if lifecycle is not None and lifecycle.on_env_response_start is not None:
+                lifecycle.on_env_response_start()
             _env_resp_t0 = time.monotonic()
             env_messages = await env.env_response(full_messages, state)
             _env_resp_time = time.monotonic() - _env_resp_t0
+            if lifecycle is not None and lifecycle.on_env_response_end is not None:
+                lifecycle.on_env_response_end()
 
             # Termination is controlled exclusively by is_done().
             is_done, stop_reason = env.is_done(state)
@@ -1198,6 +1205,7 @@ async def process_multiturn_sample(
             prefetched_prompt_str=prefetched_prompt_str,
             prefetched_prompt_token_count=prefetched_prompt_token_count,
             timing_out=timing_out,
+            lifecycle=lifecycle,
         )
     except Exception as e:
         return {
