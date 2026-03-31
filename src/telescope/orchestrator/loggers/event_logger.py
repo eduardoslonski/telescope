@@ -510,6 +510,7 @@ class Prompt:
     tokens_prompt: int = 0  # Number of prompt tokens
     system_prompt: str = ""  # The system message (if any)
     tokens_system_prompt: int = 0  # Number of tokens in the system message
+    tail_idx: int = -1  # Index of the tail upload cycle when first uploaded (events system)
 
 
 @dataclass
@@ -529,6 +530,7 @@ class Rollout:
     total_tokens: int = 0  # Total tokens passed to trainer
     raw_string: str = ""  # Decoded raw input passed to trainer
     compute_reward_time: float = 0.0  # Time in seconds for compute_reward() call
+    tail_idx: int = -1  # Index of the tail upload cycle when first uploaded (events system)
 
 
 @dataclass
@@ -756,6 +758,10 @@ class EventLogger:
         self._discarded_rollouts: list[DiscardedRollout] = []
         self._discarded_prompts: list[DiscardedPrompt] = []
         self._logged_discarded_group_ids: set[int] = set()  # Track which discarded group_ids have been logged
+
+        # Kept rollouts tracking (uploaded in events zip alongside discarded, for real-time incremental ingestion)
+        self._kept_rollouts: list[Rollout] = []
+        self._kept_prompts: list[Prompt] = []
 
         # Eval tracking (parallel to discarded, in events zip)
         self._eval_rollouts: list[EvalRollout] = []
@@ -1001,13 +1007,25 @@ class EventLogger:
             if step not in self._pending_rollouts:
                 self._pending_rollouts[step] = []
             self._pending_rollouts[step].append(gen)
-            
+            # Also track for events system (tail_idx-based incremental)
+            self._kept_rollouts.append(gen)
+
             # Log prompt if this group_id hasn't been logged yet
             if group_id not in self._logged_group_ids:
                 self._logged_group_ids.add(group_id)
                 if step not in self._pending_prompts:
                     self._pending_prompts[step] = []
                 self._pending_prompts[step].append(Prompt(
+                    step=step,
+                    group_id=group_id,
+                    env=env,
+                    prompt=prompt,
+                    tokens_prompt=tokens_prompt,
+                    system_prompt=system_prompt,
+                    tokens_system_prompt=tokens_system_prompt,
+                ))
+                # Also track for events system (tail_idx-based incremental)
+                self._kept_prompts.append(Prompt(
                     step=step,
                     group_id=group_id,
                     env=env,
@@ -1785,6 +1803,276 @@ class EventLogger:
         }
         return pa.table(data, schema=SAMPLE_TAGS_SCHEMA)
 
+    def _kept_prompts_to_table(self, prompts: list[Prompt]) -> pa.Table:
+        """Convert list of kept prompts to PyArrow table for events system."""
+        if not prompts:
+            return pa.table({
+                "step": pa.array([], type=pa.int32()),
+                "group_id": pa.array([], type=pa.int32()),
+                "env": pa.array([], type=pa.string()),
+                "prompt": pa.array([], type=pa.string()),
+                "tokens_prompt": pa.array([], type=pa.int32()),
+                "system_prompt": pa.array([], type=pa.string()),
+                "tokens_system_prompt": pa.array([], type=pa.int32()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        data = {
+            "step": [p.step for p in prompts],
+            "group_id": [p.group_id for p in prompts],
+            "env": [p.env for p in prompts],
+            "prompt": [p.prompt for p in prompts],
+            "tokens_prompt": [p.tokens_prompt for p in prompts],
+            "system_prompt": [p.system_prompt for p in prompts],
+            "tokens_system_prompt": [p.tokens_system_prompt for p in prompts],
+            "tail_idx": [p.tail_idx for p in prompts],
+        }
+        return pa.table(data)
+
+    def _kept_rollouts_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+        """Convert list of kept rollouts to PyArrow table for events system (one row per turn)."""
+        if not rollouts:
+            return pa.table({
+                "step": pa.array([], type=pa.int32()),
+                "group_id": pa.array([], type=pa.int32()),
+                "sample_idx": pa.array([], type=pa.int32()),
+                "turn_order": pa.array([], type=pa.int32()),
+                "turn_type": pa.array([], type=pa.string()),
+                "content": pa.array([], type=pa.binary()),
+                "tokens": pa.array([], type=pa.int32()),
+                "stop_reason": pa.array([], type=pa.string()),
+                "environment_response_time": pa.array([], type=pa.float64()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        steps = []
+        group_ids = []
+        sample_idxs = []
+        turn_orders = []
+        turn_types = []
+        contents = []
+        tokens_list = []
+        stop_reasons = []
+        env_response_times = []
+        tail_idxs = []
+
+        for gen in rollouts:
+            for turn in gen.turns:
+                steps.append(gen.step)
+                group_ids.append(gen.group_id)
+                sample_idxs.append(gen.sample_idx)
+                turn_orders.append(turn.turn_order)
+                turn_types.append(turn.turn_type)
+                contents.append(_zstd_compress(turn.content))
+                tokens_list.append(turn.tokens)
+                stop_reasons.append(turn.stop_reason)
+                env_response_times.append(turn.environment_response_time)
+                tail_idxs.append(gen.tail_idx)
+
+        data = {
+            "step": steps,
+            "group_id": group_ids,
+            "sample_idx": sample_idxs,
+            "turn_order": turn_orders,
+            "turn_type": turn_types,
+            "content": contents,
+            "tokens": tokens_list,
+            "stop_reason": stop_reasons,
+            "environment_response_time": env_response_times,
+            "tail_idx": tail_idxs,
+        }
+        return pa.table(data)
+
+    def _kept_samples_data_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+        """Convert kept rollouts to a samples_data table for events system."""
+        if not rollouts:
+            return pa.table({
+                "step": pa.array([], type=pa.int32()),
+                "group_id": pa.array([], type=pa.int32()),
+                "sample_idx": pa.array([], type=pa.int32()),
+                "reward": pa.array([], type=pa.float64()),
+                "advantage": pa.array([], type=pa.float64()),
+                "turns": pa.array([], type=pa.int32()),
+                "total_tokens": pa.array([], type=pa.int32()),
+                "raw_string": pa.array([], type=pa.binary()),
+                "compute_reward_time": pa.array([], type=pa.float64()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        data = {
+            "step": [gen.step for gen in rollouts],
+            "group_id": [gen.group_id for gen in rollouts],
+            "sample_idx": [gen.sample_idx for gen in rollouts],
+            "reward": [gen.reward for gen in rollouts],
+            "advantage": [gen.advantage for gen in rollouts],
+            "turns": [len(gen.turns) for gen in rollouts],
+            "total_tokens": [gen.total_tokens for gen in rollouts],
+            "raw_string": [_zstd_compress(gen.raw_string) for gen in rollouts],
+            "compute_reward_time": [gen.compute_reward_time for gen in rollouts],
+            "tail_idx": [gen.tail_idx for gen in rollouts],
+        }
+        return pa.table(data)
+
+    def _kept_rollouts_metrics_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+        """Convert kept rollouts' metrics to a normalized table for events system."""
+        if not rollouts:
+            return pa.table({
+                "step": pa.array([], type=pa.int32()),
+                "sample_idx": pa.array([], type=pa.int32()),
+                "env": pa.array([], type=pa.string()),
+                "metric_name": pa.array([], type=pa.string()),
+                "value": pa.array([], type=pa.float64()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        steps = []
+        sample_idxs = []
+        envs = []
+        metric_names = []
+        values = []
+        tail_idxs = []
+
+        for gen in rollouts:
+            for metric_name, value in gen.sample_metrics.items():
+                steps.append(gen.step)
+                sample_idxs.append(gen.sample_idx)
+                envs.append(gen.env)
+                metric_names.append(metric_name)
+                values.append(float(value))
+                tail_idxs.append(gen.tail_idx)
+
+        data = {
+            "step": steps,
+            "sample_idx": sample_idxs,
+            "env": envs,
+            "metric_name": metric_names,
+            "value": values,
+            "tail_idx": tail_idxs,
+        }
+        return pa.table(data)
+
+    def _kept_golden_answers_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+        """Convert kept rollouts' golden answers to a normalized table for events system."""
+        if not rollouts:
+            return pa.table({
+                "step": pa.array([], type=pa.int32()),
+                "sample_idx": pa.array([], type=pa.int32()),
+                "env": pa.array([], type=pa.string()),
+                "key": pa.array([], type=pa.string()),
+                "value": pa.array([], type=pa.string()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        steps = []
+        sample_idxs = []
+        envs = []
+        keys = []
+        values = []
+        tail_idxs = []
+
+        for gen in rollouts:
+            for key, value in gen.golden_answers.items():
+                steps.append(gen.step)
+                sample_idxs.append(gen.sample_idx)
+                envs.append(gen.env)
+                keys.append(key)
+                values.append(value)
+                tail_idxs.append(gen.tail_idx)
+
+        data = {
+            "step": steps,
+            "sample_idx": sample_idxs,
+            "env": envs,
+            "key": keys,
+            "value": values,
+            "tail_idx": tail_idxs,
+        }
+        return pa.table(data)
+
+    def _kept_info_turns_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+        """Convert kept rollouts' info_turns to a normalized table for events system."""
+        if not rollouts:
+            return pa.table({
+                "step": pa.array([], type=pa.int32()),
+                "sample_idx": pa.array([], type=pa.int32()),
+                "turn_order": pa.array([], type=pa.int32()),
+                "env": pa.array([], type=pa.string()),
+                "info_key": pa.array([], type=pa.string()),
+                "info_value": pa.array([], type=pa.string()),
+                "info_type": pa.array([], type=pa.string()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        steps = []
+        sample_idxs = []
+        turn_orders = []
+        envs = []
+        info_keys = []
+        info_values = []
+        info_types = []
+        tail_idxs = []
+
+        for gen in rollouts:
+            for info in gen.info_turns:
+                steps.append(gen.step)
+                sample_idxs.append(gen.sample_idx)
+                turn_orders.append(info.get("turn_order", 0))
+                envs.append(gen.env)
+                info_keys.append(info.get("info_key", ""))
+                info_values.append(info.get("info_value", ""))
+                info_types.append(info.get("info_type", "text"))
+                tail_idxs.append(gen.tail_idx)
+
+        data = {
+            "step": steps,
+            "sample_idx": sample_idxs,
+            "turn_order": turn_orders,
+            "env": envs,
+            "info_key": info_keys,
+            "info_value": info_values,
+            "info_type": info_types,
+            "tail_idx": tail_idxs,
+        }
+        return pa.table(data)
+
+    def _kept_sample_tags_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+        """Convert kept rollouts' sample_tags to a normalized table for events system."""
+        if not rollouts:
+            return pa.table({
+                "step": pa.array([], type=pa.int32()),
+                "sample_idx": pa.array([], type=pa.int32()),
+                "env": pa.array([], type=pa.string()),
+                "tag_name": pa.array([], type=pa.string()),
+                "tag_value": pa.array([], type=pa.string()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        steps = []
+        sample_idxs = []
+        envs = []
+        tag_names = []
+        tag_values = []
+        tail_idxs = []
+
+        for gen in rollouts:
+            for tag_name, tag_value in gen.sample_tags.items():
+                steps.append(gen.step)
+                sample_idxs.append(gen.sample_idx)
+                envs.append(gen.env)
+                tag_names.append(tag_name)
+                tag_values.append(str(tag_value))
+                tail_idxs.append(gen.tail_idx)
+
+        data = {
+            "step": steps,
+            "sample_idx": sample_idxs,
+            "env": envs,
+            "tag_name": tag_names,
+            "tag_value": tag_values,
+            "tail_idx": tail_idxs,
+        }
+        return pa.table(data)
+
     def _step_metrics_to_table(self, step_metrics: list[StepMetric]) -> pa.Table:
         """Convert list of step metrics to PyArrow table."""
         if not step_metrics:
@@ -2316,6 +2604,8 @@ class EventLogger:
         metadata: dict | None = None,
         discarded_rollouts: list[DiscardedRollout] | None = None,
         discarded_prompts: list[DiscardedPrompt] | None = None,
+        kept_rollouts: list[Rollout] | None = None,
+        kept_prompts: list[Prompt] | None = None,
         eval_rollouts: list[EvalRollout] | None = None,
         eval_prompts: list[EvalPrompt] | None = None,
         logs: list[tuple[LogRecord, int]] | None = None,
@@ -2347,6 +2637,17 @@ class EventLogger:
         discarded_samples_data_table = self._samples_data_discarded_to_table(discarded_gens)
         discarded_info_turns_table = self._info_turns_discarded_to_table(discarded_gens)
         discarded_sample_tags_table = self._sample_tags_discarded_to_table(discarded_gens)
+
+        # Convert kept prompts and rollouts (empty lists if None)
+        kept_proms = kept_prompts or []
+        kept_gens = kept_rollouts or []
+        kept_prompts_table = self._kept_prompts_to_table(kept_proms)
+        kept_rollouts_table = self._kept_rollouts_to_table(kept_gens)
+        kept_samples_data_table = self._kept_samples_data_to_table(kept_gens)
+        kept_metrics_table = self._kept_rollouts_metrics_to_table(kept_gens)
+        kept_golden_answers_table = self._kept_golden_answers_to_table(kept_gens)
+        kept_info_turns_table = self._kept_info_turns_to_table(kept_gens)
+        kept_sample_tags_table = self._kept_sample_tags_to_table(kept_gens)
 
         # Convert eval prompts and rollouts (empty lists if None)
         eval_rols = eval_rollouts or []
@@ -2417,6 +2718,35 @@ class EventLogger:
             buf = io.BytesIO()
             pq.write_table(discarded_sample_tags_table, buf)
             zf.writestr("sample_tags_discarded.parquet", buf.getvalue())
+
+            # Kept rollout tables
+            buf = io.BytesIO()
+            pq.write_table(kept_prompts_table, buf)
+            zf.writestr("prompts_kept.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(kept_rollouts_table, buf)
+            zf.writestr("rollouts_kept.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(kept_samples_data_table, buf)
+            zf.writestr("samples_data_kept.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(kept_metrics_table, buf)
+            zf.writestr("rollouts_metrics_kept.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(kept_golden_answers_table, buf)
+            zf.writestr("golden_answers_kept.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(kept_info_turns_table, buf)
+            zf.writestr("info_turns_kept.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(kept_sample_tags_table, buf)
+            zf.writestr("sample_tags_kept.parquet", buf.getvalue())
 
             # Eval tables
             buf = io.BytesIO()
@@ -2591,6 +2921,12 @@ class EventLogger:
             for p in self._discarded_prompts:
                 if p.tail_idx == -1:
                     p.tail_idx = current_tail_idx
+            for g in self._kept_rollouts:
+                if g.tail_idx == -1:
+                    g.tail_idx = current_tail_idx
+            for p in self._kept_prompts:
+                if p.tail_idx == -1:
+                    p.tail_idx = current_tail_idx
             for r in self._eval_rollouts:
                 if r.tail_idx == -1:
                     r.tail_idx = current_tail_idx
@@ -2616,6 +2952,8 @@ class EventLogger:
             all_inference_events = list(self._inference_events)
             all_discarded_rollouts = list(self._discarded_rollouts)
             all_discarded_prompts = list(self._discarded_prompts)
+            all_kept_rollouts = list(self._kept_rollouts)
+            all_kept_prompts = list(self._kept_prompts)
             all_eval_rollouts = list(self._eval_rollouts)
             all_eval_prompts = list(self._eval_prompts)
             pending_gens = dict(self._pending_rollouts)
@@ -2710,6 +3048,14 @@ class EventLogger:
                 p for p in all_discarded_prompts
                 if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
             ]
+            block_kept_rollouts = [
+                g for g in all_kept_rollouts
+                if g.tail_idx >= self._block_first_tail_idx and g.tail_idx <= block_last_tail_idx
+            ]
+            block_kept_prompts = [
+                p for p in all_kept_prompts
+                if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
+            ]
             block_eval_rollouts = [
                 r for r in all_eval_rollouts
                 if r.tail_idx >= self._block_first_tail_idx and r.tail_idx <= block_last_tail_idx
@@ -2719,7 +3065,7 @@ class EventLogger:
                 if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
             ]
 
-            if block_events or block_inference_events or block_gpu_metrics or block_cpu_metrics or block_vllm_metrics or block_discarded_rollouts or block_discarded_prompts or block_eval_rollouts or block_eval_prompts:
+            if block_events or block_inference_events or block_gpu_metrics or block_cpu_metrics or block_vllm_metrics or block_discarded_rollouts or block_discarded_prompts or block_kept_rollouts or block_kept_prompts or block_eval_rollouts or block_eval_prompts:
                 orch_events = [e for e in block_events if e.source == "orchestrator"]
                 trainer_events = [e for e in block_events if e.source == "trainer"]
 
@@ -2736,6 +3082,8 @@ class EventLogger:
                     metadata=finalized_block_metadata,
                     discarded_rollouts=block_discarded_rollouts,
                     discarded_prompts=block_discarded_prompts,
+                    kept_rollouts=block_kept_rollouts,
+                    kept_prompts=block_kept_prompts,
                     eval_rollouts=block_eval_rollouts,
                     eval_prompts=block_eval_prompts,
                     logs=block_log_records,
@@ -2765,6 +3113,12 @@ class EventLogger:
                 for p in self._discarded_prompts:
                     if p.tail_idx == -1:
                         p.tail_idx = current_tail_idx
+                for g in self._kept_rollouts:
+                    if g.tail_idx == -1:
+                        g.tail_idx = current_tail_idx
+                for p in self._kept_prompts:
+                    if p.tail_idx == -1:
+                        p.tail_idx = current_tail_idx
                 for r in self._eval_rollouts:
                     if r.tail_idx == -1:
                         r.tail_idx = current_tail_idx
@@ -2775,6 +3129,8 @@ class EventLogger:
                 self._inference_events = [e for e in self._inference_events if e.tail_idx >= new_block_first_tail_idx]
                 self._discarded_rollouts = [g for g in self._discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
                 self._discarded_prompts = [p for p in self._discarded_prompts if p.tail_idx >= new_block_first_tail_idx]
+                self._kept_rollouts = [g for g in self._kept_rollouts if g.tail_idx >= new_block_first_tail_idx]
+                self._kept_prompts = [p for p in self._kept_prompts if p.tail_idx >= new_block_first_tail_idx]
                 self._eval_rollouts = [r for r in self._eval_rollouts if r.tail_idx >= new_block_first_tail_idx]
                 self._eval_prompts = [p for p in self._eval_prompts if p.tail_idx >= new_block_first_tail_idx]
             
@@ -2792,9 +3148,11 @@ class EventLogger:
             all_vllm_metrics = [(m, idx) for m, idx in all_vllm_metrics if idx >= new_block_first_tail_idx]
             all_log_records = [(r, idx) for r, idx in all_log_records if idx >= new_block_first_tail_idx]
             all_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
+            all_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= new_block_first_tail_idx]
+            all_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= new_block_first_tail_idx]
             all_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= new_block_first_tail_idx]
             all_eval_prompts = [p for p in all_eval_prompts if p.tail_idx >= new_block_first_tail_idx]
-            
+
             # Set the new block's first tail_idx
             self._block_first_tail_idx = new_block_first_tail_idx
 
@@ -2806,6 +3164,8 @@ class EventLogger:
         current_block_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= self._block_first_tail_idx]
         current_block_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= self._block_first_tail_idx]
         current_block_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= self._block_first_tail_idx]
+        current_block_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= self._block_first_tail_idx]
+        current_block_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= self._block_first_tail_idx]
         current_block_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= self._block_first_tail_idx]
         current_block_eval_prompts = [p for p in all_eval_prompts if p.tail_idx >= self._block_first_tail_idx]
         current_block_log_records = [(r, idx) for r, idx in all_log_records if idx >= self._block_first_tail_idx]
@@ -2818,6 +3178,8 @@ class EventLogger:
         tail_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= tail_min_idx_for_window]
         tail_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= tail_min_idx_for_window]
         tail_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= tail_min_idx_for_window]
+        tail_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= tail_min_idx_for_window]
+        tail_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= tail_min_idx_for_window]
         tail_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= tail_min_idx_for_window]
         tail_eval_prompts = [p for p in all_eval_prompts if p.tail_idx >= tail_min_idx_for_window]
         tail_log_records = [(r, idx) for r, idx in all_log_records if idx >= tail_min_idx_for_window]
@@ -2854,6 +3216,8 @@ class EventLogger:
             metadata=tail_metadata,
             discarded_rollouts=tail_discarded_rollouts,
             discarded_prompts=tail_discarded_prompts,
+            kept_rollouts=tail_kept_rollouts,
+            kept_prompts=tail_kept_prompts,
             eval_rollouts=tail_eval_rollouts,
             eval_prompts=tail_eval_prompts,
             logs=tail_log_records,
@@ -2876,6 +3240,8 @@ class EventLogger:
             metadata=block_live_metadata,
             discarded_rollouts=current_block_discarded_rollouts,
             discarded_prompts=current_block_discarded_prompts,
+            kept_rollouts=current_block_kept_rollouts,
+            kept_prompts=current_block_kept_prompts,
             eval_rollouts=current_block_eval_rollouts,
             eval_prompts=current_block_eval_prompts,
             logs=current_block_log_records,
