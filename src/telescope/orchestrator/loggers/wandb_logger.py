@@ -608,6 +608,7 @@ class WandbLogger:
         generation_idx: int = -1,
         tool_call_idx: int = -1,
         server_id: int = -1,
+        server_lane: int = -1,
     ):
         """Log a rollout lifecycle event (generation, tool_execution, env_response, reward)."""
         if not config.cfg.use_wandb:
@@ -622,6 +623,7 @@ class WandbLogger:
             generation_idx=generation_idx,
             tool_call_idx=tool_call_idx,
             server_id=server_id,
+            server_lane=server_lane,
         )
 
     def log_infra_event(

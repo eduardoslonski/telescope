@@ -130,6 +130,7 @@ EVENTS_ROLLOUT_SCHEMA = pa.schema([
     ("generation_idx", pa.int32()),  # Generation index within (sample_id, agent_id)
     ("tool_call_idx", pa.int32()),   # Tool call index within generation (-1 if N/A)
     ("server_id", pa.int32()),       # Inference server index (-1 if N/A)
+    ("server_lane", pa.int32()),     # Per-server lane slot for timeline positioning (-1 if N/A)
 ])
 
 # Infrastructure events schema - weight sync, sandbox lifecycle
@@ -803,6 +804,7 @@ class RolloutEvent:
     generation_idx: int = -1
     tool_call_idx: int = -1
     server_id: int = -1
+    server_lane: int = -1  # Per-server lane slot for timeline positioning
     tail_idx: int = -1
 
 
@@ -1272,6 +1274,7 @@ class EventLogger:
         generation_idx: int = -1,
         tool_call_idx: int = -1,
         server_id: int = -1,
+        server_lane: int = -1,
         tool_name: str = "",
     ):
         """
@@ -1287,6 +1290,7 @@ class EventLogger:
             generation_idx: Generation index (-1 if N/A)
             tool_call_idx: Tool call index (-1 if N/A)
             server_id: Inference server index (-1 if N/A)
+            server_lane: Per-server lane slot for timeline positioning (-1 if N/A)
             tool_name: Tool name for tool_execution events (inflight display only, not in events table)
         """
         ts = timestamp if timestamp is not None else time.time()
@@ -1300,6 +1304,7 @@ class EventLogger:
             generation_idx=generation_idx,
             tool_call_idx=tool_call_idx,
             server_id=server_id,
+            server_lane=server_lane,
         )
 
         with self._lock:
@@ -1633,6 +1638,7 @@ class EventLogger:
             "generation_idx": [e.generation_idx for e in events],
             "tool_call_idx": [e.tool_call_idx for e in events],
             "server_id": [e.server_id for e in events],
+            "server_lane": [e.server_lane for e in events],
         }
         return pa.table(data, schema=EVENTS_ROLLOUT_SCHEMA)
 
