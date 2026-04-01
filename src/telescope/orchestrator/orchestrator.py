@@ -2123,7 +2123,8 @@ class Orchestrator:
                     generations[0]["inference_time"] = _otlp.get("inference_time", 0.0)
                     generations[0]["e2e_latency"] = _otlp.get("e2e_latency", 0.0)
                     generations[0]["vllm_request_id"] = _t.get("vllm_request_id", "")
-                    generations[0]["server_id"] = server_idx
+                    _server_url = result.get("server_url", "")
+                    generations[0]["server_id"] = self._get_server_index(_server_url) if _server_url else -1
 
             prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
             comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
