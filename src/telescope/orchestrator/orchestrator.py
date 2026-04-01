@@ -1154,6 +1154,7 @@ class Orchestrator:
                 sample_id=sample_id,
                 server_id=server_idx,
                 group_id=request_id,
+                generation_idx=0,  # single-turn; multi-turn sets this per-turn in generate.py
             )
             timing["inference_end_logged"] = True
 
@@ -1393,6 +1394,7 @@ class Orchestrator:
                 sample_id=sample_id,
                 server_id=server_idx,
                 group_id=request_id,
+                generation_idx=0,
             )
 
         group = self.pending_individual_groups.get(request_id)
@@ -1539,6 +1541,7 @@ class Orchestrator:
                 sample_id=sample_id,
                 server_id=server_idx,
                 group_id=request_id,
+                generation_idx=0,
             )
 
     def _log_individual_sample_error_end_event(
@@ -1557,6 +1560,7 @@ class Orchestrator:
             sample_id=sample_id,
             server_id=server_idx,
             group_id=request_id,
+            generation_idx=0,
         )
 
     def _on_individual_sample_complete(self, request_id: int, sample_idx: int, result: dict):
@@ -2007,6 +2011,21 @@ class Orchestrator:
             tool_calls = tool_calls_list[idx] if idx < len(tool_calls_list) else []
             stop_reason = stop_reasons[idx] if idx < len(stop_reasons) else ""
 
+            # Enrich generation dicts with vLLM timing from request_timings + OTLP data
+            _req_timings = result.get("request_timings", [])
+            if not result.get("is_multiturn"):
+                _t = _req_timings[idx] if idx < len(_req_timings) else {}
+                _otlp = _t.get("otlp_timing", {}) or {}
+                if generations:
+                    generations[0]["queue_time"] = _otlp.get("queue_time", 0.0)
+                    generations[0]["ttft"] = _otlp.get("time_to_first_token", 0.0)
+                    generations[0]["prefill_time"] = _otlp.get("prefill_time", 0.0)
+                    generations[0]["decode_time"] = _otlp.get("decode_time", 0.0)
+                    generations[0]["inference_time"] = _otlp.get("inference_time", 0.0)
+                    generations[0]["e2e_latency"] = _otlp.get("e2e_latency", 0.0)
+                    generations[0]["vllm_request_id"] = _t.get("vllm_request_id", "")
+                    generations[0]["server_id"] = server_idx
+
             prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
             comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
             full_ids = full_token_ids[idx] if idx < len(full_token_ids) else []
@@ -2106,6 +2125,21 @@ class Orchestrator:
             tool_calls = tool_calls_list[idx] if idx < len(tool_calls_list) else []
             stop_reason = stop_reasons[idx] if idx < len(stop_reasons) else ""
 
+            # Enrich generation dicts with vLLM timing from request_timings + OTLP data
+            _req_timings = result.get("request_timings", [])
+            if not result.get("is_multiturn"):
+                _t = _req_timings[idx] if idx < len(_req_timings) else {}
+                _otlp = _t.get("otlp_timing", {}) or {}
+                if generations:
+                    generations[0]["queue_time"] = _otlp.get("queue_time", 0.0)
+                    generations[0]["ttft"] = _otlp.get("time_to_first_token", 0.0)
+                    generations[0]["prefill_time"] = _otlp.get("prefill_time", 0.0)
+                    generations[0]["decode_time"] = _otlp.get("decode_time", 0.0)
+                    generations[0]["inference_time"] = _otlp.get("inference_time", 0.0)
+                    generations[0]["e2e_latency"] = _otlp.get("e2e_latency", 0.0)
+                    generations[0]["vllm_request_id"] = _t.get("vllm_request_id", "")
+                    generations[0]["server_id"] = server_idx
+
             prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
             comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
             full_ids = full_token_ids[idx] if idx < len(full_token_ids) else []
@@ -2175,6 +2209,7 @@ class Orchestrator:
                 sample_id=sample_id,
                 server_id=server_idx,
                 group_id=group_id,
+                generation_idx=0,
             )
 
     def _try_start_pending_rollouts(self):
@@ -2761,6 +2796,7 @@ class Orchestrator:
                         sample_id=eval_sample_id,
                         server_id=server_idx,
                         group_id=eval_group_id,
+                        generation_idx=0,
                     )
 
                 tokens_prompt = 0

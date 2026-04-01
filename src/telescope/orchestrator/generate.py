@@ -1221,6 +1221,8 @@ async def process_sample(
             "prompt_tokens": prompt_tokens,
             "tool_call_count": 0,
             "stop_reason": choice.get("finish_reason", ""),
+            # vLLM timing from request (populated via OTLP tracing in orchestrator)
+            # These get populated later in _log_kept_rollout_group from request_timing
         }],
         "env_responses": [],
         "tool_calls": [],
