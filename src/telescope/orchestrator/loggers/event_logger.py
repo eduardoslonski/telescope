@@ -299,6 +299,7 @@ SAMPLES_DATA_SCHEMA = pa.schema([
     ("raw_string", pa.binary()),   # Decoded raw input passed to trainer (zstd-compressed UTF-8)
     ("compute_reward_time", pa.float64()),  # Time in seconds for compute_reward() call
     ("stop_reason", pa.string()),  # Why rollout ended: "final_answer", "max_turns", "context_exhausted", "error"
+    ("off_policy_steps", pa.int32()),  # Number of weight updates since this rollout was dispatched
 ])
 
 # Rollouts metrics schema - normalized table for flexible per-sample metrics
@@ -429,6 +430,7 @@ SAMPLES_DATA_DISCARDED_SCHEMA = pa.schema([
     ("raw_string", pa.binary()),
     ("compute_reward_time", pa.float64()),
     ("stop_reason", pa.string()),
+    ("off_policy_steps", pa.int32()),
     ("tail_idx", pa.int32()),
 ])
 
@@ -736,6 +738,7 @@ class GenerationRollout:
     raw_string: str = ""
     compute_reward_time: float = 0.0
     stop_reason: str = ""  # Why rollout ended: "final_answer", "max_turns", etc.
+    off_policy_steps: int = 0  # Number of weight updates since this rollout was dispatched
     tail_idx: int = -1
 
 
@@ -789,6 +792,7 @@ class DiscardedGenerationRollout:
     raw_string: str = ""
     compute_reward_time: float = 0.0
     stop_reason: str = ""
+    off_policy_steps: int = 0
     tail_idx: int = -1
 
 
@@ -1137,6 +1141,7 @@ class EventLogger:
         raw_string: str = "",
         compute_reward_time: float = 0.0,
         stop_reason: str = "",
+        off_policy_steps: int = 0,
         agent_id: int = 0,
     ):
         """
@@ -1237,6 +1242,7 @@ class EventLogger:
             raw_string=raw_string,
             compute_reward_time=compute_reward_time,
             stop_reason=stop_reason,
+            off_policy_steps=off_policy_steps,
         )
 
         with self._lock:
@@ -1315,7 +1321,9 @@ class EventLogger:
                 if phase == "start" and sample_id >= 0:
                     self._inflight_generations[sample_id] = {
                         "sample_id": sample_id, "generation_idx": generation_idx,
-                        "server_id": server_id, "agent_id": agent_id,
+                        "server_id": server_id, "server_lane": server_lane,
+                        "group_id": group_id, "agent_id": agent_id,
+                        "start_time": ts,
                     }
                 elif phase == "end" and sample_id >= 0:
                     self._inflight_generations.pop(sample_id, None)
@@ -1429,6 +1437,7 @@ class EventLogger:
         raw_string: str = "",
         compute_reward_time: float = 0.0,
         stop_reason: str = "",
+        off_policy_steps: int = 0,
         agent_id: int = 0,
     ):
         """Log a discarded rollout sample (not sent to trainer)."""
@@ -1506,6 +1515,7 @@ class EventLogger:
             raw_string=raw_string,
             compute_reward_time=compute_reward_time,
             stop_reason=stop_reason,
+            off_policy_steps=off_policy_steps,
         )
 
         with self._lock:
@@ -1926,6 +1936,7 @@ class EventLogger:
             "raw_string": [_zstd_compress(r.raw_string) for r in rollouts],
             "compute_reward_time": [r.compute_reward_time for r in rollouts],
             "stop_reason": [r.stop_reason for r in rollouts],
+            "off_policy_steps": [r.off_policy_steps for r in rollouts],
         }, schema=SAMPLES_DATA_SCHEMA)
 
     def _rollouts_metrics_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
@@ -2155,6 +2166,7 @@ class EventLogger:
             "raw_string": [_zstd_compress(r.raw_string) for r in rollouts],
             "compute_reward_time": [r.compute_reward_time for r in rollouts],
             "stop_reason": [r.stop_reason for r in rollouts],
+            "off_policy_steps": [r.off_policy_steps for r in rollouts],
             "tail_idx": [r.tail_idx for r in rollouts],
         }, schema=schema)
 
@@ -2442,6 +2454,7 @@ class EventLogger:
             "raw_string": [_zstd_compress(r.raw_string) for r in rollouts],
             "compute_reward_time": [r.compute_reward_time for r in rollouts],
             "stop_reason": [r.stop_reason for r in rollouts],
+            "off_policy_steps": [r.off_policy_steps for r in rollouts],
             "tail_idx": [r.tail_idx for r in rollouts],
         }, schema=SAMPLES_DATA_DISCARDED_SCHEMA)
 

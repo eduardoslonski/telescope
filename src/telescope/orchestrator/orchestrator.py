@@ -1517,34 +1517,13 @@ class Orchestrator:
     def _log_individual_sample_end_event(
         self, request_id: int, sample_idx: int, result: dict, group: dict,
     ):
-        """Log generation end event for a single completed individual-mode sample."""
-        rollout_info = self.inflight_rollout_info.get(request_id)
-        sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
+        """Placeholder for individual-mode sample completion.
 
-        server_url = group["server_url"]
-        server_idx = self._get_server_index(server_url)
-
-        # Extract timings (single-turn: "request_timing", multi-turn: "request_timings")
-        timings = result.get("request_timings")
-        if timings is None:
-            single = result.get("request_timing")
-            timings = [single] if single else []
-
-        for timing in timings:
-            if not timing:
-                continue
-            # Skip if already logged by lifecycle callback at generation-complete time
-            if timing.get("inference_end_logged"):
-                continue
-
-            self.wandb_logger.event_logger.log_rollout_event(
-                event_type="generation",
-                phase="end",
-                sample_id=sample_id,
-                server_id=server_idx,
-                group_id=request_id,
-                generation_idx=0,
-            )
+        The generation end event is already emitted by the on_inference_end
+        lifecycle callback inside process_sample/process_multiturn_sample.
+        This method is kept as a hook point but does not emit events.
+        """
+        pass
 
     def _log_individual_sample_error_end_event(
         self, request_id: int, sample_idx: int, group: dict,
@@ -1988,6 +1967,7 @@ class Orchestrator:
         full_token_ids = result.get("full_token_ids", [])  # Full sequence for raw_string
         total_tokens_list = result.get("total_tokens", [])
         compute_reward_times = result.get("compute_reward_times", [])
+        off_policy_steps_map = result.get("off_policy_steps", {})
 
         # Compute tokens_system_prompt and tokens_prompt if we have a tokenizer
         tokens_system_prompt = 0
@@ -2071,6 +2051,7 @@ class Orchestrator:
                 raw_string=raw_string,
                 compute_reward_time=compute_reward_time,
                 stop_reason=stop_reason,
+                off_policy_steps=off_policy_steps_map.get(idx, 0),
             )
 
     def _log_kept_rollout_group(self, result: dict):
@@ -2103,6 +2084,7 @@ class Orchestrator:
         full_token_ids = result.get("full_token_ids", [])  # Full sequence for raw_string
         total_tokens_list = result.get("total_tokens", [])
         compute_reward_times = result.get("compute_reward_times", [])
+        off_policy_steps_map = result.get("off_policy_steps", {})
 
         # Compute tokens_system_prompt and tokens_prompt if we have a tokenizer
         tokens_system_prompt = 0
@@ -2184,36 +2166,7 @@ class Orchestrator:
                 raw_string=raw_string,
                 compute_reward_time=compute_reward_time,
                 stop_reason=stop_reason,
-            )
-
-    def _log_inference_request_events(
-        self,
-        request_timings: list[dict],
-        group_id: int,
-        server_url: str,
-        sample_idx_map: dict[int, int],
-        off_policy_steps: dict[int, int] | None = None,
-        individual_lane_slots: list[int] | None = None,
-    ):
-        """Log generation end events for request timings with exact sample/group mapping."""
-        if not request_timings:
-            return
-
-        server_idx = self._get_server_index(server_url)
-        for timing in request_timings:
-            # Skip if already logged by lifecycle callback at generation-complete time
-            if timing.get("inference_end_logged"):
-                continue
-            sample_idx_in_group = timing.get("sample_idx_in_group", -1)
-            sample_id = sample_idx_map.get(sample_idx_in_group, -1)
-
-            self.wandb_logger.event_logger.log_rollout_event(
-                event_type="generation",
-                phase="end",
-                sample_id=sample_id,
-                server_id=server_idx,
-                group_id=group_id,
-                generation_idx=0,
+                off_policy_steps=off_policy_steps_map.get(idx, 0),
             )
 
     def _try_start_pending_rollouts(self):
