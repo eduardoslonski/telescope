@@ -2011,21 +2011,6 @@ class Orchestrator:
             tool_calls = tool_calls_list[idx] if idx < len(tool_calls_list) else []
             stop_reason = stop_reasons[idx] if idx < len(stop_reasons) else ""
 
-            # Enrich generation dicts with vLLM timing from request_timings + OTLP data
-            _req_timings = result.get("request_timings", [])
-            if not result.get("is_multiturn"):
-                _t = _req_timings[idx] if idx < len(_req_timings) else {}
-                _otlp = _t.get("otlp_timing", {}) or {}
-                if generations:
-                    generations[0]["queue_time"] = _otlp.get("queue_time", 0.0)
-                    generations[0]["ttft"] = _otlp.get("time_to_first_token", 0.0)
-                    generations[0]["prefill_time"] = _otlp.get("prefill_time", 0.0)
-                    generations[0]["decode_time"] = _otlp.get("decode_time", 0.0)
-                    generations[0]["inference_time"] = _otlp.get("inference_time", 0.0)
-                    generations[0]["e2e_latency"] = _otlp.get("e2e_latency", 0.0)
-                    generations[0]["vllm_request_id"] = _t.get("vllm_request_id", "")
-                    generations[0]["server_id"] = server_idx
-
             prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
             comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
             full_ids = full_token_ids[idx] if idx < len(full_token_ids) else []
