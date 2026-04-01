@@ -1272,6 +1272,7 @@ class EventLogger:
         generation_idx: int = -1,
         tool_call_idx: int = -1,
         server_id: int = -1,
+        tool_name: str = "",
     ):
         """
         Log a rollout lifecycle event (generation, tool_execution, env_response, reward).
@@ -1286,6 +1287,7 @@ class EventLogger:
             generation_idx: Generation index (-1 if N/A)
             tool_call_idx: Tool call index (-1 if N/A)
             server_id: Inference server index (-1 if N/A)
+            tool_name: Tool name for tool_execution events (inflight display only, not in events table)
         """
         ts = timestamp if timestamp is not None else time.time()
         event = RolloutEvent(
@@ -1316,7 +1318,8 @@ class EventLogger:
                 if phase == "start" and sample_id >= 0:
                     self._inflight_tool_executions[(sample_id, tool_call_idx)] = {
                         "sample_id": sample_id, "generation_idx": generation_idx,
-                        "tool_call_idx": tool_call_idx, "agent_id": agent_id,
+                        "tool_call_idx": tool_call_idx, "tool_name": tool_name,
+                        "agent_id": agent_id,
                     }
                 elif phase == "end" and sample_id >= 0:
                     self._inflight_tool_executions.pop((sample_id, tool_call_idx), None)
@@ -1958,7 +1961,7 @@ class EventLogger:
                 steps.append(r.step)
                 sample_ids.append(r.sample_id)
                 agent_ids.append(r.agent_id)
-                gen_idxs.append(info.get("generation_idx", 0))
+                gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
                 tc_idxs.append(info.get("tool_call_idx", -1))
                 envs.append(r.env)
                 info_keys.append(info.get("info_key", ""))
@@ -2204,7 +2207,7 @@ class EventLogger:
                 steps.append(r.step)
                 sample_ids.append(r.sample_id)
                 agent_ids.append(r.agent_id)
-                gen_idxs.append(info.get("generation_idx", 0))
+                gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
                 tc_idxs.append(info.get("tool_call_idx", -1))
                 envs.append(r.env)
                 info_keys.append(info.get("info_key", ""))
@@ -2485,7 +2488,7 @@ class EventLogger:
             for info in r.info_turns:
                 sample_ids.append(r.sample_id)
                 agent_ids.append(r.agent_id)
-                gen_idxs.append(info.get("generation_idx", 0))
+                gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
                 tc_idxs.append(info.get("tool_call_idx", -1))
                 envs.append(r.env)
                 info_keys.append(info.get("info_key", ""))
@@ -2722,7 +2725,7 @@ class EventLogger:
                 sample_idxs.append(r.sample_idx)
                 comp_idxs.append(r.completion_idx)
                 agent_ids.append(r.agent_id)
-                gen_idxs.append(info.get("generation_idx", 0))
+                gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
                 tc_idxs.append(info.get("tool_call_idx", -1))
                 envs.append(r.env)
                 info_keys.append(info.get("info_key", ""))
