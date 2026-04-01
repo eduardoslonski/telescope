@@ -6,7 +6,7 @@ in a way that's easy for the frontend UI to fetch and filter.
 
 All events are stored together in unified zip archives:
 - events/tail.zip: Last 60 seconds of all data
-  Contains: orchestrator.parquet, trainer.parquet, inference.parquet, gpu.parquet, cpu.parquet, vllm.parquet,
+  Contains: orchestrator.parquet, trainer.parquet, events_rollout.parquet, events_infra.parquet, gpu.parquet, cpu.parquet, vllm.parquet,
             generations_discarded.parquet, env_responses_discarded.parquet, tool_calls_discarded.parquet,
             rollouts_metrics_discarded.parquet, golden_answers_discarded.parquet, info_turns_discarded.parquet,
             sample_tags_discarded.parquet, samples_data_discarded.parquet, prompts_discarded.parquet
@@ -26,11 +26,12 @@ Each zip archive includes a metadata.json file with archive-level metadata:
 - max_tail_idx: Last complete tail index in the archive
 - Additional fields depending on the archive type (block_idx, tail_idx, etc.)
 
-Inference events track request and weight broadcast timings per server:
-- event_type: "request" or "weight_broadcast"
-- start_time, end_time: Event duration
-- server: Server index (0, 1, ...)
-- step: Training step (populated for weight_broadcast, null for requests)
+Rollout events track per-sample rollout pipeline phases (generation, tool_execution, env_response, reward):
+- event_type, phase, sample_id, generation_idx, tool_call_idx, server_id, agent_id
+- tail_idx: Upload cycle index when first uploaded
+
+Infra events track infrastructure operations (weight_sync, sandbox_provision):
+- event_type, phase, step, server_id, sandbox_id
 - tail_idx: Upload cycle index when first uploaded
 
 Steps data is stored in blocks by step count:
@@ -42,7 +43,8 @@ Run summary is updated every 5 seconds with metadata to help the UI:
 - events/current_tail_idx: Current tail upload cycle index
 - events/current_block_idx: Which event block we're currently writing to
 - events/num_finalized_blocks: How many event block_*.zip files have been written
-- events/tail_inference_count: Number of inference events in tail
+- events/tail_rollout_events_count: Number of rollout events in tail
+- events/tail_infra_events_count: Number of infra events in tail
 - steps/current_block_idx: Which step block we're currently writing to
 - steps/num_finalized_blocks: How many step block_*.zip files have been written
 - steps/last_training_step: Last completed trainer step index (-1 before first completion)
@@ -1108,37 +1110,6 @@ class EventLogger:
 
         with self._lock:
             self._events.append(event)
-            # Track inflight compute_reward for snapshot
-            if event_type == "compute_reward_start" and sample_id >= 0:
-                gen_event = self._ended_generation_info.get(sample_id)
-                entry = {
-                    "sample_id": sample_id,
-                    "group_id": group_id,
-                    "server": gen_event.server if gen_event else -1,
-                    "server_lane": gen_event.server_lane if gen_event else -1,
-                    "start_time": ts,
-                    "is_eval": gen_event.is_eval if gen_event else False,
-                    "prompt_tokens": gen_event.prompt_tokens if gen_event else 0,
-                }
-                self._inflight_compute_reward[sample_id] = entry
-            elif event_type == "compute_reward_end" and sample_id >= 0:
-                self._inflight_compute_reward.pop(sample_id, None)
-                self._ended_generation_info.pop(sample_id, None)
-            # Track inflight env_response for snapshot
-            elif event_type == "env_response_start" and sample_id >= 0:
-                gen_event = self._inflight_generations.get(sample_id)
-                entry = {
-                    "sample_id": sample_id,
-                    "group_id": group_id,
-                    "server": gen_event.server if gen_event else -1,
-                    "server_lane": gen_event.server_lane if gen_event else -1,
-                    "start_time": ts,
-                    "is_eval": gen_event.is_eval if gen_event else False,
-                    "prompt_tokens": gen_event.prompt_tokens if gen_event else 0,
-                }
-                self._inflight_env_response[sample_id] = entry
-            elif event_type == "env_response_end" and sample_id >= 0:
-                self._inflight_env_response.pop(sample_id, None)
 
     def log_generation_rollout(
         self,
@@ -2803,26 +2774,28 @@ class EventLogger:
         self,
         orchestrator_events: list[Event],
         trainer_events: list[Event],
-        inference_events: list[InferenceEvent],
+        rollout_events: list[RolloutEvent],
+        infra_events: list[InfraEvent],
         gpu_metrics: list,
         cpu_metrics: list,
         vllm_metrics: list,
     ) -> tuple[int, int]:
         """
         Compute the min and max tail_idx from all data sources.
-        
+
         Returns:
             (min_tail_idx, max_tail_idx) tuple, or (-1, -1) if no data
         """
         all_tail_indices = (
             [e.tail_idx for e in orchestrator_events] +
             [e.tail_idx for e in trainer_events] +
-            [e.tail_idx for e in inference_events] +
+            [e.tail_idx for e in rollout_events] +
+            [e.tail_idx for e in infra_events] +
             [idx for _, idx in gpu_metrics] +
             [idx for _, idx in cpu_metrics] +
             [idx for _, idx in vllm_metrics]
         )
-        
+
         if all_tail_indices:
             return min(all_tail_indices), max(all_tail_indices)
         return -1, -1
@@ -2831,7 +2804,8 @@ class EventLogger:
         self,
         orchestrator_events: list[Event],
         trainer_events: list[Event],
-        inference_events: list[InferenceEvent],
+        rollout_events: list[RolloutEvent],
+        infra_events: list[InfraEvent],
         gpu_metrics: list,
         cpu_metrics: list,
         vllm_metrics: list,
@@ -2844,9 +2818,7 @@ class EventLogger:
         eval_rollouts: list[EvalGenerationRollout] | None = None,
         eval_prompts: list[EvalPrompt] | None = None,
         logs: list[tuple[LogRecord, int]] | None = None,
-        inflight_snapshot: list[dict] | None = None,
-        inflight_compute_reward: list[dict] | None = None,
-        inflight_env_response: list[dict] | None = None,
+        inflight_snapshot: dict | None = None,
     ):
         """Write all event data as separate parquet files in a single zip archive."""
         if self.run is None:
@@ -2858,7 +2830,8 @@ class EventLogger:
         # Convert all data to tables
         orchestrator_table = self._orchestrator_events_to_table(orchestrator_events)
         trainer_table = self._trainer_events_to_table(trainer_events)
-        inference_table = self._inference_events_to_table(inference_events)
+        rollout_events_table = self._rollout_events_to_table(rollout_events)
+        infra_events_table = self._infra_events_to_table(infra_events)
         gpu_table = self._gpu_metrics_to_table(gpu_metrics)
         cpu_table = self._cpu_metrics_to_table(cpu_metrics)
         vllm_table = self._vllm_metrics_to_table(vllm_metrics)
@@ -2917,8 +2890,12 @@ class EventLogger:
             zf.writestr("trainer.parquet", buf.getvalue())
 
             buf = io.BytesIO()
-            pq.write_table(inference_table, buf)
-            zf.writestr("inference.parquet", buf.getvalue())
+            pq.write_table(rollout_events_table, buf)
+            zf.writestr("events_rollout.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(infra_events_table, buf)
+            zf.writestr("events_infra.parquet", buf.getvalue())
 
             buf = io.BytesIO()
             pq.write_table(gpu_table, buf)
@@ -3055,15 +3032,7 @@ class EventLogger:
 
             # Write inflight snapshot if provided (only for tail.zip)
             if inflight_snapshot is not None:
-                inflight_data = {
-                    "snapshot_time": time.time(),
-                    "running": inflight_snapshot,
-                }
-                if inflight_compute_reward:
-                    inflight_data["running_compute_reward"] = inflight_compute_reward
-                if inflight_env_response:
-                    inflight_data["running_env_response"] = inflight_env_response
-                zf.writestr("inflight.json", json.dumps(inflight_data))
+                zf.writestr("inflight.json", json.dumps(inflight_snapshot))
 
         self.run.save(str(dest_path), base_path=self.run.dir, policy="now")
 
@@ -3106,6 +3075,7 @@ class EventLogger:
         golden_answers_table = self._golden_answers_to_table(rollouts)
         info_turns_table = self._info_turns_to_table(rollouts)
         sample_tags_table = self._sample_tags_to_table(rollouts)
+        turn_metrics_table = self._turn_metrics_to_table(rollouts)
         metrics_table = self._step_metrics_to_table(step_metrics)
 
         with zipfile.ZipFile(dest_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -3154,6 +3124,11 @@ class EventLogger:
             pq.write_table(sample_tags_table, buf)
             zf.writestr("sample_tags.parquet", buf.getvalue())
 
+            # Write turn metrics table (per-turn numeric metrics)
+            buf = io.BytesIO()
+            pq.write_table(turn_metrics_table, buf)
+            zf.writestr("turn_metrics.parquet", buf.getvalue())
+
             # Write step metrics table (grad_norm, kl_divergence_inference, entropy per rank)
             buf = io.BytesIO()
             pq.write_table(metrics_table, buf)
@@ -3189,12 +3164,15 @@ class EventLogger:
         now = time.time()
         current_tail_idx = self._current_tail_idx
 
-        # Assign tail_idx to events/inference_events/discarded_rollouts that don't have one yet
+        # Assign tail_idx to events/rollout_events/infra_events/discarded_rollouts that don't have one yet
         with self._lock:
             for e in self._events:
                 if e.tail_idx == -1:
                     e.tail_idx = current_tail_idx
-            for e in self._inference_events:
+            for e in self._rollout_events:
+                if e.tail_idx == -1:
+                    e.tail_idx = current_tail_idx
+            for e in self._infra_events:
                 if e.tail_idx == -1:
                     e.tail_idx = current_tail_idx
             for g in self._discarded_rollouts:
@@ -3215,25 +3193,19 @@ class EventLogger:
             for p in self._eval_prompts:
                 if p.tail_idx == -1:
                     p.tail_idx = current_tail_idx
-            # Snapshot inflight generations for tail.zip
-            inflight_snapshot = [
-                {
-                    "sample_id": e.sample_id,
-                    "group_id": e.group_id,
-                    "server": e.server,
-                    "server_lane": e.server_lane,
-                    "start_time": e.start_time,
-                    "is_eval": e.is_eval,
-                    "prompt_tokens": e.prompt_tokens,
-                }
-                for e in self._inflight_generations.values()
-            ]
-            # Snapshot inflight compute_reward for tail.zip
-            inflight_compute_reward_snapshot = list(self._inflight_compute_reward.values())
-            # Snapshot inflight env_response for tail.zip
-            inflight_env_response_snapshot = list(self._inflight_env_response.values())
+            # Snapshot all inflight tracking dicts for tail.zip
+            inflight_snapshot = {
+                "timestamp": time.time(),
+                "inflight_generations": list(self._inflight_generations.values()),
+                "inflight_tool_executions": list(self._inflight_tool_executions.values()),
+                "inflight_env_responses": list(self._inflight_env_responses.values()),
+                "inflight_sandbox_ops": list(self._inflight_sandbox_ops.values()),
+                "inflight_weight_syncs": list(self._inflight_weight_syncs.values()),
+                "inflight_rewards": list(self._inflight_rewards.values()),
+            }
             all_events = list(self._events)
-            all_inference_events = list(self._inference_events)
+            all_rollout_events = list(self._rollout_events)
+            all_infra_events = list(self._infra_events)
             all_discarded_rollouts = list(self._discarded_rollouts)
             all_discarded_prompts = list(self._discarded_prompts)
             all_kept_rollouts = list(self._kept_rollouts)
@@ -3304,8 +3276,12 @@ class EventLogger:
                 e for e in all_events
                 if e.tail_idx >= self._block_first_tail_idx and e.tail_idx <= block_last_tail_idx
             ]
-            block_inference_events = [
-                e for e in all_inference_events
+            block_rollout_events = [
+                e for e in all_rollout_events
+                if e.tail_idx >= self._block_first_tail_idx and e.tail_idx <= block_last_tail_idx
+            ]
+            block_infra_events = [
+                e for e in all_infra_events
                 if e.tail_idx >= self._block_first_tail_idx and e.tail_idx <= block_last_tail_idx
             ]
             block_gpu_metrics = [
@@ -3349,7 +3325,7 @@ class EventLogger:
                 if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
             ]
 
-            if block_events or block_inference_events or block_gpu_metrics or block_cpu_metrics or block_vllm_metrics or block_discarded_rollouts or block_discarded_prompts or block_kept_rollouts or block_kept_prompts or block_eval_rollouts or block_eval_prompts:
+            if block_events or block_rollout_events or block_infra_events or block_gpu_metrics or block_cpu_metrics or block_vllm_metrics or block_discarded_rollouts or block_discarded_prompts or block_kept_rollouts or block_kept_prompts or block_eval_rollouts or block_eval_prompts:
                 orch_events = [e for e in block_events if e.source == "orchestrator"]
                 trainer_events = [e for e in block_events if e.source == "trainer"]
 
@@ -3360,7 +3336,7 @@ class EventLogger:
                     "max_tail_idx": block_last_tail_idx,
                 }
                 self._write_events_zip_to_wandb(
-                    orch_events, trainer_events, block_inference_events,
+                    orch_events, trainer_events, block_rollout_events, block_infra_events,
                     block_gpu_metrics, block_cpu_metrics, block_vllm_metrics,
                     block_path,
                     metadata=finalized_block_metadata,
@@ -3388,7 +3364,10 @@ class EventLogger:
                 for e in self._events:
                     if e.tail_idx == -1:
                         e.tail_idx = current_tail_idx
-                for e in self._inference_events:
+                for e in self._rollout_events:
+                    if e.tail_idx == -1:
+                        e.tail_idx = current_tail_idx
+                for e in self._infra_events:
                     if e.tail_idx == -1:
                         e.tail_idx = current_tail_idx
                 for g in self._discarded_rollouts:
@@ -3410,7 +3389,8 @@ class EventLogger:
                     if p.tail_idx == -1:
                         p.tail_idx = current_tail_idx
                 self._events = [e for e in self._events if e.tail_idx >= new_block_first_tail_idx]
-                self._inference_events = [e for e in self._inference_events if e.tail_idx >= new_block_first_tail_idx]
+                self._rollout_events = [e for e in self._rollout_events if e.tail_idx >= new_block_first_tail_idx]
+                self._infra_events = [e for e in self._infra_events if e.tail_idx >= new_block_first_tail_idx]
                 self._discarded_rollouts = [g for g in self._discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
                 self._discarded_prompts = [p for p in self._discarded_prompts if p.tail_idx >= new_block_first_tail_idx]
                 self._kept_rollouts = [g for g in self._kept_rollouts if g.tail_idx >= new_block_first_tail_idx]
@@ -3426,7 +3406,8 @@ class EventLogger:
             self._log_records = [(r, idx) for r, idx in self._log_records if idx >= new_block_first_tail_idx]
 
             all_events = [e for e in all_events if e.tail_idx >= new_block_first_tail_idx]
-            all_inference_events = [e for e in all_inference_events if e.tail_idx >= new_block_first_tail_idx]
+            all_rollout_events = [e for e in all_rollout_events if e.tail_idx >= new_block_first_tail_idx]
+            all_infra_events = [e for e in all_infra_events if e.tail_idx >= new_block_first_tail_idx]
             all_gpu_metrics = [(m, idx) for m, idx in all_gpu_metrics if idx >= new_block_first_tail_idx]
             all_cpu_metrics = [(m, idx) for m, idx in all_cpu_metrics if idx >= new_block_first_tail_idx]
             all_vllm_metrics = [(m, idx) for m, idx in all_vllm_metrics if idx >= new_block_first_tail_idx]
@@ -3442,7 +3423,8 @@ class EventLogger:
 
         # Filter for current block BY TAIL_IDX (ensures complete tails)
         current_block_events = [e for e in all_events if e.tail_idx >= self._block_first_tail_idx]
-        current_block_inference_events = [e for e in all_inference_events if e.tail_idx >= self._block_first_tail_idx]
+        current_block_rollout_events = [e for e in all_rollout_events if e.tail_idx >= self._block_first_tail_idx]
+        current_block_infra_events = [e for e in all_infra_events if e.tail_idx >= self._block_first_tail_idx]
         current_block_gpu = [(m, idx) for m, idx in all_gpu_metrics if idx >= self._block_first_tail_idx]
         current_block_cpu = [(m, idx) for m, idx in all_cpu_metrics if idx >= self._block_first_tail_idx]
         current_block_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= self._block_first_tail_idx]
@@ -3456,7 +3438,8 @@ class EventLogger:
 
         # Filter for tail BY TAIL_IDX (ensures complete tails)
         tail_events = [e for e in all_events if e.tail_idx >= tail_min_idx_for_window]
-        tail_inference_events = [e for e in all_inference_events if e.tail_idx >= tail_min_idx_for_window]
+        tail_rollout_events = [e for e in all_rollout_events if e.tail_idx >= tail_min_idx_for_window]
+        tail_infra_events = [e for e in all_infra_events if e.tail_idx >= tail_min_idx_for_window]
         tail_gpu = [(m, idx) for m, idx in all_gpu_metrics if idx >= tail_min_idx_for_window]
         tail_cpu = [(m, idx) for m, idx in all_cpu_metrics if idx >= tail_min_idx_for_window]
         tail_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= tail_min_idx_for_window]
@@ -3477,7 +3460,8 @@ class EventLogger:
         # Calculate tail time range (from all data sources) - for informational purposes
         all_tail_timestamps = (
             [e.timestamp for e in tail_events] +
-            [e.start_time for e in tail_inference_events] +
+            [e.timestamp for e in tail_rollout_events] +
+            [e.timestamp for e in tail_infra_events] +
             [m.timestamp for m, _ in tail_gpu] +
             [m.timestamp for m, _ in tail_cpu] +
             [m.timestamp for m, _ in tail_vllm]
@@ -3494,7 +3478,7 @@ class EventLogger:
             "max_tail_idx": current_tail_idx,
         }
         self._write_events_zip_to_wandb(
-            tail_orch_events, tail_trainer_events, tail_inference_events,
+            tail_orch_events, tail_trainer_events, tail_rollout_events, tail_infra_events,
             tail_gpu, tail_cpu, tail_vllm,
             "events/tail.zip",
             metadata=tail_metadata,
@@ -3506,8 +3490,6 @@ class EventLogger:
             eval_prompts=tail_eval_prompts,
             logs=tail_log_records,
             inflight_snapshot=inflight_snapshot,
-            inflight_compute_reward=inflight_compute_reward_snapshot,
-            inflight_env_response=inflight_env_response_snapshot,
         )
 
         # Write block_live.zip with all data
@@ -3519,7 +3501,7 @@ class EventLogger:
             "max_tail_idx": current_tail_idx,
         }
         self._write_events_zip_to_wandb(
-            block_orch_events, block_trainer_events, current_block_inference_events,
+            block_orch_events, block_trainer_events, current_block_rollout_events, current_block_infra_events,
             current_block_gpu, current_block_cpu, current_block_vllm,
             "events/block_live.zip",
             metadata=block_live_metadata,
@@ -3668,7 +3650,8 @@ class EventLogger:
             # Events counts in tail
             "events/tail_orchestrator_count": len(tail_orch_events),
             "events/tail_trainer_count": len(tail_trainer_events),
-            "events/tail_inference_count": len(tail_inference_events),
+            "events/tail_rollout_events_count": len(tail_rollout_events),
+            "events/tail_infra_events_count": len(tail_infra_events),
             "events/tail_gpu_count": len(tail_gpu),
             "events/tail_cpu_count": len(tail_cpu),
             "events/tail_vllm_count": len(tail_vllm),
@@ -3676,7 +3659,8 @@ class EventLogger:
             # Events counts in block_live
             "events/block_live_orchestrator_count": len(block_orch_events),
             "events/block_live_trainer_count": len(block_trainer_events),
-            "events/block_live_inference_count": len(current_block_inference_events),
+            "events/block_live_rollout_events_count": len(current_block_rollout_events),
+            "events/block_live_infra_events_count": len(current_block_infra_events),
             "events/block_live_gpu_count": len(current_block_gpu),
             "events/block_live_cpu_count": len(current_block_cpu),
             "events/block_live_vllm_count": len(current_block_vllm),
@@ -3703,7 +3687,7 @@ class EventLogger:
         self._summary_id += 1
         # Increment tail_idx for the next upload cycle
         self._current_tail_idx += 1
-        _log.debug(f"Uploaded tail {current_tail_idx}: events={len(tail_orch_events)}+{len(tail_trainer_events)}+{len(tail_inference_events)}, metrics={len(tail_gpu)}+{len(tail_cpu)}+{len(tail_vllm)}, discarded={len(tail_discarded_rollouts)}")
+        _log.debug(f"Uploaded tail {current_tail_idx}: events={len(tail_orch_events)}+{len(tail_trainer_events)}+{len(tail_rollout_events)}+{len(tail_infra_events)}, metrics={len(tail_gpu)}+{len(tail_cpu)}+{len(tail_vllm)}, discarded={len(tail_discarded_rollouts)}")
 
     def upload_now(self, blocking: bool = False):
         """Trigger an upload cycle."""
