@@ -750,6 +750,12 @@ async def run_multiturn_rollout(
     logged_turns: list[dict] = []
     turn_order = 0
 
+    # Generation-centric data collection
+    generation_idx = 0
+    logged_generations: list[dict] = []
+    logged_env_responses: list[dict] = []
+    logged_tool_calls: list[dict] = []
+
     use_interleaved = interleaved if interleaved is not None else config.cfg.interleaved_rollouts
     
     # Get the interleaved tokenizer for local tokenization (no HTTP calls!)
@@ -834,6 +840,16 @@ async def run_multiturn_rollout(
                 "stop_reason": finish_reason,
             })
             turn_order += 1
+
+            # Generation-centric logging
+            logged_generations.append({
+                "generation_idx": generation_idx,
+                "content": completion_text,
+                "tokens": turn_completion_tokens,
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "tool_call_count": 0,  # Updated below after env_response parses tool calls
+                "stop_reason": finish_reason,
+            })
             
             # Build trajectory step
             step = TrajectoryStep(
@@ -902,6 +918,43 @@ async def run_multiturn_rollout(
                     })
                     turn_order += 1
 
+                    # Generation-centric env response logging
+                    logged_env_responses.append({
+                        "generation_idx": generation_idx,
+                        "content": env_content,
+                        "turn_type": env_turn_type,
+                        "tokens": env_tokens,
+                        "response_time": _env_resp_time,
+                    })
+
+            # Extract tool calls from state.custom if the environment tracks them
+            # (ToolEnvironment populates these during env_response)
+            new_tool_calls = state.custom.get("_pending_tool_calls", [])
+            if new_tool_calls:
+                # Update the generation's tool_call_count
+                if logged_generations:
+                    logged_generations[-1]["tool_call_count"] = len(new_tool_calls)
+                for tc_idx, tc in enumerate(new_tool_calls):
+                    logged_tool_calls.append({
+                        "generation_idx": generation_idx,
+                        "tool_call_idx": tc_idx,
+                        "env_response_generation_idx": generation_idx,
+                        "tool_name": tc.get("tool_name", tc.get("name", "")),
+                        "arguments": tc.get("arguments", ""),
+                        "raw_text": tc.get("raw_text", tc.get("raw", "")),
+                        "result": tc.get("result", ""),
+                        "success": tc.get("success", True),
+                        "error": tc.get("error", ""),
+                        "exit_code": tc.get("exit_code", -1),
+                        "truncated": tc.get("truncated", False),
+                        "result_tokens": tc.get("result_tokens", 0),
+                        "sandbox_id": tc.get("sandbox_id", ""),
+                    })
+                # Clear pending tool calls for next generation
+                state.custom["_pending_tool_calls"] = []
+
+            generation_idx += 1
+
             # Build next prompt messages (for message tracking and non-interleaved mode)
             messages = env.get_next_prompt_messages(state, env_messages)
             
@@ -921,6 +974,9 @@ async def run_multiturn_rollout(
     
     # Store data in state for downstream consumption
     state.custom["_logged_turns"] = logged_turns
+    state.custom["_logged_generations"] = logged_generations
+    state.custom["_logged_env_responses"] = logged_env_responses
+    state.custom["_logged_tool_calls"] = logged_tool_calls
     # Store full token sequence (prompt + completions + env responses) for raw_string
     state.custom["_full_token_ids"] = running_token_ids
     
@@ -1157,6 +1213,17 @@ async def process_sample(
         },
         "vllm_logprobs": vllm_logprobs,
         "compute_reward_time": compute_reward_time,
+        # Generation-centric data (single generation for single-turn)
+        "generations": [{
+            "generation_idx": 0,
+            "content": completion_text,
+            "tokens": completion_tokens,
+            "prompt_tokens": prompt_tokens,
+            "tool_call_count": 0,
+            "stop_reason": choice.get("finish_reason", ""),
+        }],
+        "env_responses": [],
+        "tool_calls": [],
     }
 
 
@@ -1267,8 +1334,11 @@ async def process_multiturn_sample(
             elif msg.get("role") == "system" and not system_prompt:
                 system_prompt = msg.get("content", "")
     
-    # Get logged turns from state
+    # Get logged data from state
     logged_turns = state.custom.get("_logged_turns", [])
+    logged_generations = state.custom.get("_logged_generations", [])
+    logged_env_responses = state.custom.get("_logged_env_responses", [])
+    logged_tool_calls = state.custom.get("_logged_tool_calls", [])
     
     # Get full token sequence for raw_string (includes env responses)
     full_token_ids = state.custom.get("_full_token_ids", [])
@@ -1295,6 +1365,9 @@ async def process_multiturn_sample(
         "num_turns": state.num_turns,
         "stop_reason": state.stop_reason,
         "turns": logged_turns,
+        "generations": logged_generations,
+        "env_responses": logged_env_responses,
+        "tool_calls": logged_tool_calls,
         "compute_reward_time": compute_reward_time,
     }
 
@@ -1470,6 +1543,9 @@ async def process_multiturn_group(
         "num_turns": [s["num_turns"] for s in group_samples],
         "stop_reasons": [s["stop_reason"] for s in group_samples],
         "turns": turns_list,
+        "generations": [s["generations"] for s in group_samples],
+        "env_responses": [s["env_responses"] for s in group_samples],
+        "tool_calls": [s["tool_calls"] for s in group_samples],
         "system_prompt": system_prompt,  # Raw system prompt (no chat template)
         "tokens_system_prompt": tokens_system_prompt,
         "compute_reward_times": compute_reward_times,
@@ -1650,6 +1726,9 @@ async def process_group(
         "vllm_logprobs": vllm_logprobs,
         "server_url": server_url,
         "turns": turns_list,
+        "generations": [s["generations"] for s in group_samples],
+        "env_responses": [s["env_responses"] for s in group_samples],
+        "tool_calls": [s["tool_calls"] for s in group_samples],
         "system_prompt": system_prompt,  # Raw system prompt (no chat template)
         "tokens_system_prompt": tokens_system_prompt,
         "compute_reward_times": compute_reward_times,

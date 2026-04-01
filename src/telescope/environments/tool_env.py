@@ -699,10 +699,11 @@ class ToolEnvironment(MultiTurnEnvironment):
 
         # Execute each tool call
         results: list[ToolResult] = []
+        pending_tool_calls: list[dict] = []
         for call in tool_calls:
             result = await self.execute_tool(call)
             results.append(result)
-            
+
             # Track tool usage
             state.custom["tool_calls"].append({
                 "name": call.name,
@@ -715,16 +716,34 @@ class ToolEnvironment(MultiTurnEnvironment):
                 "success": result.success,
                 "error": result.error,
             })
-            
+
             if result.success:
                 state.custom["tool_success_count"] += 1
             else:
                 state.custom["tool_error_count"] += 1
-            
+
             # Per-tool count
             if result.tool_name not in state.custom["tools_by_name"]:
                 state.custom["tools_by_name"][result.tool_name] = 0
             state.custom["tools_by_name"][result.tool_name] += 1
+
+            # Build structured tool call record for generation-centric logging
+            import json
+            pending_tool_calls.append({
+                "tool_name": call.name,
+                "arguments": json.dumps(call.arguments) if isinstance(call.arguments, dict) else str(call.arguments),
+                "raw_text": call.raw_text,
+                "result": result.result,
+                "success": result.success,
+                "error": result.error or "",
+                "exit_code": -1,
+                "truncated": False,
+                "result_tokens": 0,
+                "sandbox_id": "",
+            })
+
+        # Store pending tool calls for generation-centric data collection in generate.py
+        state.custom["_pending_tool_calls"] = pending_tool_calls
         
         # Format results for next turn
         formatted_results = self.format_multiple_tool_results(results)

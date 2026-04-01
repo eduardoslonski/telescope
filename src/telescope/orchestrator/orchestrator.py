@@ -33,9 +33,10 @@ from telescope.orchestrator.eval_runner import (
     compute_eval_schedule,
 )
 from telescope.orchestrator.loggers.event_logger import (
+    EnvResponseRecord,
+    EvalGenerationRollout,
     EvalPrompt,
-    EvalRollout,
-    RolloutTurn,
+    GenerationRecord,
 )
 from telescope.orchestrator import generate as generate_module
 from telescope.orchestrator.generate import (
@@ -966,21 +967,14 @@ class Orchestrator:
         for i in range(config.cfg.group_size):
             sample_ids[i] = self.next_sample_idx
             self.next_sample_idx += 1
-            self.wandb_logger.log_inference_event(
-                event_type="request",
-                server=server_idx,
-                start_time=now,
-                end_time=now,
-                node_id=server_info.get("node_id", -1),
-                node_ip=str(server_info.get("node_ip") or ""),
-                hostname=str(server_info.get("hostname") or ""),
-                ray_node_id=str(server_info.get("ray_node_id") or ""),
-                tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-                tp_size=int(server_info.get("tp_size", 1)),
-                group_id=request_id,
-                sample_id=sample_ids[i],
-                server_lane=lane_slots[i],
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="generation",
                 phase="start",
+                timestamp=now,
+                sample_id=sample_ids[i],
+                server_id=server_idx,
+                generation_idx=0,
+                group_id=request_id,
             )
 
         task = asyncio.create_task(
@@ -1109,21 +1103,14 @@ class Orchestrator:
                     now = time.time()
                     server_idx = self._get_server_index(server_url)
                     server_info = self._get_server_info(server_url)
-                    self.wandb_logger.log_inference_event(
-                        event_type="request",
-                        server=server_idx,
-                        start_time=now,
-                        end_time=now,
-                        node_id=server_info.get("node_id", -1),
-                        node_ip=str(server_info.get("node_ip") or ""),
-                        hostname=str(server_info.get("hostname") or ""),
-                        ray_node_id=str(server_info.get("ray_node_id") or ""),
-                        tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-                        tp_size=int(server_info.get("tp_size", 1)),
-                        group_id=request_id,
-                        sample_id=sample_id,
-                        server_lane=lane_slot,
+                    self.wandb_logger.event_logger.log_rollout_event(
+                        event_type="generation",
                         phase="start",
+                        timestamp=now,
+                        sample_id=sample_id,
+                        server_id=server_idx,
+                        generation_idx=0,
+                        group_id=request_id,
                     )
                 _log.debug(
                     f"Dispatched individual sample: request_id={request_id}, "
@@ -1160,25 +1147,13 @@ class Orchestrator:
             rollout_info = self.inflight_rollout_info.get(request_id)
             sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
 
-            # Log phase="end" inference event with generation timing (no OTLP, no compute_reward_time)
-            self.wandb_logger.log_inference_event(
-                event_type="request",
-                server=server_idx,
-                start_time=timing.get("start_time", 0),
-                end_time=timing.get("end_time", 0),
-                node_id=server_info.get("node_id", -1),
-                node_ip=str(server_info.get("node_ip") or ""),
-                hostname=str(server_info.get("hostname") or ""),
-                ray_node_id=str(server_info.get("ray_node_id") or ""),
-                tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-                tp_size=int(server_info.get("tp_size", 1)),
-                prompt_tokens=timing.get("prompt_tokens", 0),
-                rollout_tokens=timing.get("rollout_tokens", 0),
-                group_id=request_id,
-                sample_id=sample_id,
-                off_policy_steps=(rollout_info.sample_off_policy_steps.get(sample_idx, 0) if rollout_info else 0),
-                server_lane=lane_slot,
+            # Log generation end event (vLLM timing now goes in domain table via log_generation_rollout)
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="generation",
                 phase="end",
+                sample_id=sample_id,
+                server_id=server_idx,
+                group_id=request_id,
             )
             timing["inference_end_logged"] = True
 
@@ -1197,27 +1172,39 @@ class Orchestrator:
             nonlocal _reward_sample_id
             rollout_info = self.inflight_rollout_info.get(request_id)
             _reward_sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
-            self.wandb_logger.log_orchestrator_timeline_event(
-                "compute_reward_start", group_id=request_id, sample_id=_reward_sample_id,
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="reward",
+                phase="start",
+                sample_id=_reward_sample_id,
+                group_id=request_id,
             )
 
         def on_reward_end(compute_reward_time: float):
-            self.wandb_logger.log_orchestrator_timeline_event(
-                "compute_reward_end", group_id=request_id, sample_id=_reward_sample_id,
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="reward",
+                phase="end",
+                sample_id=_reward_sample_id,
+                group_id=request_id,
             )
 
         def on_env_response_start():
             rollout_info = self.inflight_rollout_info.get(request_id)
             sid = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
-            self.wandb_logger.log_orchestrator_timeline_event(
-                "env_response_start", group_id=request_id, sample_id=sid,
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="env_response",
+                phase="start",
+                sample_id=sid,
+                group_id=request_id,
             )
 
         def on_env_response_end():
             rollout_info = self.inflight_rollout_info.get(request_id)
             sid = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
-            self.wandb_logger.log_orchestrator_timeline_event(
-                "env_response_end", group_id=request_id, sample_id=sid,
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="env_response",
+                phase="end",
+                sample_id=sid,
+                group_id=request_id,
             )
 
         lifecycle = SampleLifecycleCallbacks(
@@ -1395,30 +1382,17 @@ class Orchestrator:
         if not lane_already_freed and server_url in self.available_server_lane_slots:
             self.available_server_lane_slots[server_url].add(lane_slot)
 
-        # Log inference event for the cancelled sample
+        # Log generation end event for the cancelled sample
         if not generate_module._shutting_down:
             rollout_info = self.inflight_rollout_info.get(request_id)
-            off_policy_steps = rollout_info.sample_off_policy_steps.get(sample_idx, 0) if rollout_info else 0
             sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
             server_idx = self._get_server_index(server_url)
-            server_info = self._get_server_info(server_url)
-            self.wandb_logger.log_inference_event(
-                event_type="request",
-                server=server_idx,
-                start_time=start_time,
-                end_time=end_time,
-                node_id=server_info.get("node_id", -1),
-                node_ip=str(server_info.get("node_ip") or ""),
-                hostname=str(server_info.get("hostname") or ""),
-                ray_node_id=str(server_info.get("ray_node_id") or ""),
-                tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-                tp_size=int(server_info.get("tp_size", 1)),
-                group_id=request_id,
-                sample_id=sample_id,
-                is_canceled=True,
-                off_policy_steps=off_policy_steps,
-                server_lane=lane_slot,
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="generation",
                 phase="end",
+                sample_id=sample_id,
+                server_id=server_idx,
+                group_id=request_id,
             )
 
         group = self.pending_individual_groups.get(request_id)
@@ -1524,25 +1498,13 @@ class Orchestrator:
             server_info = self._get_server_info(server_url)
             pre_assigned_ids = rollout_info.sample_ids if rollout_info else {}
             for sample_i in range(config.cfg.group_size):
-                timing = sample_timings[sample_i] if sample_i < len(sample_timings) else {}
                 sample_id = pre_assigned_ids.get(sample_i, -1)
-                self.wandb_logger.log_inference_event(
-                    event_type="request",
-                    server=server_idx,
-                    start_time=timing.get("start_time", now),
-                    end_time=timing.get("end_time", now),
-                    node_id=server_info.get("node_id", -1),
-                    node_ip=str(server_info.get("node_ip") or ""),
-                    hostname=str(server_info.get("hostname") or ""),
-                    ray_node_id=str(server_info.get("ray_node_id") or ""),
-                    tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-                    tp_size=int(server_info.get("tp_size", 1)),
-                    group_id=request_id,
-                    sample_id=sample_id,
-                    is_canceled=True,
-                    off_policy_steps=sample_off_policy.get(sample_i, 0),
-                    server_lane=lane_slots[sample_i] if sample_i < len(lane_slots) else -1,
+                self.wandb_logger.event_logger.log_rollout_event(
+                    event_type="generation",
                     phase="end",
+                    sample_id=sample_id,
+                    server_id=server_idx,
+                    group_id=request_id,
                 )
 
         # Lanes freed — try to dispatch new groups immediately.
@@ -1551,16 +1513,12 @@ class Orchestrator:
     def _log_individual_sample_end_event(
         self, request_id: int, sample_idx: int, result: dict, group: dict,
     ):
-        """Log inference end event for a single completed individual-mode sample."""
+        """Log generation end event for a single completed individual-mode sample."""
         rollout_info = self.inflight_rollout_info.get(request_id)
         sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
-        off_policy = rollout_info.sample_off_policy_steps.get(sample_idx, 0) if rollout_info else 0
 
         server_url = group["server_url"]
         server_idx = self._get_server_index(server_url)
-        server_info = self._get_server_info(server_url)
-        lane_slots = group["lane_slots"]
-        server_lane = lane_slots[sample_idx] if sample_idx < len(lane_slots) and lane_slots[sample_idx] is not None else -1
 
         # Extract timings (single-turn: "request_timing", multi-turn: "request_timings")
         timings = result.get("request_timings")
@@ -1574,82 +1532,31 @@ class Orchestrator:
             # Skip if already logged by lifecycle callback at generation-complete time
             if timing.get("inference_end_logged"):
                 continue
-            vllm_request_id = timing.get("vllm_request_id", "")
-            vllm_max_tokens = timing.get("max_tokens", 0)
-            queue_time = time_to_first_token = prefill_time = 0.0
-            decode_time = inference_time = e2e_latency = 0.0
 
-            span_data = timing.get("otlp_timing")
-            if span_data is not None:
-                queue_time = span_data.get("queue_time") or 0.0
-                time_to_first_token = span_data.get("time_to_first_token") or 0.0
-                prefill_time = span_data.get("prefill_time") or 0.0
-                decode_time = span_data.get("decode_time") or 0.0
-                inference_time = span_data.get("inference_time") or 0.0
-                e2e_latency = span_data.get("e2e_latency") or 0.0
-
-            self.wandb_logger.log_inference_event(
-                event_type="request",
-                server=server_idx,
-                start_time=timing.get("start_time", 0),
-                end_time=timing.get("end_time", 0),
-                node_id=server_info.get("node_id", -1),
-                node_ip=str(server_info.get("node_ip") or ""),
-                hostname=str(server_info.get("hostname") or ""),
-                ray_node_id=str(server_info.get("ray_node_id") or ""),
-                tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-                tp_size=int(server_info.get("tp_size", 1)),
-                prompt_tokens=timing.get("prompt_tokens", 0),
-                rollout_tokens=timing.get("rollout_tokens", 0),
-                group_id=request_id,
-                sample_id=sample_id,
-                vllm_request_id=vllm_request_id,
-                queue_time=queue_time,
-                time_to_first_token=time_to_first_token,
-                prefill_time=prefill_time,
-                decode_time=decode_time,
-                inference_time=inference_time,
-                e2e_latency=e2e_latency,
-                vllm_max_tokens=vllm_max_tokens,
-                compute_reward_time=timing.get("compute_reward_time", 0.0),
-                off_policy_steps=off_policy,
-                server_lane=server_lane,
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="generation",
                 phase="end",
+                sample_id=sample_id,
+                server_id=server_idx,
+                group_id=request_id,
             )
 
     def _log_individual_sample_error_end_event(
         self, request_id: int, sample_idx: int, group: dict,
     ):
-        """Log inference end event for a failed individual-mode sample."""
+        """Log generation end event for a failed individual-mode sample."""
         rollout_info = self.inflight_rollout_info.get(request_id)
         sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
-        off_policy = rollout_info.sample_off_policy_steps.get(sample_idx, 0) if rollout_info else 0
-        timing = rollout_info.sample_timings.get(sample_idx, {}) if rollout_info else {}
 
         server_url = group["server_url"]
         server_idx = self._get_server_index(server_url)
-        server_info = self._get_server_info(server_url)
-        lane_slots = group["lane_slots"]
-        server_lane = lane_slots[sample_idx] if sample_idx < len(lane_slots) and lane_slots[sample_idx] is not None else -1
 
-        now = time.time()
-        self.wandb_logger.log_inference_event(
-            event_type="request",
-            server=server_idx,
-            start_time=timing.get("start_time", now),
-            end_time=timing.get("end_time", now),
-            node_id=server_info.get("node_id", -1),
-            node_ip=str(server_info.get("node_ip") or ""),
-            hostname=str(server_info.get("hostname") or ""),
-            ray_node_id=str(server_info.get("ray_node_id") or ""),
-            tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-            tp_size=int(server_info.get("tp_size", 1)),
-            group_id=request_id,
-            sample_id=sample_id,
-            is_canceled=True,
-            off_policy_steps=off_policy,
-            server_lane=server_lane,
+        self.wandb_logger.event_logger.log_rollout_event(
+            event_type="generation",
             phase="end",
+            sample_id=sample_id,
+            server_id=server_idx,
+            group_id=request_id,
         )
 
     def _on_individual_sample_complete(self, request_id: int, sample_idx: int, result: dict):
@@ -1785,6 +1692,13 @@ class Orchestrator:
             "vllm_logprobs": vllm_logprobs,
             "server_url": server_url,
             "turns": turns_list,
+            "generations": [s["generations"] for s in group_samples],
+            "env_responses": [s["env_responses"] for s in group_samples],
+            "tool_calls": [s["tool_calls"] for s in group_samples],
+            "stop_reasons": [
+                s["data_completion"]["choices"][0].get("finish_reason", "")
+                for s in group_samples
+            ],
             "system_prompt": system_prompt,
             "tokens_system_prompt": tokens_system_prompt,
             "compute_reward_times": compute_reward_times,
@@ -1882,6 +1796,9 @@ class Orchestrator:
             "num_turns": [s["num_turns"] for s in group_samples],
             "stop_reasons": [s["stop_reason"] for s in group_samples],
             "turns": turns_list,
+            "generations": [s["generations"] for s in group_samples],
+            "env_responses": [s["env_responses"] for s in group_samples],
+            "tool_calls": [s["tool_calls"] for s in group_samples],
             "system_prompt": system_prompt,
             "tokens_system_prompt": tokens_system_prompt,
             "compute_reward_times": compute_reward_times,
@@ -2040,7 +1957,7 @@ class Orchestrator:
     def _log_discarded_rollouts(self, result: dict, discard_reason: str):
         """
         Log all samples from a discarded rollout group.
-        
+
         Args:
             result: The rollout result dict from process_group
             discard_reason: Why the group was discarded (e.g. "max_async", "zero_advantage")
@@ -2049,20 +1966,23 @@ class Orchestrator:
         env_name = result.get("env_name", "")
         group_id = result.get("group_id", -1)
         turns_list = result.get("turns", [])  # Per-sample turns
+        generations_list = result.get("generations", [])
+        env_responses_list = result.get("env_responses", [])
+        tool_calls_list = result.get("tool_calls", [])
+        stop_reasons = result.get("stop_reasons", [])
         rewards = result.get("rewards", [])
         advantages = result.get("advantages", [])
         sample_metrics_list = result.get("sample_metrics", [])
         golden_answers_list = result.get("golden_answers", [])
         info_turns_list = result.get("info_turns", [])
         sample_tags_list = result.get("sample_tags", [])
-        request_timings = result.get("request_timings", [])
         system_prompt = result.get("system_prompt", "")
         prompt_token_ids = result.get("prompt_token_ids", [])
         completion_token_ids = result.get("completion_token_ids", [])
         full_token_ids = result.get("full_token_ids", [])  # Full sequence for raw_string
         total_tokens_list = result.get("total_tokens", [])
         compute_reward_times = result.get("compute_reward_times", [])
-        
+
         # Compute tokens_system_prompt and tokens_prompt if we have a tokenizer
         tokens_system_prompt = 0
         tokens_prompt = 0
@@ -2071,21 +1991,21 @@ class Orchestrator:
                 tokens_system_prompt = len(self.tokenizer.encode(system_prompt))
             if prompt_text:
                 tokens_prompt = len(self.tokenizer.encode(prompt_text))
-        
+
         num_samples = len(turns_list)
         pre_assigned = result.get("pre_assigned_sample_ids", {})
-        sample_idx_map: dict[int, int] = {}
-
-        individual_lane_slots = result.get("individual_lane_slots")
 
         for idx in range(num_samples):
-            turns = turns_list[idx] if idx < len(turns_list) else []
             reward = rewards[idx] if idx < len(rewards) else 0.0
             advantage = advantages[idx] if idx < len(advantages) else 0.0
             sample_metrics = sample_metrics_list[idx] if idx < len(sample_metrics_list) else {}
             golden_answers = golden_answers_list[idx] if idx < len(golden_answers_list) else {}
             info_turns = info_turns_list[idx] if idx < len(info_turns_list) else []
             sample_tags = sample_tags_list[idx] if idx < len(sample_tags_list) else {}
+            generations = generations_list[idx] if idx < len(generations_list) else []
+            env_responses = env_responses_list[idx] if idx < len(env_responses_list) else []
+            tool_calls = tool_calls_list[idx] if idx < len(tool_calls_list) else []
+            stop_reason = stop_reasons[idx] if idx < len(stop_reasons) else ""
 
             prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
             comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
@@ -2099,21 +2019,22 @@ class Orchestrator:
                 elif prompt_ids or comp_ids:
                     raw_string = self.tokenizer.decode(prompt_ids + comp_ids, skip_special_tokens=False)
 
-            sample_idx = pre_assigned.get(idx, self.next_sample_idx)
+            sample_id = pre_assigned.get(idx, self.next_sample_idx)
             if idx not in pre_assigned:
                 self.next_sample_idx += 1
-            sample_idx_map[idx] = sample_idx
 
             compute_reward_time = compute_reward_times[idx] if idx < len(compute_reward_times) else 0.0
 
-            self.wandb_logger.log_discarded_rollout(
+            self.wandb_logger.event_logger.log_discarded_generation_rollout(
                 discard_reason=discard_reason,
                 trainer_step=self.trainer_step,
                 inference_step=self.inference_step,
                 group_id=group_id,
-                sample_idx=sample_idx,
+                sample_id=sample_id,
                 prompt=prompt_text,
-                turns=turns,
+                generations=generations,
+                env_responses=env_responses,
+                tool_calls=tool_calls,
                 reward=reward,
                 advantage=advantage,
                 env=env_name,
@@ -2127,17 +2048,7 @@ class Orchestrator:
                 total_tokens=total_tokens,
                 raw_string=raw_string,
                 compute_reward_time=compute_reward_time,
-            )
-
-        # Skip if inference end events were already logged per-sample (individual mode)
-        if not result.get("inference_events_logged_per_sample"):
-            self._log_inference_request_events(
-                request_timings=request_timings,
-                group_id=group_id,
-                server_url=result.get("server_url", ""),
-                sample_idx_map=sample_idx_map,
-                off_policy_steps=result.get("off_policy_steps"),
-                individual_lane_slots=individual_lane_slots,
+                stop_reason=stop_reason,
             )
 
     def _log_kept_rollout_group(self, result: dict):
@@ -2154,13 +2065,16 @@ class Orchestrator:
         env_name = result.get("env_name", "")
         group_id = result.get("group_id", -1)
         turns_list = result.get("turns", [])  # Per-sample turns
+        generations_list = result.get("generations", [])
+        env_responses_list = result.get("env_responses", [])
+        tool_calls_list = result.get("tool_calls", [])
+        stop_reasons = result.get("stop_reasons", [])
         rewards = result.get("rewards", [])
         advantages = result.get("advantages", [])
         sample_metrics_list = result.get("sample_metrics", [])
         golden_answers_list = result.get("golden_answers", [])
         info_turns_list = result.get("info_turns", [])
         sample_tags_list = result.get("sample_tags", [])
-        request_timings = result.get("request_timings", [])
         system_prompt = result.get("system_prompt", "")
         prompt_token_ids = result.get("prompt_token_ids", [])
         completion_token_ids = result.get("completion_token_ids", [])
@@ -2179,18 +2093,18 @@ class Orchestrator:
 
         num_samples = len(turns_list)
         pre_assigned = result.get("pre_assigned_sample_ids", {})
-        sample_idx_map: dict[int, int] = {}
-
-        individual_lane_slots = result.get("individual_lane_slots")
 
         for idx in range(num_samples):
-            turns = turns_list[idx] if idx < len(turns_list) else []
             reward = rewards[idx] if idx < len(rewards) else 0.0
             advantage = advantages[idx] if idx < len(advantages) else 0.0
             sample_metrics = sample_metrics_list[idx] if idx < len(sample_metrics_list) else {}
             golden_answers = golden_answers_list[idx] if idx < len(golden_answers_list) else {}
             info_turns = info_turns_list[idx] if idx < len(info_turns_list) else []
             sample_tags = sample_tags_list[idx] if idx < len(sample_tags_list) else {}
+            generations = generations_list[idx] if idx < len(generations_list) else []
+            env_responses = env_responses_list[idx] if idx < len(env_responses_list) else []
+            tool_calls = tool_calls_list[idx] if idx < len(tool_calls_list) else []
+            stop_reason = stop_reasons[idx] if idx < len(stop_reasons) else ""
 
             prompt_ids = prompt_token_ids[idx] if idx < len(prompt_token_ids) else []
             comp_ids = completion_token_ids[idx] if idx < len(completion_token_ids) else []
@@ -2204,19 +2118,20 @@ class Orchestrator:
                 elif prompt_ids or comp_ids:
                     raw_string = self.tokenizer.decode(prompt_ids + comp_ids, skip_special_tokens=False)
 
-            sample_idx = pre_assigned.get(idx, self.next_sample_idx)
+            sample_id = pre_assigned.get(idx, self.next_sample_idx)
             if idx not in pre_assigned:
                 self.next_sample_idx += 1
-            sample_idx_map[idx] = sample_idx
 
             compute_reward_time = compute_reward_times[idx] if idx < len(compute_reward_times) else 0.0
 
-            self.wandb_logger.event_logger.log_rollout(
+            self.wandb_logger.event_logger.log_generation_rollout(
                 step=self.inference_step,
                 group_id=group_id,
-                sample_idx=sample_idx,
+                sample_id=sample_id,
                 prompt=prompt_text,
-                turns=turns,
+                generations=generations,
+                env_responses=env_responses,
+                tool_calls=tool_calls,
                 reward=reward,
                 advantage=advantage,
                 env=env_name,
@@ -2230,17 +2145,7 @@ class Orchestrator:
                 total_tokens=total_tokens,
                 raw_string=raw_string,
                 compute_reward_time=compute_reward_time,
-            )
-
-        # Skip if inference end events were already logged per-sample (individual mode)
-        if not result.get("inference_events_logged_per_sample"):
-            self._log_inference_request_events(
-                request_timings=request_timings,
-                group_id=group_id,
-                server_url=result.get("server_url", ""),
-                sample_idx_map=sample_idx_map,
-                off_policy_steps=result.get("off_policy_steps"),
-                individual_lane_slots=individual_lane_slots,
+                stop_reason=stop_reason,
             )
 
     def _log_inference_request_events(
@@ -2252,19 +2157,11 @@ class Orchestrator:
         off_policy_steps: dict[int, int] | None = None,
         individual_lane_slots: list[int] | None = None,
     ):
-        """Log inference request timings with exact sample/group mapping."""
+        """Log generation end events for request timings with exact sample/group mapping."""
         if not request_timings:
             return
 
         server_idx = self._get_server_index(server_url)
-        server_info = self._get_server_info(server_url)
-        node_id = server_info.get("node_id", -1)
-        node_ip = str(server_info.get("node_ip") or "")
-        hostname = str(server_info.get("hostname") or "")
-        ray_node_id = str(server_info.get("ray_node_id") or "")
-        tp_group_id = int(server_info.get("tp_group_id", server_idx))
-        tp_size = int(server_info.get("tp_size", 1))
-        _off_policy = off_policy_steps or {}
         for timing in request_timings:
             # Skip if already logged by lifecycle callback at generation-complete time
             if timing.get("inference_end_logged"):
@@ -2272,66 +2169,12 @@ class Orchestrator:
             sample_idx_in_group = timing.get("sample_idx_in_group", -1)
             sample_id = sample_idx_map.get(sample_idx_in_group, -1)
 
-            # Extract vLLM request ID and look up OTLP span data.
-            # Prefer pre-fetched timing (stored by _fetch_otlp_timing_for_result
-            # at sample completion time) to avoid stale/missing lookups.
-            vllm_request_id = timing.get("vllm_request_id", "")
-            vllm_max_tokens = timing.get("max_tokens", 0)
-            queue_time = 0.0
-            time_to_first_token = 0.0
-            prefill_time = 0.0
-            decode_time = 0.0
-            inference_time = 0.0
-            e2e_latency = 0.0
-
-            span_data = timing.pop("otlp_timing", None)
-            if span_data is None and self.otlp_receiver is not None and vllm_request_id:
-                # Fallback: try live lookup (may miss if BSP hasn't flushed
-                # or span was already pruned).
-                span_key = f"{vllm_request_id}-0"
-                span_data = self.otlp_receiver.get_and_remove(span_key)
-                if span_data is None:
-                    span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
-            if span_data is not None:
-                queue_time = span_data.get("queue_time") or 0.0
-                time_to_first_token = span_data.get("time_to_first_token") or 0.0
-                prefill_time = span_data.get("prefill_time") or 0.0
-                decode_time = span_data.get("decode_time") or 0.0
-                inference_time = span_data.get("inference_time") or 0.0
-                e2e_latency = span_data.get("e2e_latency") or 0.0
-
-            if individual_lane_slots is not None and sample_idx_in_group < len(individual_lane_slots):
-                server_lane = individual_lane_slots[sample_idx_in_group]
-            else:
-                server_lane = -1
-
-            self.wandb_logger.log_inference_event(
-                event_type="request",
-                server=server_idx,
-                start_time=timing["start_time"],
-                end_time=timing["end_time"],
-                node_id=node_id,
-                node_ip=node_ip,
-                hostname=hostname,
-                ray_node_id=ray_node_id,
-                tp_group_id=tp_group_id,
-                tp_size=tp_size,
-                prompt_tokens=timing.get("prompt_tokens", 0),
-                rollout_tokens=timing.get("rollout_tokens", 0),
-                group_id=group_id,
-                sample_id=sample_id,
-                vllm_request_id=vllm_request_id,
-                queue_time=queue_time,
-                time_to_first_token=time_to_first_token,
-                prefill_time=prefill_time,
-                decode_time=decode_time,
-                inference_time=inference_time,
-                e2e_latency=e2e_latency,
-                vllm_max_tokens=vllm_max_tokens,
-                compute_reward_time=timing.get("compute_reward_time", 0.0),
-                off_policy_steps=_off_policy.get(sample_idx_in_group, 0),
-                server_lane=server_lane,
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="generation",
                 phase="end",
+                sample_id=sample_id,
+                server_id=server_idx,
+                group_id=group_id,
             )
 
     def _try_start_pending_rollouts(self):
@@ -2584,17 +2427,18 @@ class Orchestrator:
             weight_sync_events = []
 
         for event in weight_sync_events:
-            self.wandb_logger.log_inference_event(
-                event_type="weight_broadcast",
-                server=event.get("server", -1),
-                start_time=event.get("start_time", time.time()),
-                end_time=event.get("end_time", time.time()),
-                node_id=event.get("node_id", -1),
-                node_ip=str(event.get("node_ip", "")),
-                hostname=str(event.get("hostname", "")),
-                ray_node_id=str(event.get("ray_node_id", "")),
-                tp_group_id=int(event.get("tp_group_id", event.get("server", -1))),
-                tp_size=int(event.get("tp_size", 1)),
+            self.wandb_logger.event_logger.log_infra_event(
+                event_type="weight_sync",
+                phase="start",
+                timestamp=event.get("start_time", time.time()),
+                server_id=event.get("server", -1),
+                step=step,
+            )
+            self.wandb_logger.event_logger.log_infra_event(
+                event_type="weight_sync",
+                phase="end",
+                timestamp=event.get("end_time", time.time()),
+                server_id=event.get("server", -1),
                 step=step,
             )
 
@@ -2889,7 +2733,7 @@ class Orchestrator:
                 step=step,
             )
 
-            # Log individual sample results as EvalRollout/EvalPrompt + inference events
+            # Log individual sample results as EvalGenerationRollout/EvalPrompt + rollout events
             all_server_urls = list(self.inference_group.server_urls) if self.inference_group else []
             sample_results = result.get("sample_results", [])
 
@@ -2907,59 +2751,16 @@ class Orchestrator:
                 self.next_request_id += 1
                 eval_group_id = eval_group_ids[sr.sample_idx]
 
-                # Log inference event with is_eval=True
+                # Log generation end rollout event for eval
                 if sr.start_time and sr.end_time and sr.server_url:
                     server_idx = all_server_urls.index(sr.server_url) if sr.server_url in all_server_urls else -1
-                    server_info = self._get_server_info(sr.server_url)
 
-                    vllm_request_id = sr.vllm_request_id
-                    vllm_max_tokens = sr.max_tokens
-                    queue_time = 0.0
-                    time_to_first_token = 0.0
-                    prefill_time = 0.0
-                    decode_time = 0.0
-                    inference_time = 0.0
-                    e2e_latency = 0.0
-
-                    if self.otlp_receiver is not None and vllm_request_id:
-                        span_key = f"{vllm_request_id}-0"
-                        span_data = self.otlp_receiver.get_and_remove(span_key)
-                        if span_data is None:
-                            span_data = self.otlp_receiver.get_and_remove(vllm_request_id)
-                        if span_data is not None:
-                            queue_time = span_data.get("queue_time") or 0.0
-                            time_to_first_token = span_data.get("time_to_first_token") or 0.0
-                            prefill_time = span_data.get("prefill_time") or 0.0
-                            decode_time = span_data.get("decode_time") or 0.0
-                            inference_time = span_data.get("inference_time") or 0.0
-                            e2e_latency = span_data.get("e2e_latency") or 0.0
-
-                    self.wandb_logger.log_inference_event(
-                        event_type="request",
-                        server=server_idx,
-                        start_time=sr.start_time,
-                        end_time=sr.end_time,
-                        node_id=server_info.get("node_id", -1),
-                        node_ip=str(server_info.get("node_ip", "")),
-                        hostname=str(server_info.get("hostname", "")),
-                        ray_node_id=str(server_info.get("ray_node_id", "")),
-                        tp_group_id=int(server_info.get("tp_group_id", server_idx)),
-                        tp_size=int(server_info.get("tp_size", 1)),
-                        prompt_tokens=sr.prompt_tokens,
-                        rollout_tokens=sr.rollout_tokens,
-                        group_id=eval_group_id,
-                        sample_id=eval_sample_id,
-                        vllm_request_id=vllm_request_id,
-                        queue_time=queue_time,
-                        time_to_first_token=time_to_first_token,
-                        prefill_time=prefill_time,
-                        decode_time=decode_time,
-                        inference_time=inference_time,
-                        e2e_latency=e2e_latency,
-                        vllm_max_tokens=vllm_max_tokens,
-                        is_eval=True,
-                        compute_reward_time=sr.compute_eval_metrics_time,
+                    self.wandb_logger.event_logger.log_rollout_event(
+                        event_type="generation",
                         phase="end",
+                        sample_id=eval_sample_id,
+                        server_id=server_idx,
+                        group_id=eval_group_id,
                     )
 
                 tokens_prompt = 0
@@ -2982,32 +2783,44 @@ class Orchestrator:
                     tokens_system_prompt=tokens_system_prompt,
                 ))
 
-                # Convert turns dicts to RolloutTurn objects
-                rollout_turns = [
-                    RolloutTurn(
-                        turn_order=t.get("turn_order", 0),
-                        turn_type=t.get("turn_type", "model"),
-                        content=t.get("content", ""),
-                        tokens=t.get("tokens", 0),
-                        stop_reason=t.get("stop_reason", ""),
-                        environment_response_time=t.get("environment_response_time", 0.0),
-                    )
-                    for t in sr.turns
-                ]
+                # Build generation/env_response records from turns
+                eval_generations: list[GenerationRecord] = []
+                eval_env_responses: list[EnvResponseRecord] = []
+                gen_idx = 0
+                for t in sr.turns:
+                    turn_type = t.get("turn_type", "model")
+                    if turn_type == "model":
+                        eval_generations.append(GenerationRecord(
+                            generation_idx=gen_idx,
+                            content=t.get("content", ""),
+                            tokens=t.get("tokens", 0),
+                            stop_reason=t.get("stop_reason", ""),
+                        ))
+                        gen_idx += 1
+                    else:
+                        eval_env_responses.append(EnvResponseRecord(
+                            generation_idx=max(0, gen_idx - 1),
+                            content=t.get("content", ""),
+                            turn_type=turn_type,
+                            tokens=t.get("tokens", 0),
+                            response_time=t.get("environment_response_time", 0.0),
+                        ))
 
-                self.wandb_logger.log_eval_rollout(EvalRollout(
+                self.wandb_logger.log_eval_rollout(EvalGenerationRollout(
                     step=step,
                     eval_name=eval_name,
                     model_step=model_step,
                     sample_idx=sr.sample_idx,
                     completion_idx=sr.completion_idx,
                     env=sr.env_name or eval_name,
-                    turns=rollout_turns,
+                    generations=eval_generations,
+                    env_responses=eval_env_responses,
                     sample_metrics=sr.metrics,
                     golden_answers=sr.golden_answers,
                     info_turns=sr.info_turns,
                     sample_tags=sr.sample_tags,
                     compute_eval_metrics_time=sr.compute_eval_metrics_time,
+                    stop_reason=sr.stop_reason or "",
                 ))
 
         self.wandb_logger.log_orchestrator_timeline_event(f"eval_{label}_done", step=step)
