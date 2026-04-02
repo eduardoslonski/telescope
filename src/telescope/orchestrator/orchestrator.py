@@ -2201,7 +2201,6 @@ class Orchestrator:
 
         for idx in range(num_samples):
             sample_id = sample_ids.get(idx, -1)
-            _log.debug(f"Cancelled sample: group_id={request_id}, sample_id={sample_id}, reason={cancel_reason}, env={env_name}, off_policy={off_policy_steps_map.get(idx, 0)}")
 
             self.wandb_logger.event_logger.log_cancelled_generation_rollout(
                 cancel_reason=cancel_reason,
