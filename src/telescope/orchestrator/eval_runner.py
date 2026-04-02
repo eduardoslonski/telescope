@@ -93,6 +93,7 @@ class EvalSampleResult:
     max_tokens: int = 0
     system_prompt: str = ""
     env_name: str = ""
+    sample_id: int = -1
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +625,7 @@ class EvalRunner:
             max_tokens=actual_max_tokens,
             system_prompt=system_prompt,
             env_name=actual_env_name,
+            sample_id=sample_id,
         )
 
     async def _eval_multiturn(
@@ -726,6 +728,7 @@ class EvalRunner:
             max_tokens=last_max_tokens,
             system_prompt=system_prompt,
             env_name=actual_env_name,
+            sample_id=sample_id,
         )
 
     async def _collect_eval_results(

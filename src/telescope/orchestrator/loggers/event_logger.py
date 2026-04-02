@@ -496,6 +496,7 @@ PROMPTS_EVAL_SCHEMA = pa.schema([
     ("eval_name", pa.string()),
     ("model_step", pa.int32()),
     ("sample_idx", pa.int32()),   # Index in the eval dataset (not renamed, eval-specific)
+    ("sample_id", pa.int32()),    # Globally unique sample ID (correlates with events_rollout)
     ("env", pa.string()),
     ("prompt", pa.string()),
     ("tokens_prompt", pa.int32()),
@@ -509,6 +510,7 @@ GENERATIONS_EVAL_SCHEMA = pa.schema([
     ("eval_name", pa.string()),
     ("model_step", pa.int32()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("agent_id", pa.int32()),
     ("generation_idx", pa.int32()),
@@ -525,6 +527,7 @@ ENV_RESPONSES_EVAL_SCHEMA = pa.schema([
     ("eval_name", pa.string()),
     ("model_step", pa.int32()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("agent_id", pa.int32()),
     ("generation_idx", pa.int32()),
@@ -540,6 +543,7 @@ TOOL_CALLS_EVAL_SCHEMA = pa.schema([
     ("eval_name", pa.string()),
     ("model_step", pa.int32()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("agent_id", pa.int32()),
     ("generation_idx", pa.int32()),
@@ -563,6 +567,7 @@ SAMPLES_DATA_EVAL_SCHEMA = pa.schema([
     ("eval_name", pa.string()),
     ("model_step", pa.int32()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("env", pa.string()),
     ("num_generations", pa.int32()),
@@ -575,6 +580,7 @@ ROLLOUTS_METRICS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("env", pa.string()),
     ("metric_name", pa.string()),
@@ -586,6 +592,7 @@ GOLDEN_ANSWERS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("env", pa.string()),
     ("key", pa.string()),
@@ -597,6 +604,7 @@ INFO_TURNS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("agent_id", pa.int32()),
     ("generation_idx", pa.int32()),
@@ -612,6 +620,7 @@ SAMPLE_TAGS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("env", pa.string()),
     ("tag_name", pa.string()),
@@ -836,6 +845,7 @@ class EvalPrompt:
     tokens_prompt: int = 0
     system_prompt: str = ""
     tokens_system_prompt: int = 0
+    sample_id: int = -1  # Globally unique sample ID (correlates with events_rollout)
     tail_idx: int = -1
 
 
@@ -849,6 +859,7 @@ class EvalGenerationRollout:
     completion_idx: int  # 0..max(pass_k)-1
     env: str = ""
     agent_id: int = 0
+    sample_id: int = -1  # Globally unique sample ID (correlates with events_rollout)
     generations: list[GenerationRecord] = field(default_factory=list)
     env_responses: list[EnvResponseRecord] = field(default_factory=list)
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
@@ -2608,6 +2619,7 @@ class EventLogger:
             "eval_name": [p.eval_name for p in prompts],
             "model_step": [p.model_step for p in prompts],
             "sample_idx": [p.sample_idx for p in prompts],
+            "sample_id": [p.sample_id for p in prompts],
             "env": [p.env for p in prompts],
             "prompt": [p.prompt for p in prompts],
             "tokens_prompt": [p.tokens_prompt for p in prompts],
@@ -2622,7 +2634,7 @@ class EventLogger:
         if not rollouts:
             return pa.table({col: pa.array([], type=field.type) for col, field in zip(GENERATIONS_EVAL_SCHEMA.names, GENERATIONS_EVAL_SCHEMA)})
 
-        steps, eval_names, model_steps, sample_idxs, comp_idxs, agent_ids = [], [], [], [], [], []
+        steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
         gen_idxs, contents, tokens_list, prompt_tokens_list = [], [], [], []
         tool_call_counts, stop_reasons, tail_idxs = [], [], []
 
@@ -2632,6 +2644,7 @@ class EventLogger:
                 eval_names.append(r.eval_name)
                 model_steps.append(r.model_step)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 agent_ids.append(r.agent_id)
                 gen_idxs.append(g.generation_idx)
@@ -2644,7 +2657,8 @@ class EventLogger:
 
         return pa.table({
             "step": steps, "eval_name": eval_names, "model_step": model_steps,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs, "agent_id": agent_ids,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs, "agent_id": agent_ids,
             "generation_idx": gen_idxs, "content": contents, "tokens": tokens_list,
             "prompt_tokens": prompt_tokens_list, "tool_call_count": tool_call_counts,
             "stop_reason": stop_reasons, "tail_idx": tail_idxs,
@@ -2655,7 +2669,7 @@ class EventLogger:
         if not rollouts:
             return pa.table({col: pa.array([], type=field.type) for col, field in zip(ENV_RESPONSES_EVAL_SCHEMA.names, ENV_RESPONSES_EVAL_SCHEMA)})
 
-        steps, eval_names, model_steps, sample_idxs, comp_idxs, agent_ids = [], [], [], [], [], []
+        steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
         gen_idxs, contents, turn_types, tokens_list, response_times, tail_idxs = [], [], [], [], [], []
 
         for r in rollouts:
@@ -2664,6 +2678,7 @@ class EventLogger:
                 eval_names.append(r.eval_name)
                 model_steps.append(r.model_step)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 agent_ids.append(r.agent_id)
                 gen_idxs.append(e.generation_idx)
@@ -2675,7 +2690,8 @@ class EventLogger:
 
         return pa.table({
             "step": steps, "eval_name": eval_names, "model_step": model_steps,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs, "agent_id": agent_ids,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs, "agent_id": agent_ids,
             "generation_idx": gen_idxs, "content": contents, "turn_type": turn_types,
             "tokens": tokens_list, "response_time": response_times, "tail_idx": tail_idxs,
         }, schema=ENV_RESPONSES_EVAL_SCHEMA)
@@ -2685,7 +2701,7 @@ class EventLogger:
         if not rollouts:
             return pa.table({col: pa.array([], type=field.type) for col, field in zip(TOOL_CALLS_EVAL_SCHEMA.names, TOOL_CALLS_EVAL_SCHEMA)})
 
-        steps, eval_names, model_steps, sample_idxs, comp_idxs, agent_ids = [], [], [], [], [], []
+        steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
         gen_idxs, tc_idxs, env_resp_gen_idxs = [], [], []
         tool_names, arguments_list, raw_texts, results = [], [], [], []
         successes, errors, exit_codes, truncateds = [], [], [], []
@@ -2697,6 +2713,7 @@ class EventLogger:
                 eval_names.append(r.eval_name)
                 model_steps.append(r.model_step)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 agent_ids.append(r.agent_id)
                 gen_idxs.append(tc.generation_idx)
@@ -2716,7 +2733,8 @@ class EventLogger:
 
         return pa.table({
             "step": steps, "eval_name": eval_names, "model_step": model_steps,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs, "agent_id": agent_ids,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs, "agent_id": agent_ids,
             "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
             "env_response_generation_idx": env_resp_gen_idxs,
             "tool_name": tool_names, "arguments": arguments_list, "raw_text": raw_texts,
@@ -2734,6 +2752,7 @@ class EventLogger:
             "eval_name": [r.eval_name for r in rollouts],
             "model_step": [r.model_step for r in rollouts],
             "sample_idx": [r.sample_idx for r in rollouts],
+            "sample_id": [r.sample_id for r in rollouts],
             "completion_idx": [r.completion_idx for r in rollouts],
             "env": [r.env for r in rollouts],
             "num_generations": [len(r.generations) for r in rollouts],
@@ -2746,12 +2765,13 @@ class EventLogger:
         """Convert eval rollouts' metrics to a normalized table (one row per metric per sample)."""
         if not rollouts:
             return pa.table({col: pa.array([], type=field.type) for col, field in zip(ROLLOUTS_METRICS_EVAL_SCHEMA.names, ROLLOUTS_METRICS_EVAL_SCHEMA)})
-        steps, eval_names, sample_idxs, comp_idxs, envs, metric_names, values, tail_idxs = [], [], [], [], [], [], [], []
+        steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, metric_names, values, tail_idxs = [], [], [], [], [], [], [], [], []
         for r in rollouts:
             for metric_name, value in r.sample_metrics.items():
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 envs.append(r.env)
                 metric_names.append(metric_name)
@@ -2759,7 +2779,8 @@ class EventLogger:
                 tail_idxs.append(r.tail_idx)
         return pa.table({
             "step": steps, "eval_name": eval_names,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs,
             "env": envs, "metric_name": metric_names,
             "value": values, "tail_idx": tail_idxs,
         }, schema=ROLLOUTS_METRICS_EVAL_SCHEMA)
@@ -2768,12 +2789,13 @@ class EventLogger:
         """Convert eval rollouts' golden answers to a normalized table (one row per answer per sample)."""
         if not rollouts:
             return pa.table({col: pa.array([], type=field.type) for col, field in zip(GOLDEN_ANSWERS_EVAL_SCHEMA.names, GOLDEN_ANSWERS_EVAL_SCHEMA)})
-        steps, eval_names, sample_idxs, comp_idxs, envs, keys, values, tail_idxs = [], [], [], [], [], [], [], []
+        steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, keys, values, tail_idxs = [], [], [], [], [], [], [], [], []
         for r in rollouts:
             for key, value in r.golden_answers.items():
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 envs.append(r.env)
                 keys.append(key)
@@ -2781,7 +2803,8 @@ class EventLogger:
                 tail_idxs.append(r.tail_idx)
         return pa.table({
             "step": steps, "eval_name": eval_names,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs,
             "env": envs, "key": keys, "value": values, "tail_idx": tail_idxs,
         }, schema=GOLDEN_ANSWERS_EVAL_SCHEMA)
 
@@ -2789,7 +2812,7 @@ class EventLogger:
         """Convert eval rollouts' info_turns to a normalized table (one row per info item)."""
         if not rollouts:
             return pa.table({col: pa.array([], type=field.type) for col, field in zip(INFO_TURNS_EVAL_SCHEMA.names, INFO_TURNS_EVAL_SCHEMA)})
-        steps, eval_names, sample_idxs, comp_idxs, agent_ids = [], [], [], [], []
+        steps, eval_names, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], []
         gen_idxs, tc_idxs, envs = [], [], []
         info_keys, info_values, info_types, tail_idxs = [], [], [], []
         for r in rollouts:
@@ -2797,6 +2820,7 @@ class EventLogger:
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 agent_ids.append(r.agent_id)
                 gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
@@ -2808,7 +2832,8 @@ class EventLogger:
                 tail_idxs.append(r.tail_idx)
         return pa.table({
             "step": steps, "eval_name": eval_names,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs,
             "agent_id": agent_ids, "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
             "env": envs, "info_key": info_keys, "info_value": info_values,
             "info_type": info_types, "tail_idx": tail_idxs,
@@ -2818,12 +2843,13 @@ class EventLogger:
         """Convert eval rollouts' sample_tags to a normalized table (one row per tag per sample)."""
         if not rollouts:
             return pa.table({col: pa.array([], type=field.type) for col, field in zip(SAMPLE_TAGS_EVAL_SCHEMA.names, SAMPLE_TAGS_EVAL_SCHEMA)})
-        steps, eval_names, sample_idxs, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], []
+        steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], [], []
         for r in rollouts:
             for tag_name, tag_value in r.sample_tags.items():
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 envs.append(r.env)
                 tag_names.append(tag_name)
@@ -2831,7 +2857,8 @@ class EventLogger:
                 tail_idxs.append(r.tail_idx)
         return pa.table({
             "step": steps, "eval_name": eval_names,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs,
             "env": envs, "tag_name": tag_names,
             "tag_value": tag_values, "tail_idx": tail_idxs,
         }, schema=SAMPLE_TAGS_EVAL_SCHEMA)

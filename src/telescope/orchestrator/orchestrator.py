@@ -2803,6 +2803,7 @@ class Orchestrator:
                     tokens_prompt=tokens_prompt,
                     system_prompt=sr.system_prompt,
                     tokens_system_prompt=tokens_system_prompt,
+                    sample_id=sr.sample_id,
                 ))
 
                 # Build generation/env_response records from turns
@@ -2835,6 +2836,7 @@ class Orchestrator:
                     sample_idx=sr.sample_idx,
                     completion_idx=sr.completion_idx,
                     env=sr.env_name or eval_name,
+                    sample_id=sr.sample_id,
                     generations=eval_generations,
                     env_responses=eval_env_responses,
                     sample_metrics=sr.metrics,
