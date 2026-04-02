@@ -728,7 +728,6 @@ class ToolEnvironment(MultiTurnEnvironment):
             state.custom["tools_by_name"][result.tool_name] += 1
 
             # Build structured tool call record for generation-centric logging
-            import json
             pending_tool_calls.append({
                 "tool_name": call.name,
                 "arguments": json.dumps(call.arguments) if isinstance(call.arguments, dict) else str(call.arguments),

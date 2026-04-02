@@ -1505,17 +1505,6 @@ class Orchestrator:
         # Lanes freed — try to dispatch new groups immediately.
         self._try_start_pending_rollouts()
 
-    def _log_individual_sample_end_event(
-        self, request_id: int, sample_idx: int, result: dict, group: dict,
-    ):
-        """Placeholder for individual-mode sample completion.
-
-        The generation start/end events are emitted per-turn by the
-        on_generation_start/end lifecycle callbacks inside the rollout loop.
-        This method is kept as a hook point but does not emit events.
-        """
-        pass
-
     def _log_individual_sample_error_end_event(
         self, request_id: int, sample_idx: int, group: dict,
     ):
@@ -1545,12 +1534,9 @@ class Orchestrator:
         group["samples"][sample_idx] = result
         group["remaining"] -= 1
 
-        # Log end event for this sample immediately (per-sample, not waiting for group)
-        if not generate_module._shutting_down:
-            if "error" not in result:
-                self._log_individual_sample_end_event(request_id, sample_idx, result, group)
-            else:
-                self._log_individual_sample_error_end_event(request_id, sample_idx, group)
+        # Log end event for failed samples (success events are emitted by lifecycle callbacks)
+        if not generate_module._shutting_down and "error" in result:
+            self._log_individual_sample_error_end_event(request_id, sample_idx, group)
 
         _log.debug(
             f"Individual sample complete: request_id={request_id}, "
