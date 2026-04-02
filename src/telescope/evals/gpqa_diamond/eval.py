@@ -116,7 +116,7 @@ class GpqaDiamondEval(Eval):
         logger.info(f"Loaded {len(samples)} samples for {self.name}")
         return samples
 
-    def compute_eval_metrics(
+    async def compute_eval_metrics(
         self,
         completion: str,
         sample: Sample,

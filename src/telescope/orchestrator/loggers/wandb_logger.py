@@ -597,206 +597,54 @@ class WandbLogger:
             sample_id=sample_id,
         )
 
-    def log_inference_event(
+    def log_rollout_event(
         self,
         event_type: str,
-        server: int,
-        start_time: float,
-        end_time: float,
-        node_id: int = -1,
-        node_ip: str = "",
-        hostname: str = "",
-        ray_node_id: str = "",
-        tp_group_id: int = -1,
-        tp_size: int = 1,
-        prompt_tokens: int = 0,
-        rollout_tokens: int = 0,
+        phase: str,
+        timestamp: float | None = None,
         group_id: int = -1,
         sample_id: int = -1,
-        vllm_request_id: str = "",
-        queue_time: float = 0.0,
-        time_to_first_token: float = 0.0,
-        prefill_time: float = 0.0,
-        decode_time: float = 0.0,
-        inference_time: float = 0.0,
-        e2e_latency: float = 0.0,
-        vllm_max_tokens: int = 0,
-        is_eval: bool = False,
-        is_canceled: bool = False,
-        compute_reward_time: float = 0.0,
-        step: int = -1,
-        off_policy_steps: int = 0,
+        agent_id: int = 0,
+        generation_idx: int = -1,
+        tool_call_idx: int = -1,
+        server_id: int = -1,
         server_lane: int = -1,
-        phase: str = "",
     ):
-        """
-        Log an inference event (request or weight broadcast).
-
-        Args:
-            event_type: "request" or "weight_broadcast"
-            server: Server index (0, 1, ...)
-            start_time: Event start timestamp
-            end_time: Event end timestamp
-            prompt_tokens: Number of prompt tokens (for requests)
-            rollout_tokens: Number of generated tokens (for requests)
-            group_id: Request group ID (shared by all rollouts in a group)
-            sample_id: Run-wide unique sample index (requests only)
-            vllm_request_id: vLLM request ID (e.g. "cmpl-abc123")
-            queue_time: Time in vLLM queue (from OTLP span)
-            time_to_first_token: TTFT from vLLM (from OTLP span)
-            prefill_time: Model prefill time (from OTLP span)
-            decode_time: Model decode time (from OTLP span)
-            inference_time: prefill + decode (from OTLP span)
-            e2e_latency: End-to-end latency inside vLLM (from OTLP span)
-            vllm_max_tokens: max_tokens param for this request
-            is_eval: Whether this is an eval request (not training)
-            is_canceled: Whether this request was cancelled before completing
-            compute_reward_time: Time for compute_reward or compute_eval_metrics (seconds)
-            step: Training step (populated for weight_broadcast events, -1 for requests)
-            off_policy_steps: Number of weight updates since this rollout was dispatched
-            phase: "start" or "end" (empty for weight_broadcast events)
-        """
+        """Log a rollout lifecycle event (generation, tool_execution, env_response, reward)."""
         if not config.cfg.use_wandb:
             return
-
-        server_idx = self._as_int(server, default=-1)
-        server_info = self._inference_server_by_idx.get(server_idx, {})
-        (
-            resolved_node_id,
-            resolved_node_ip,
-            resolved_hostname,
-            resolved_ray_node_id,
-        ) = self._resolve_node_identity(
-            node_id=self._as_int(node_id, default=-1),
-            node_ip=str(node_ip or server_info.get("node_ip") or ""),
-            hostname=str(hostname or server_info.get("hostname") or ""),
-            ray_node_id=str(ray_node_id or server_info.get("ray_node_id") or ""),
-        )
-        resolved_tp_group_id = self._as_int(
-            tp_group_id
-            if tp_group_id != -1
-            else server_info.get("tp_group_id", server_idx if server_idx >= 0 else -1)
-        )
-        server_tp_size = self._as_int(server_info.get("tp_size", 1), default=1)
-        resolved_tp_size = self._as_int(
-            tp_size
-            if tp_size > 0
-            else max(1, server_tp_size),
-            default=1,
-        )
-
-        self.event_logger.log_inference_event(
+        self.event_logger.log_rollout_event(
             event_type=event_type,
-            server=server_idx,
-            start_time=start_time,
-            end_time=end_time,
-            node_id=resolved_node_id,
-            node_ip=resolved_node_ip,
-            hostname=resolved_hostname,
-            ray_node_id=resolved_ray_node_id,
-            tp_group_id=resolved_tp_group_id,
-            tp_size=resolved_tp_size,
-            prompt_tokens=prompt_tokens,
-            rollout_tokens=rollout_tokens,
+            phase=phase,
+            timestamp=timestamp,
             group_id=group_id,
             sample_id=sample_id,
-            vllm_request_id=vllm_request_id,
-            queue_time=queue_time,
-            time_to_first_token=time_to_first_token,
-            prefill_time=prefill_time,
-            decode_time=decode_time,
-            inference_time=inference_time,
-            e2e_latency=e2e_latency,
-            vllm_max_tokens=vllm_max_tokens,
-            is_eval=is_eval,
-            is_canceled=is_canceled,
-            compute_reward_time=compute_reward_time,
-            step=step,
-            off_policy_steps=off_policy_steps,
+            agent_id=agent_id,
+            generation_idx=generation_idx,
+            tool_call_idx=tool_call_idx,
+            server_id=server_id,
             server_lane=server_lane,
-            phase=phase,
         )
 
-    def log_discarded_rollout(
+    def log_infra_event(
         self,
-        discard_reason: str,
-        trainer_step: int,
-        inference_step: int,
-        group_id: int,
-        sample_idx: int,
-        prompt: str,
-        turns: list[dict] | None,
-        reward: float,
-        advantage: float,
-        env: str = "",
-        sample_metrics: dict[str, float] | None = None,
-        golden_answers: dict[str, str | None] | None = None,
-        info_turns: list[dict] | None = None,
-        sample_tags: dict[str, str] | None = None,
-        tokens_prompt: int = 0,
-        system_prompt: str = "",
-        tokens_system_prompt: int = 0,
-        total_tokens: int = 0,
-        raw_string: str = "",
-        compute_reward_time: float = 0.0,
+        event_type: str,
+        phase: str,
+        timestamp: float | None = None,
+        step: int = -1,
+        server_id: int = -1,
+        sandbox_id: str = "",
     ):
-        """
-        Log a discarded rollout sample.
-
-        These are rollouts that were not sent to the trainer due to:
-        - max_async: Async level exceeded the maximum allowed
-        - zero_advantage: All samples in the group had zero advantage
-
-        Args:
-            discard_reason: Why the rollout was discarded (e.g. "max_async", "zero_advantage")
-            trainer_step: Current trainer step at the time of discarding
-            inference_step: Current inference step (what step this rollout would have been for)
-            group_id: Request group ID (shared by all completions with same prompt)
-            sample_idx: Run-wide unique sample index (starts at 0, grows throughout run)
-            prompt: Input prompt text (for the prompts_discarded table)
-            turns: List of turn dicts with keys:
-                   - "turn_order": int (0, 1, 2, ...)
-                   - "turn_type": str ("model" or env-provided type)
-                   - "content": str (the text content)
-                   - "tokens": int (number of tokens for this turn)
-            reward: Total reward
-            advantage: Computed advantage
-            env: Environment name (e.g. "countdown", "coding")
-            sample_metrics: Dict of per-sample metric names to float values
-            golden_answers: Dict mapping golden answer keys to their values
-            info_turns: List of per-turn text info dicts (see EventLogger.log_rollout)
-            sample_tags: Dict of per-sample string tags for filtering
-            tokens_prompt: Number of prompt tokens (stored in prompts_discarded table)
-            system_prompt: The system message (if any)
-            tokens_system_prompt: Number of tokens in the system message
-            total_tokens: Total tokens that would have been passed to trainer
-            raw_string: Decoded raw input that would have been passed to trainer
-            compute_reward_time: Time in seconds for compute_reward() call
-        """
+        """Log an infrastructure event (weight_sync, sandbox lifecycle)."""
         if not config.cfg.use_wandb:
             return
-
-        self.event_logger.log_discarded_rollout(
-            discard_reason=discard_reason,
-            trainer_step=trainer_step,
-            inference_step=inference_step,
-            group_id=group_id,
-            sample_idx=sample_idx,
-            prompt=prompt,
-            turns=turns,
-            reward=reward,
-            advantage=advantage,
-            env=env,
-            sample_metrics=sample_metrics,
-            golden_answers=golden_answers,
-            info_turns=info_turns,
-            sample_tags=sample_tags,
-            tokens_prompt=tokens_prompt,
-            system_prompt=system_prompt,
-            tokens_system_prompt=tokens_system_prompt,
-            total_tokens=total_tokens,
-            raw_string=raw_string,
-            compute_reward_time=compute_reward_time,
+        self.event_logger.log_infra_event(
+            event_type=event_type,
+            phase=phase,
+            timestamp=timestamp,
+            step=step,
+            server_id=server_id,
+            sandbox_id=sandbox_id,
         )
 
     def set_inference_servers(self, server_infos: list[dict]):

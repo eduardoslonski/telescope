@@ -53,10 +53,13 @@ from telescope.orchestrator.eval_runner import (
 )
 from telescope.orchestrator.loggers.event_logger import (
     EvalPrompt,
-    EvalRollout,
-    RolloutTurn,
+    EvalGenerationRollout,
+    GenerationRecord,
+    EnvResponseRecord,
     PROMPTS_EVAL_SCHEMA,
-    ROLLOUTS_EVAL_SCHEMA,
+    GENERATIONS_EVAL_SCHEMA,
+    ENV_RESPONSES_EVAL_SCHEMA,
+    TOOL_CALLS_EVAL_SCHEMA,
     SAMPLES_DATA_EVAL_SCHEMA,
     ROLLOUTS_METRICS_EVAL_SCHEMA,
     GOLDEN_ANSWERS_EVAL_SCHEMA,
@@ -264,7 +267,7 @@ def _parse_eval_configs(eval_cfg: EvalStandaloneConfig) -> list[EvalConfig]:
 
 
 # ---------------------------------------------------------------------------
-# Result collection (builds EvalPrompt/EvalRollout/StepMetric objects)
+# Result collection (builds EvalPrompt/EvalGenerationRollout objects)
 # ---------------------------------------------------------------------------
 
 _zstd_compressor = zstd.ZstdCompressor(level=3)
@@ -279,13 +282,13 @@ def _collect_eval_objects(
     step: int,
     model_step: int,
     tokenizer: Any | None = None,
-) -> tuple[list[EvalPrompt], list[EvalRollout]]:
-    """Convert eval results into EvalPrompt/EvalRollout objects.
+) -> tuple[list[EvalPrompt], list[EvalGenerationRollout]]:
+    """Convert eval results into EvalPrompt/EvalGenerationRollout objects.
 
     Returns (eval_prompts, eval_rollouts).
     """
     eval_prompts: list[EvalPrompt] = []
-    eval_rollouts: list[EvalRollout] = []
+    eval_rollouts: list[EvalGenerationRollout] = []
     logged_prompt_keys: set[tuple[str, int]] = set()
 
     for result in results:
@@ -302,7 +305,7 @@ def _collect_eval_objects(
             f"metrics={avg_metrics}",
         )
 
-        # Collect per-sample EvalPrompt and EvalRollout objects
+        # Collect per-sample EvalPrompt and EvalGenerationRollout objects
         sample_results = result.get("sample_results", [])
         for sr in sample_results:
             # Deduplicate prompts (same eval_name + sample_idx across pass@k completions)
@@ -322,6 +325,7 @@ def _collect_eval_objects(
                     eval_name=eval_name,
                     model_step=model_step,
                     sample_idx=sr.sample_idx,
+                    sample_id=sr.sample_id,
                     env=sr.env_name or eval_name,
                     prompt=sr.prompt_text,
                     tokens_prompt=tokens_prompt,
@@ -330,32 +334,51 @@ def _collect_eval_objects(
                     tail_idx=0,
                 ))
 
-            # Convert turns dicts to RolloutTurn objects
-            rollout_turns = [
-                RolloutTurn(
-                    turn_order=t.get("turn_order", 0),
-                    turn_type=t.get("turn_type", "model"),
-                    content=t.get("content", ""),
-                    tokens=t.get("tokens", 0),
-                    stop_reason=t.get("stop_reason", ""),
-                    environment_response_time=t.get("environment_response_time", 0.0),
-                )
-                for t in sr.turns
-            ]
+            # Split turns into GenerationRecord and EnvResponseRecord lists
+            generations: list[GenerationRecord] = []
+            env_responses: list[EnvResponseRecord] = []
+            generation_idx = 0
+            last_generation_idx = 0
 
-            eval_rollouts.append(EvalRollout(
+            for t in sr.turns:
+                turn_type = t.get("turn_type", "model")
+                if turn_type == "model":
+                    generations.append(GenerationRecord(
+                        generation_idx=generation_idx,
+                        content=t.get("content", ""),
+                        tokens=t.get("tokens", 0),
+                        stop_reason=t.get("stop_reason", ""),
+                    ))
+                    last_generation_idx = generation_idx
+                    generation_idx += 1
+                else:
+                    env_responses.append(EnvResponseRecord(
+                        generation_idx=last_generation_idx,
+                        content=t.get("content", ""),
+                        turn_type=turn_type,
+                        tokens=t.get("tokens", 0),
+                        response_time=t.get("environment_response_time", 0.0),
+                    ))
+
+            # Determine overall stop_reason from the last generation
+            stop_reason = generations[-1].stop_reason if generations else ""
+
+            eval_rollouts.append(EvalGenerationRollout(
                 step=step,
                 eval_name=eval_name,
                 model_step=model_step,
                 sample_idx=sr.sample_idx,
+                sample_id=sr.sample_id,
                 completion_idx=sr.completion_idx,
                 env=sr.env_name or eval_name,
-                turns=rollout_turns,
+                generations=generations,
+                env_responses=env_responses,
                 sample_metrics=sr.metrics,
                 golden_answers=sr.golden_answers,
                 info_turns=sr.info_turns,
                 sample_tags=sr.sample_tags,
                 compute_eval_metrics_time=sr.compute_eval_metrics_time,
+                stop_reason=stop_reason,
                 tail_idx=0,
             ))
 
@@ -374,6 +397,7 @@ def _eval_prompts_to_table(prompts: list[EvalPrompt]) -> pa.Table:
         "eval_name": [p.eval_name for p in prompts],
         "model_step": [p.model_step for p in prompts],
         "sample_idx": [p.sample_idx for p in prompts],
+        "sample_id": [p.sample_id for p in prompts],
         "env": [p.env for p in prompts],
         "prompt": [p.prompt for p in prompts],
         "tokens_prompt": [p.tokens_prompt for p in prompts],
@@ -384,36 +408,112 @@ def _eval_prompts_to_table(prompts: list[EvalPrompt]) -> pa.Table:
     return pa.table(data, schema=PROMPTS_EVAL_SCHEMA)
 
 
-def _eval_rollouts_to_table(rollouts: list[EvalRollout]) -> pa.Table:
+def _eval_generations_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
-        return pa.table({f.name: pa.array([], type=f.type) for f in ROLLOUTS_EVAL_SCHEMA})
-    steps, eval_names, model_steps, sample_idxs, comp_idxs = [], [], [], [], []
-    turn_orders, turn_types, contents, tokens_list, stop_reasons, env_resp_times, tail_idxs = [], [], [], [], [], [], []
+        return pa.table({f.name: pa.array([], type=f.type) for f in GENERATIONS_EVAL_SCHEMA})
+    steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
+    gen_idxs, contents, tokens_list, prompt_tokens_list = [], [], [], []
+    tool_call_counts, stop_reasons, tail_idxs = [], [], []
     for r in rollouts:
-        for turn in r.turns:
+        for g in r.generations:
             steps.append(r.step)
             eval_names.append(r.eval_name)
             model_steps.append(r.model_step)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
-            turn_orders.append(turn.turn_order)
-            turn_types.append(turn.turn_type)
-            contents.append(_zstd_compress(turn.content))
-            tokens_list.append(turn.tokens)
-            stop_reasons.append(turn.stop_reason)
-            env_resp_times.append(turn.environment_response_time)
+            agent_ids.append(r.agent_id)
+            gen_idxs.append(g.generation_idx)
+            contents.append(_zstd_compress(g.content))
+            tokens_list.append(g.tokens)
+            prompt_tokens_list.append(g.prompt_tokens)
+            tool_call_counts.append(g.tool_call_count)
+            stop_reasons.append(g.stop_reason)
             tail_idxs.append(r.tail_idx)
-    data = {
+    return pa.table({
         "step": steps, "eval_name": eval_names, "model_step": model_steps,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
-        "turn_order": turn_orders, "turn_type": turn_types, "content": contents,
-        "tokens": tokens_list, "stop_reason": stop_reasons,
-        "environment_response_time": env_resp_times, "tail_idx": tail_idxs,
-    }
-    return pa.table(data, schema=ROLLOUTS_EVAL_SCHEMA)
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs, "agent_id": agent_ids,
+        "generation_idx": gen_idxs, "content": contents, "tokens": tokens_list,
+        "prompt_tokens": prompt_tokens_list, "tool_call_count": tool_call_counts,
+        "stop_reason": stop_reasons, "tail_idx": tail_idxs,
+    }, schema=GENERATIONS_EVAL_SCHEMA)
 
 
-def _samples_data_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
+def _eval_env_responses_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
+    if not rollouts:
+        return pa.table({f.name: pa.array([], type=f.type) for f in ENV_RESPONSES_EVAL_SCHEMA})
+    steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
+    gen_idxs, contents, turn_types, tokens_list, response_times, tail_idxs = [], [], [], [], [], []
+    for r in rollouts:
+        for e in r.env_responses:
+            steps.append(r.step)
+            eval_names.append(r.eval_name)
+            model_steps.append(r.model_step)
+            sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
+            comp_idxs.append(r.completion_idx)
+            agent_ids.append(r.agent_id)
+            gen_idxs.append(e.generation_idx)
+            contents.append(_zstd_compress(e.content))
+            turn_types.append(e.turn_type)
+            tokens_list.append(e.tokens)
+            response_times.append(e.response_time)
+            tail_idxs.append(r.tail_idx)
+    return pa.table({
+        "step": steps, "eval_name": eval_names, "model_step": model_steps,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs, "agent_id": agent_ids,
+        "generation_idx": gen_idxs, "content": contents, "turn_type": turn_types,
+        "tokens": tokens_list, "response_time": response_times, "tail_idx": tail_idxs,
+    }, schema=ENV_RESPONSES_EVAL_SCHEMA)
+
+
+def _eval_tool_calls_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
+    if not rollouts:
+        return pa.table({f.name: pa.array([], type=f.type) for f in TOOL_CALLS_EVAL_SCHEMA})
+    steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
+    gen_idxs, tc_idxs, env_resp_gen_idxs = [], [], []
+    tool_names, arguments_list, raw_texts, results = [], [], [], []
+    successes, errors, exit_codes, truncateds = [], [], [], []
+    result_tokens_list, sandbox_ids, tail_idxs = [], [], []
+    for r in rollouts:
+        for tc in r.tool_calls:
+            steps.append(r.step)
+            eval_names.append(r.eval_name)
+            model_steps.append(r.model_step)
+            sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
+            comp_idxs.append(r.completion_idx)
+            agent_ids.append(r.agent_id)
+            gen_idxs.append(tc.generation_idx)
+            tc_idxs.append(tc.tool_call_idx)
+            env_resp_gen_idxs.append(tc.env_response_generation_idx)
+            tool_names.append(tc.tool_name)
+            arguments_list.append(tc.arguments)
+            raw_texts.append(tc.raw_text)
+            results.append(_zstd_compress(tc.result))
+            successes.append(tc.success)
+            errors.append(tc.error)
+            exit_codes.append(tc.exit_code)
+            truncateds.append(tc.truncated)
+            result_tokens_list.append(tc.result_tokens)
+            sandbox_ids.append(tc.sandbox_id)
+            tail_idxs.append(r.tail_idx)
+    return pa.table({
+        "step": steps, "eval_name": eval_names, "model_step": model_steps,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs, "agent_id": agent_ids,
+        "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+        "env_response_generation_idx": env_resp_gen_idxs,
+        "tool_name": tool_names, "arguments": arguments_list, "raw_text": raw_texts,
+        "result": results, "success": successes, "error": errors, "exit_code": exit_codes,
+        "truncated": truncateds, "result_tokens": result_tokens_list, "sandbox_id": sandbox_ids,
+        "tail_idx": tail_idxs,
+    }, schema=TOOL_CALLS_EVAL_SCHEMA)
+
+
+def _samples_data_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in SAMPLES_DATA_EVAL_SCHEMA})
     data = {
@@ -421,24 +521,27 @@ def _samples_data_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
         "eval_name": [r.eval_name for r in rollouts],
         "model_step": [r.model_step for r in rollouts],
         "sample_idx": [r.sample_idx for r in rollouts],
+        "sample_id": [r.sample_id for r in rollouts],
         "completion_idx": [r.completion_idx for r in rollouts],
         "env": [r.env for r in rollouts],
-        "turns": [len(r.turns) for r in rollouts],
+        "num_generations": [len(r.generations) for r in rollouts],
         "compute_eval_metrics_time": [r.compute_eval_metrics_time for r in rollouts],
+        "stop_reason": [r.stop_reason for r in rollouts],
         "tail_idx": [r.tail_idx for r in rollouts],
     }
     return pa.table(data, schema=SAMPLES_DATA_EVAL_SCHEMA)
 
 
-def _rollouts_metrics_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
+def _rollouts_metrics_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in ROLLOUTS_METRICS_EVAL_SCHEMA})
-    steps, eval_names, sample_idxs, comp_idxs, envs, metric_names, values, tail_idxs = [], [], [], [], [], [], [], []
+    steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, metric_names, values, tail_idxs = [], [], [], [], [], [], [], [], []
     for r in rollouts:
         for metric_name, value in r.sample_metrics.items():
             steps.append(r.step)
             eval_names.append(r.eval_name)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             envs.append(r.env)
             metric_names.append(metric_name)
@@ -446,22 +549,24 @@ def _rollouts_metrics_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
             tail_idxs.append(r.tail_idx)
     data = {
         "step": steps, "eval_name": eval_names,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs,
         "env": envs, "metric_name": metric_names,
         "value": values, "tail_idx": tail_idxs,
     }
     return pa.table(data, schema=ROLLOUTS_METRICS_EVAL_SCHEMA)
 
 
-def _golden_answers_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
+def _golden_answers_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in GOLDEN_ANSWERS_EVAL_SCHEMA})
-    steps, eval_names, sample_idxs, comp_idxs, envs, keys, values, tail_idxs = [], [], [], [], [], [], [], []
+    steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, keys, values, tail_idxs = [], [], [], [], [], [], [], [], []
     for r in rollouts:
         for key, value in r.golden_answers.items():
             steps.append(r.step)
             eval_names.append(r.eval_name)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             envs.append(r.env)
             keys.append(key)
@@ -469,24 +574,29 @@ def _golden_answers_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
             tail_idxs.append(r.tail_idx)
     data = {
         "step": steps, "eval_name": eval_names,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs,
         "env": envs, "key": keys, "value": values, "tail_idx": tail_idxs,
     }
     return pa.table(data, schema=GOLDEN_ANSWERS_EVAL_SCHEMA)
 
 
-def _info_turns_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
+def _info_turns_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in INFO_TURNS_EVAL_SCHEMA})
-    steps, eval_names, sample_idxs, comp_idxs, turn_orders, envs = [], [], [], [], [], []
+    steps, eval_names, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], []
+    gen_idxs, tc_idxs, envs = [], [], []
     info_keys, info_values, info_types, tail_idxs = [], [], [], []
     for r in rollouts:
         for info in r.info_turns:
             steps.append(r.step)
             eval_names.append(r.eval_name)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
-            turn_orders.append(info.get("turn_order", 0))
+            agent_ids.append(r.agent_id)
+            gen_idxs.append(info.get("generation_idx", 0))
+            tc_idxs.append(info.get("tool_call_idx", -1))
             envs.append(r.env)
             info_keys.append(info.get("info_key", ""))
             info_values.append(info.get("info_value", ""))
@@ -494,23 +604,25 @@ def _info_turns_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
             tail_idxs.append(r.tail_idx)
     data = {
         "step": steps, "eval_name": eval_names,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
-        "turn_order": turn_orders, "env": envs,
-        "info_key": info_keys, "info_value": info_values,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs,
+        "agent_id": agent_ids, "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+        "env": envs, "info_key": info_keys, "info_value": info_values,
         "info_type": info_types, "tail_idx": tail_idxs,
     }
     return pa.table(data, schema=INFO_TURNS_EVAL_SCHEMA)
 
 
-def _sample_tags_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
+def _sample_tags_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in SAMPLE_TAGS_EVAL_SCHEMA})
-    steps, eval_names, sample_idxs, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], []
+    steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], [], []
     for r in rollouts:
         for tag_name, tag_value in r.sample_tags.items():
             steps.append(r.step)
             eval_names.append(r.eval_name)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             envs.append(r.env)
             tag_names.append(tag_name)
@@ -518,7 +630,8 @@ def _sample_tags_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
             tail_idxs.append(r.tail_idx)
     data = {
         "step": steps, "eval_name": eval_names,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs,
         "env": envs, "tag_name": tag_names,
         "tag_value": tag_values, "tail_idx": tail_idxs,
     }
@@ -532,7 +645,7 @@ def _sample_tags_eval_to_table(rollouts: list[EvalRollout]) -> pa.Table:
 def _upload_eval_zip(
     wandb_run: Any,
     all_prompts: list[EvalPrompt],
-    all_rollouts: list[EvalRollout],
+    all_rollouts: list[EvalGenerationRollout],
 ) -> None:
     """Build a zip with all eval parquet tables and upload to wandb."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -543,7 +656,9 @@ def _upload_eval_zip(
 
     # Build parquet tables
     prompts_table = _eval_prompts_to_table(all_prompts)
-    rollouts_table = _eval_rollouts_to_table(all_rollouts)
+    generations_table = _eval_generations_to_table(all_rollouts)
+    env_responses_table = _eval_env_responses_to_table(all_rollouts)
+    tool_calls_table = _eval_tool_calls_to_table(all_rollouts)
     samples_data_table = _samples_data_eval_to_table(all_rollouts)
     metrics_table = _rollouts_metrics_eval_to_table(all_rollouts)
     golden_answers_table = _golden_answers_eval_to_table(all_rollouts)
@@ -564,7 +679,9 @@ def _upload_eval_zip(
 
     with zipfile.ZipFile(dest_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         _write_table(zf, "prompts_eval.parquet", prompts_table)
-        _write_table(zf, "rollouts_eval.parquet", rollouts_table)
+        _write_table(zf, "generations_eval.parquet", generations_table)
+        _write_table(zf, "env_responses_eval.parquet", env_responses_table)
+        _write_table(zf, "tool_calls_eval.parquet", tool_calls_table)
         _write_table(zf, "samples_data_eval.parquet", samples_data_table)
         _write_table(zf, "rollouts_metrics_eval.parquet", metrics_table)
         _write_table(zf, "golden_answers_eval.parquet", golden_answers_table)
@@ -637,7 +754,7 @@ async def _run_eval_async(eval_cfg: EvalStandaloneConfig) -> None:
 
     # Accumulate all eval data across checkpoints for a single zip upload
     all_eval_prompts: list[EvalPrompt] = []
-    all_eval_rollouts: list[EvalRollout] = []
+    all_eval_rollouts: list[EvalGenerationRollout] = []
 
     try:
         for ckpt in resolved_checkpoints:

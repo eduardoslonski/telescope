@@ -6,9 +6,9 @@ in a way that's easy for the frontend UI to fetch and filter.
 
 All events are stored together in unified zip archives:
 - events/tail.zip: Last 60 seconds of all data
-  Contains: orchestrator.parquet, trainer.parquet, inference.parquet, gpu.parquet, cpu.parquet, vllm.parquet,
-            rollouts_discarded.parquet, rollouts_metrics_discarded.parquet,
-            golden_answers_discarded.parquet, info_turns_discarded.parquet,
+  Contains: orchestrator.parquet, trainer.parquet, events_rollout.parquet, events_infra.parquet, gpu.parquet, cpu.parquet, vllm.parquet,
+            generations_discarded.parquet, env_responses_discarded.parquet, tool_calls_discarded.parquet,
+            rollouts_metrics_discarded.parquet, golden_answers_discarded.parquet, info_turns_discarded.parquet,
             sample_tags_discarded.parquet, samples_data_discarded.parquet, prompts_discarded.parquet
 - events/block_live.zip: Current 30-minute block with all parquet files
 - events/block_*.zip: Finalized 30-minute blocks
@@ -26,11 +26,12 @@ Each zip archive includes a metadata.json file with archive-level metadata:
 - max_tail_idx: Last complete tail index in the archive
 - Additional fields depending on the archive type (block_idx, tail_idx, etc.)
 
-Inference events track request and weight broadcast timings per server:
-- event_type: "request" or "weight_broadcast"
-- start_time, end_time: Event duration
-- server: Server index (0, 1, ...)
-- step: Training step (populated for weight_broadcast, null for requests)
+Rollout events track per-sample rollout pipeline phases (generation, tool_execution, env_response, reward):
+- event_type, phase, sample_id, generation_idx, tool_call_idx, server_id, agent_id
+- tail_idx: Upload cycle index when first uploaded
+
+Infra events track infrastructure operations (weight_sync, sandbox_provision):
+- event_type, phase, step, server_id, sandbox_id
 - tail_idx: Upload cycle index when first uploaded
 
 Steps data is stored in blocks by step count:
@@ -42,7 +43,8 @@ Run summary is updated every 5 seconds with metadata to help the UI:
 - events/current_tail_idx: Current tail upload cycle index
 - events/current_block_idx: Which event block we're currently writing to
 - events/num_finalized_blocks: How many event block_*.zip files have been written
-- events/tail_inference_count: Number of inference events in tail
+- events/tail_rollout_events_count: Number of rollout events in tail
+- events/tail_infra_events_count: Number of infra events in tail
 - steps/current_block_idx: Which step block we're currently writing to
 - steps/num_finalized_blocks: How many step block_*.zip files have been written
 - steps/last_training_step: Last completed trainer step index (-1 before first completion)
@@ -115,36 +117,31 @@ TRAINER_EVENT_SCHEMA = pa.schema([
     ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this event was first uploaded
 ])
 
-# Inference events schema - duration events with server info
-INFERENCE_EVENT_SCHEMA = pa.schema([
-    ("event_type", pa.string()),
-    ("start_time", pa.float64()),
-    ("end_time", pa.float64()),
-    ("server", pa.int32()),  # Server index (0, 1, ...)
-    ("node_id", pa.int32()),
-    ("tp_group_id", pa.int32()),
-    ("tp_size", pa.int32()),
-    ("prompt_tokens", pa.int32()),  # Number of prompt tokens
-    ("rollout_tokens", pa.int32()),  # Number of generated tokens
-    ("group_id", pa.int32()),  # Request group ID (shared by all rollouts in a group)
-    ("sample_id", pa.int32()),  # Run-wide unique sample index for this request
-    ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this event was first uploaded
-    # vLLM per-request timing from OpenTelemetry spans (populated when ENABLE_VLLM_TRACING=True)
-    ("vllm_request_id", pa.string()),  # vLLM request ID (e.g. "cmpl-abc123"), join key for span data
-    ("queue_time", pa.float64()),  # Time request waited in vLLM's queue before scheduling
-    ("time_to_first_token", pa.float64()),  # TTFT from vLLM's perspective
-    ("prefill_time", pa.float64()),  # Time from scheduling to first token (model prefill)
-    ("decode_time", pa.float64()),  # Time from first token to last token
-    ("inference_time", pa.float64()),  # prefill + decode (scheduling to last token)
-    ("e2e_latency", pa.float64()),  # End-to-end latency inside vLLM
-    ("vllm_max_tokens", pa.int32()),  # The max_tokens param for this request in vLLM
-    ("is_eval", pa.bool_()),  # Whether this request is an eval request (not training)
-    ("is_canceled", pa.bool_()),  # Whether this request was cancelled before completing
-    ("compute_reward_time", pa.float64()),  # Time for compute_reward/compute_eval_metrics (seconds)
-    ("step", pa.int32()),  # Training step (populated for weight_broadcast, -1 for requests)
-    ("off_policy_steps", pa.int32()),  # Number of weight updates since this rollout was dispatched
-    ("server_lane", pa.int32()),  # Per-server lane slot for this sample
-    ("phase", pa.string()),  # "start" or "end" (empty for backward compat e.g. weight_broadcast)
+# Rollout events schema - per-sample lifecycle events (generation, tool execution, env response, reward)
+# Start and end are separate rows. End rows also carry start_time for self-contained historical queries.
+EVENTS_ROLLOUT_SCHEMA = pa.schema([
+    ("timestamp", pa.float64()),   # Event timestamp (start_time for start rows, end_time for end rows)
+    ("tail_idx", pa.int32()),
+    ("event_type", pa.string()),   # "generation", "tool_execution", "env_response", "reward"
+    ("phase", pa.string()),        # "start" or "end"
+    ("group_id", pa.int32()),
+    ("sample_id", pa.int32()),     # Run-wide unique sample ID
+    ("agent_id", pa.int32()),      # Agent ID (0 = main agent, 1+ = sub-agents)
+    ("generation_idx", pa.int32()),  # Generation index within (sample_id, agent_id)
+    ("tool_call_idx", pa.int32()),   # Tool call index within generation (-1 if N/A)
+    ("server_id", pa.int32()),       # Inference server index (-1 if N/A)
+    ("server_lane", pa.int32()),     # Per-server lane slot for timeline positioning (-1 if N/A)
+])
+
+# Infrastructure events schema - weight sync, sandbox lifecycle
+EVENTS_INFRA_SCHEMA = pa.schema([
+    ("timestamp", pa.float64()),
+    ("tail_idx", pa.int32()),
+    ("event_type", pa.string()),   # "weight_sync", "sandbox"
+    ("phase", pa.string()),        # "start"/"end" for weight_sync; "create"/"setup"/"ready"/"execute"/"destroy" for sandbox
+    ("step", pa.int32()),          # Training step (-1 if N/A)
+    ("server_id", pa.int32()),     # For weight_sync events (-1 if N/A)
+    ("sandbox_id", pa.string()),   # For sandbox events (null if N/A)
 ])
 
 # GPU metrics schema - includes gpu_index column
@@ -193,66 +190,144 @@ PROMPTS_SCHEMA = pa.schema([
     ("tokens_system_prompt", pa.int32()),  # Number of tokens in the system message
 ])
 
-# Rollouts schema - one row per turn per completion (model rollouts and env responses)
-# For single-turn: one row per sample_idx with order=0, type="model"
-# For multi-turn: multiple rows per sample_idx tracking the conversation
-# Each turn's content is just that turn's text, not accumulated from previous turns
-ROLLOUTS_SCHEMA = pa.schema([
+# Generations schema - one row per model generation
+# For single-turn: one row per sample with generation_idx=0
+# For multi-turn: multiple rows per sample, one per model generation
+GENERATIONS_SCHEMA = pa.schema([
     ("step", pa.int32()),
-    ("group_id", pa.int32()),  # Links to prompts table
-    ("sample_idx", pa.int32()),  # Unique per completion across the run
-    ("turn_order", pa.int32()),  # 0, 1, 2, ... sequence within this sample
-    ("turn_type", pa.string()),  # "model" for model rollouts, or env-provided type
-    ("content", pa.binary()),  # The text content for this turn only (zstd-compressed UTF-8)
-    ("tokens", pa.int32()),  # Number of tokens for this turn
-    ("stop_reason", pa.string()),  # Why rollout stopped (for model turns: "stop", "length", etc.)
-    ("environment_response_time", pa.float64()),  # Time in seconds for env_response() call (0.0 for model turns)
+    ("group_id", pa.int32()),      # Links to prompts table
+    ("sample_id", pa.int32()),     # Run-wide unique sample ID
+    ("agent_id", pa.int32()),      # 0 = main agent, 1+ = sub-agents
+    ("generation_idx", pa.int32()),  # 0-indexed within (sample_id, agent_id)
+    ("content", pa.binary()),      # Full generation text (zstd-compressed UTF-8)
+    ("tokens", pa.int32()),        # Tokens generated
+    ("prompt_tokens", pa.int32()), # Tokens in the prompt for this generation
+    ("tool_call_count", pa.int32()),  # Number of tool calls parsed (0 for reasoning)
+    ("stop_reason", pa.string()),  # "eos", "max_tokens", "tool_call", "tool_result_interrupt"
+    # vLLM per-request timing
+    ("queue_time", pa.float64()),
+    ("ttft", pa.float64()),        # Time to first token
+    ("prefill_time", pa.float64()),
+    ("decode_time", pa.float64()),
+    ("inference_time", pa.float64()),  # prefill + decode
+    ("e2e_latency", pa.float64()),
+    ("server_id", pa.int32()),
+    ("vllm_request_id", pa.string()),
+])
+
+# Environment responses schema - one row per injection between generations
+ENV_RESPONSES_SCHEMA = pa.schema([
+    ("step", pa.int32()),
+    ("group_id", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),  # Which generation this follows
+    ("content", pa.binary()),        # Text injected into conversation (zstd-compressed UTF-8)
+    ("turn_type", pa.string()),      # "tool_result", "env_response", "feedback", "context"
+    ("tokens", pa.int32()),
+    ("response_time", pa.float64()), # Wall clock for entire env_response processing
+])
+
+# Tool calls schema - one row per tool call (call + result combined)
+TOOL_CALLS_SCHEMA = pa.schema([
+    ("step", pa.int32()),
+    ("group_id", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),              # Which generation created this call
+    ("tool_call_idx", pa.int32()),               # 0-indexed within generation
+    ("env_response_generation_idx", pa.int32()), # Which env_response contains the result
+    ("tool_name", pa.string()),
+    ("arguments", pa.string()),                  # JSON
+    ("raw_text", pa.string()),                   # Original parsed text from generation
+    ("result", pa.binary()),                     # Tool output (zstd-compressed, can be large)
+    ("success", pa.bool_()),
+    ("error", pa.string()),
+    ("exit_code", pa.int32()),                   # For bash/terminal tools (-1 if N/A)
+    ("truncated", pa.bool_()),
+    ("result_tokens", pa.int32()),
+    ("sandbox_id", pa.string()),
+])
+
+# Sandboxes schema - one row per sandbox session
+SANDBOXES_SCHEMA = pa.schema([
+    ("step", pa.int32()),
+    ("group_id", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("sandbox_id", pa.string()),
+    ("sandbox_type", pa.string()),  # "docker", "modal", "firecracker", "e2b", "namespace"
+    ("image", pa.string()),
+    ("create_time", pa.float64()),
+    ("setup_time", pa.float64()),
+    ("total_execute_time", pa.float64()),
+    ("destroy_time", pa.float64()),
+    ("cpu_limit", pa.float32()),
+    ("memory_limit_mb", pa.int32()),
+    ("disk_limit_mb", pa.int32()),
+    ("timeout_seconds", pa.int32()),
+    ("peak_cpu_pct", pa.float32()),
+    ("peak_memory_mb", pa.int32()),
+    ("peak_disk_mb", pa.int32()),
+    ("status", pa.string()),       # "created", "ready", "executing", "completed", "failed", "timeout"
+    ("error", pa.string()),
+    ("tool_calls_executed", pa.int32()),
+    ("reused", pa.bool_()),
+])
+
+# Turn metrics schema - per-generation or per-env-response metrics
+TURN_METRICS_SCHEMA = pa.schema([
+    ("step", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("turn_type", pa.string()),    # "generation" or "env_response"
+    ("env", pa.string()),
+    ("metric_name", pa.string()),
+    ("value", pa.float64()),
 ])
 
 # Samples data schema - one row per sample with summary information
-# Links to prompts table via group_id, to rollouts table via sample_idx
+# Links to prompts table via group_id, to generations/env_responses/tool_calls via sample_id
 SAMPLES_DATA_SCHEMA = pa.schema([
     ("step", pa.int32()),
-    ("group_id", pa.int32()),  # Links to prompts table
-    ("sample_idx", pa.int32()),  # Unique per completion across the run
-    ("reward", pa.float64()),  # Total reward
-    ("advantage", pa.float64()),  # Computed advantage
-    ("turns", pa.int32()),  # Number of turns in this sample
+    ("group_id", pa.int32()),      # Links to prompts table
+    ("sample_id", pa.int32()),     # Run-wide unique sample ID
+    ("reward", pa.float64()),      # Total reward
+    ("advantage", pa.float64()),   # Computed advantage
+    ("num_generations", pa.int32()),  # Number of model generations in this sample
     ("total_tokens", pa.int32()),  # Total tokens passed to trainer
-    ("raw_string", pa.binary()),  # Decoded raw input passed to trainer (zstd-compressed UTF-8)
+    ("raw_string", pa.binary()),   # Decoded raw input passed to trainer (zstd-compressed UTF-8)
     ("compute_reward_time", pa.float64()),  # Time in seconds for compute_reward() call
+    ("stop_reason", pa.string()),  # Why rollout ended: "final_answer", "max_turns", "context_exhausted", "error"
+    ("off_policy_steps", pa.int32()),  # Number of weight updates since this rollout was dispatched
 ])
 
-# Rollouts metrics schema - normalized table for flexible per-rollout metrics
-# Includes both reward components and other rollout metrics (e.g. char count, word frequency)
-# Each row represents one metric for one rollout
-# UI can query: run_id (from wandb), step+sample_idx (rollout_id), env, metric_name, value
+# Rollouts metrics schema - normalized table for flexible per-sample metrics
+# Includes both reward components and other sample metrics
 ROLLOUTS_METRICS_SCHEMA = pa.schema([
     ("step", pa.int32()),
-    ("sample_idx", pa.int32()),
-    ("env", pa.string()),  # Environment name
-    ("metric_name", pa.string()),  # Metric name (e.g. "format_reward", "equation_reward", "char_count", "word_freq")
-    ("value", pa.float64()),  # Metric value
+    ("sample_id", pa.int32()),     # Run-wide unique sample ID
+    ("env", pa.string()),
+    ("metric_name", pa.string()),
+    ("value", pa.float64()),
 ])
 
-# Golden answers schema - ground truth answers per rollout (completely independent from metrics)
-# Each row represents one golden answer key/value for one rollout
+# Golden answers schema - ground truth answers per sample
 GOLDEN_ANSWERS_SCHEMA = pa.schema([
     ("step", pa.int32()),
-    ("sample_idx", pa.int32()),
-    ("env", pa.string()),  # Environment name
-    ("key", pa.string()),  # Golden answer key name (e.g. "target", "correct_answer")
-    ("value", pa.string()),  # Golden answer value (null if not available)
+    ("sample_id", pa.int32()),
+    ("env", pa.string()),
+    ("key", pa.string()),
+    ("value", pa.string()),
 ])
 
 # Sample tags schema - per-sample string tags for filtering
-# Each row represents one tag key/value for one sample
 SAMPLE_TAGS_SCHEMA = pa.schema([
     ("step", pa.int32()),
-    ("sample_idx", pa.int32()),
-    ("env", pa.string()),  # Environment name
-    ("tag_name", pa.string()),  # Tag key (e.g. "style", "task")
-    ("tag_value", pa.string()),  # Tag value (e.g. "4 numbers", "coding")
+    ("sample_id", pa.int32()),
+    ("env", pa.string()),
+    ("tag_name", pa.string()),
+    ("tag_value", pa.string()),
 ])
 
 STEP_METRICS_SCHEMA = pa.schema([
@@ -278,87 +353,136 @@ PROMPTS_DISCARDED_SCHEMA = pa.schema([
     ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this was first uploaded
 ])
 
-# Discarded rollouts schema - one row per turn per discarded completion
-# Note: timestamp and discard_reason are in samples_data_discarded, not duplicated here
-ROLLOUTS_DISCARDED_SCHEMA = pa.schema([
-    ("trainer_step", pa.int32()),  # Trainer step at the time of discarding
-    ("inference_step", pa.int32()),  # Inference step (what step this rollout would have been for)
-    ("group_id", pa.int32()),  # Links to prompts_discarded table
-    ("sample_idx", pa.int32()),
-    ("turn_order", pa.int32()),  # 0, 1, 2, ... sequence within this sample
-    ("turn_type", pa.string()),  # "model" for model rollouts, or env-provided type
-    ("content", pa.binary()),  # The text content for this turn only (zstd-compressed UTF-8)
-    ("tokens", pa.int32()),  # Number of tokens for this turn
-    ("stop_reason", pa.string()),  # Why rollout stopped (for model turns: "stop", "length", etc.)
-    ("environment_response_time", pa.float64()),  # Time in seconds for env_response() call (0.0 for model turns)
-    ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this was first uploaded
+# Discarded generations schema
+GENERATIONS_DISCARDED_SCHEMA = pa.schema([
+    ("trainer_step", pa.int32()),
+    ("inference_step", pa.int32()),
+    ("group_id", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("content", pa.binary()),
+    ("tokens", pa.int32()),
+    ("prompt_tokens", pa.int32()),
+    ("tool_call_count", pa.int32()),
+    ("stop_reason", pa.string()),
+    ("queue_time", pa.float64()),
+    ("ttft", pa.float64()),
+    ("prefill_time", pa.float64()),
+    ("decode_time", pa.float64()),
+    ("inference_time", pa.float64()),
+    ("e2e_latency", pa.float64()),
+    ("server_id", pa.int32()),
+    ("vllm_request_id", pa.string()),
+    ("tail_idx", pa.int32()),
 ])
 
-# Discarded samples data schema - one row per discarded sample with summary information
+# Discarded environment responses schema
+ENV_RESPONSES_DISCARDED_SCHEMA = pa.schema([
+    ("trainer_step", pa.int32()),
+    ("inference_step", pa.int32()),
+    ("group_id", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("content", pa.binary()),
+    ("turn_type", pa.string()),
+    ("tokens", pa.int32()),
+    ("response_time", pa.float64()),
+    ("tail_idx", pa.int32()),
+])
+
+# Discarded tool calls schema
+TOOL_CALLS_DISCARDED_SCHEMA = pa.schema([
+    ("trainer_step", pa.int32()),
+    ("inference_step", pa.int32()),
+    ("group_id", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("tool_call_idx", pa.int32()),
+    ("env_response_generation_idx", pa.int32()),
+    ("tool_name", pa.string()),
+    ("arguments", pa.string()),
+    ("raw_text", pa.string()),
+    ("result", pa.binary()),
+    ("success", pa.bool_()),
+    ("error", pa.string()),
+    ("exit_code", pa.int32()),
+    ("truncated", pa.bool_()),
+    ("result_tokens", pa.int32()),
+    ("sandbox_id", pa.string()),
+    ("tail_idx", pa.int32()),
+])
+
+# Discarded samples data schema
 SAMPLES_DATA_DISCARDED_SCHEMA = pa.schema([
-    ("timestamp", pa.float64()),  # When the rollout was discarded
-    ("discard_reason", pa.string()),  # Why it was discarded
-    ("trainer_step", pa.int32()),  # Trainer step at the time of discarding
-    ("inference_step", pa.int32()),  # Inference step (what step this rollout would have been for)
-    ("group_id", pa.int32()),  # Links to prompts_discarded table
-    ("sample_idx", pa.int32()),  # Unique per completion across the run
-    ("reward", pa.float64()),  # Total reward
-    ("advantage", pa.float64()),  # Computed advantage
-    ("turns", pa.int32()),  # Number of turns in this sample
-    ("total_tokens", pa.int32()),  # Total tokens that would have been passed to trainer
-    ("raw_string", pa.binary()),  # Decoded raw input that would have been passed to trainer (zstd-compressed UTF-8)
-    ("compute_reward_time", pa.float64()),  # Time in seconds for compute_reward() call
-    ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this was first uploaded
+    ("timestamp", pa.float64()),
+    ("discard_reason", pa.string()),
+    ("trainer_step", pa.int32()),
+    ("inference_step", pa.int32()),
+    ("group_id", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("reward", pa.float64()),
+    ("advantage", pa.float64()),
+    ("num_generations", pa.int32()),
+    ("total_tokens", pa.int32()),
+    ("raw_string", pa.binary()),
+    ("compute_reward_time", pa.float64()),
+    ("stop_reason", pa.string()),
+    ("off_policy_steps", pa.int32()),
+    ("tail_idx", pa.int32()),
 ])
 
-# Discarded rollouts metrics schema - normalized table for flexible per-rollout metrics
-# Includes both reward components and other rollout metrics
-# Note: timestamp and discard_reason are in samples_data_discarded, not duplicated here
+# Discarded rollouts metrics schema
 ROLLOUTS_METRICS_DISCARDED_SCHEMA = pa.schema([
-    ("sample_idx", pa.int32()),
-    ("env", pa.string()),  # Environment name
-    ("metric_name", pa.string()),  # Metric name (reward component or other metric)
-    ("value", pa.float64()),  # Metric value
-    ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this was first uploaded
+    ("sample_id", pa.int32()),
+    ("env", pa.string()),
+    ("metric_name", pa.string()),
+    ("value", pa.float64()),
+    ("tail_idx", pa.int32()),
 ])
 
-# Discarded golden answers schema - ground truth answers per discarded rollout
-# Note: timestamp and discard_reason are in samples_data_discarded, not duplicated here
+# Discarded golden answers schema
 GOLDEN_ANSWERS_DISCARDED_SCHEMA = pa.schema([
-    ("sample_idx", pa.int32()),
-    ("env", pa.string()),  # Environment name
-    ("key", pa.string()),  # Golden answer key name
-    ("value", pa.string()),  # Golden answer value (null if not available)
-    ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this was first uploaded
+    ("sample_id", pa.int32()),
+    ("env", pa.string()),
+    ("key", pa.string()),
+    ("value", pa.string()),
+    ("tail_idx", pa.int32()),
 ])
 
-# Info turns schema - per-turn text information for a sample
-# One row per info item. Multiple info items can exist per turn.
+# Info turns schema - per-generation text information for a sample
+# One row per info item. Multiple info items can exist per generation.
 # Example uses: stderr from code execution, model summaries, debug output, etc.
 INFO_TURNS_SCHEMA = pa.schema([
     ("step", pa.int32()),
-    ("sample_idx", pa.int32()),
-    ("turn_order", pa.int32()),  # Which turn this info is for (0, 1, 2, ...)
-    ("env", pa.string()),  # Environment name
-    ("info_key", pa.string()),  # Key name (e.g. "stderr", "summary", "debug")
-    ("info_value", pa.string()),  # The text value
-    ("info_type", pa.string()),  # Type hint for rendering (e.g. "text", "stderr", "stdout")
-])
-
-# Discarded info turns schema - same as info_turns but for discarded samples
-INFO_TURNS_DISCARDED_SCHEMA = pa.schema([
-    ("sample_idx", pa.int32()),
-    ("turn_order", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),   # Which generation this info is for
+    ("tool_call_idx", pa.int32()),    # Which tool call (-1 if not tool-specific)
     ("env", pa.string()),
     ("info_key", pa.string()),
     ("info_value", pa.string()),
     ("info_type", pa.string()),
-    ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this was first uploaded
 ])
 
-# Discarded sample tags schema - per-sample string tags for discarded samples
+# Discarded info turns schema
+INFO_TURNS_DISCARDED_SCHEMA = pa.schema([
+    ("sample_id", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("tool_call_idx", pa.int32()),
+    ("env", pa.string()),
+    ("info_key", pa.string()),
+    ("info_value", pa.string()),
+    ("info_type", pa.string()),
+    ("tail_idx", pa.int32()),
+])
+
+# Discarded sample tags schema
 SAMPLE_TAGS_DISCARDED_SCHEMA = pa.schema([
-    ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("env", pa.string()),
     ("tag_name", pa.string()),
     ("tag_value", pa.string()),
@@ -368,10 +492,11 @@ SAMPLE_TAGS_DISCARDED_SCHEMA = pa.schema([
 # ---- Eval schemas (parallel to discarded, for eval completions) ----
 
 PROMPTS_EVAL_SCHEMA = pa.schema([
-    ("step", pa.int32()),  # Training step that triggered this eval (0 for baseline, 1-indexed)
-    ("eval_name", pa.string()),  # Name of the eval
-    ("model_step", pa.int32()),  # Model weights step used for the eval
-    ("sample_idx", pa.int32()),  # Index in the eval dataset
+    ("step", pa.int32()),
+    ("eval_name", pa.string()),
+    ("model_step", pa.int32()),
+    ("sample_idx", pa.int32()),   # Index in the eval dataset (not renamed, eval-specific)
+    ("sample_id", pa.int32()),    # Globally unique sample ID (correlates with events_rollout)
     ("env", pa.string()),
     ("prompt", pa.string()),
     ("tokens_prompt", pa.int32()),
@@ -380,18 +505,60 @@ PROMPTS_EVAL_SCHEMA = pa.schema([
     ("tail_idx", pa.int32()),
 ])
 
-ROLLOUTS_EVAL_SCHEMA = pa.schema([
+GENERATIONS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("model_step", pa.int32()),
     ("sample_idx", pa.int32()),
-    ("completion_idx", pa.int32()),  # Which completion for this prompt (0..max(pass_k)-1)
-    ("turn_order", pa.int32()),
-    ("turn_type", pa.string()),
-    ("content", pa.binary()),  # zstd-compressed UTF-8
+    ("sample_id", pa.int32()),
+    ("completion_idx", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("content", pa.binary()),
     ("tokens", pa.int32()),
+    ("prompt_tokens", pa.int32()),
+    ("tool_call_count", pa.int32()),
     ("stop_reason", pa.string()),
-    ("environment_response_time", pa.float64()),
+    ("tail_idx", pa.int32()),
+])
+
+ENV_RESPONSES_EVAL_SCHEMA = pa.schema([
+    ("step", pa.int32()),
+    ("eval_name", pa.string()),
+    ("model_step", pa.int32()),
+    ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("completion_idx", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("content", pa.binary()),
+    ("turn_type", pa.string()),
+    ("tokens", pa.int32()),
+    ("response_time", pa.float64()),
+    ("tail_idx", pa.int32()),
+])
+
+TOOL_CALLS_EVAL_SCHEMA = pa.schema([
+    ("step", pa.int32()),
+    ("eval_name", pa.string()),
+    ("model_step", pa.int32()),
+    ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
+    ("completion_idx", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("tool_call_idx", pa.int32()),
+    ("env_response_generation_idx", pa.int32()),
+    ("tool_name", pa.string()),
+    ("arguments", pa.string()),
+    ("raw_text", pa.string()),
+    ("result", pa.binary()),
+    ("success", pa.bool_()),
+    ("error", pa.string()),
+    ("exit_code", pa.int32()),
+    ("truncated", pa.bool_()),
+    ("result_tokens", pa.int32()),
+    ("sandbox_id", pa.string()),
     ("tail_idx", pa.int32()),
 ])
 
@@ -400,10 +567,12 @@ SAMPLES_DATA_EVAL_SCHEMA = pa.schema([
     ("eval_name", pa.string()),
     ("model_step", pa.int32()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("env", pa.string()),
-    ("turns", pa.int32()),
+    ("num_generations", pa.int32()),
     ("compute_eval_metrics_time", pa.float64()),
+    ("stop_reason", pa.string()),
     ("tail_idx", pa.int32()),
 ])
 
@@ -411,6 +580,7 @@ ROLLOUTS_METRICS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("env", pa.string()),
     ("metric_name", pa.string()),
@@ -422,6 +592,7 @@ GOLDEN_ANSWERS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("env", pa.string()),
     ("key", pa.string()),
@@ -433,8 +604,11 @@ INFO_TURNS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
-    ("turn_order", pa.int32()),
+    ("agent_id", pa.int32()),
+    ("generation_idx", pa.int32()),
+    ("tool_call_idx", pa.int32()),
     ("env", pa.string()),
     ("info_key", pa.string()),
     ("info_value", pa.string()),
@@ -446,6 +620,7 @@ SAMPLE_TAGS_EVAL_SCHEMA = pa.schema([
     ("step", pa.int32()),
     ("eval_name", pa.string()),
     ("sample_idx", pa.int32()),
+    ("sample_id", pa.int32()),
     ("completion_idx", pa.int32()),
     ("env", pa.string()),
     ("tag_name", pa.string()),
@@ -490,14 +665,51 @@ class Event:
 
 
 @dataclass
-class RolloutTurn:
-    """Single turn in a rollout (model output or env response)."""
-    turn_order: int  # 0, 1, 2, ... sequence within this sample
-    turn_type: str  # "model" for model rollouts, or env-provided type
-    content: str  # The text content for this turn
-    tokens: int = 0  # Number of tokens for this turn
-    stop_reason: str = ""  # Why rollout stopped (for model turns: "stop", "length", etc.)
-    environment_response_time: float = 0.0  # Time in seconds for env_response() call (0.0 for model turns)
+class GenerationRecord:
+    """One model generation (one vLLM request/response)."""
+    generation_idx: int  # 0-indexed within (sample_id, agent_id)
+    content: str  # Full generation text
+    tokens: int = 0  # Tokens generated
+    prompt_tokens: int = 0  # Tokens in prompt for this generation
+    tool_call_count: int = 0  # Number of tool calls parsed
+    stop_reason: str = ""  # "eos", "max_tokens", "tool_call", "tool_result_interrupt"
+    # vLLM timing
+    queue_time: float = 0.0
+    ttft: float = 0.0
+    prefill_time: float = 0.0
+    decode_time: float = 0.0
+    inference_time: float = 0.0
+    e2e_latency: float = 0.0
+    server_id: int = -1
+    vllm_request_id: str = ""
+
+
+@dataclass
+class EnvResponseRecord:
+    """One environment response between generations."""
+    generation_idx: int  # Which generation this follows
+    content: str  # Text injected into conversation
+    turn_type: str = "env_response"  # "tool_result", "env_response", "feedback", "context"
+    tokens: int = 0
+    response_time: float = 0.0  # Wall clock for entire env_response processing
+
+
+@dataclass
+class ToolCallRecord:
+    """One tool call with its result."""
+    generation_idx: int  # Which generation created this call
+    tool_call_idx: int  # 0-indexed within generation
+    env_response_generation_idx: int  # Which env_response contains the result
+    tool_name: str = ""
+    arguments: str = ""  # JSON
+    raw_text: str = ""  # Original parsed text from generation
+    result: str = ""  # Tool output text
+    success: bool = True
+    error: str = ""
+    exit_code: int = -1  # For bash/terminal tools
+    truncated: bool = False
+    result_tokens: int = 0
+    sandbox_id: str = ""
 
 
 @dataclass
@@ -514,23 +726,29 @@ class Prompt:
 
 
 @dataclass
-class Rollout:
-    """Single rollout sample with all its turns."""
+class GenerationRollout:
+    """Complete rollout data for one sample, structured around generations."""
     step: int
-    group_id: int  # Links to prompts table
-    sample_idx: int
-    env: str  # Environment name
-    turns: list[RolloutTurn]  # All turns for this sample (model + env responses)
-    reward: float  # Total reward
-    advantage: float
-    sample_metrics: dict[str, float]  # Per-sample metrics: reward components + any other metrics
-    golden_answers: dict[str, str | None] = field(default_factory=dict)  # Golden answer per reward component
-    info_turns: list[dict] = field(default_factory=list)  # Per-turn text info (e.g. stderr, summaries)
-    sample_tags: dict[str, str] = field(default_factory=dict)  # Per-sample string tags for filtering
-    total_tokens: int = 0  # Total tokens passed to trainer
-    raw_string: str = ""  # Decoded raw input passed to trainer
-    compute_reward_time: float = 0.0  # Time in seconds for compute_reward() call
-    tail_idx: int = -1  # Index of the tail upload cycle when first uploaded (events system)
+    group_id: int
+    sample_id: int  # Run-wide unique sample ID
+    agent_id: int = 0
+    env: str = ""
+    generations: list[GenerationRecord] = field(default_factory=list)
+    env_responses: list[EnvResponseRecord] = field(default_factory=list)
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    reward: float = 0.0
+    advantage: float = 0.0
+    sample_metrics: dict[str, float] = field(default_factory=dict)
+    golden_answers: dict[str, str | None] = field(default_factory=dict)
+    info_turns: list[dict] = field(default_factory=list)
+    sample_tags: dict[str, str] = field(default_factory=dict)
+    turn_metrics: list[dict] = field(default_factory=list)  # Per-generation/env-response metrics
+    total_tokens: int = 0
+    raw_string: str = ""
+    compute_reward_time: float = 0.0
+    stop_reason: str = ""  # Why rollout ended: "final_answer", "max_turns", etc.
+    off_policy_steps: int = 0  # Number of weight updates since this rollout was dispatched
+    tail_idx: int = -1
 
 
 @dataclass
@@ -560,62 +778,59 @@ class DiscardedPrompt:
 
 
 @dataclass
-class DiscardedRollout:
+class DiscardedGenerationRollout:
     """A rollout sample that was discarded (not sent to trainer)."""
-    timestamp: float  # When the rollout was discarded
-    discard_reason: str  # Why it was discarded (e.g. "max_async", "zero_advantage")
-    trainer_step: int  # Trainer step at the time of discarding
-    inference_step: int  # Inference step (what step this rollout would have been for)
-    group_id: int  # Links to prompts_discarded table
-    sample_idx: int
-    env: str  # Environment name
-    turns: list[RolloutTurn]  # All turns for this sample (model + env responses)
-    reward: float  # Total reward
-    advantage: float
-    sample_metrics: dict[str, float]  # Per-sample metrics: reward components + any other metrics
-    golden_answers: dict[str, str | None] = field(default_factory=dict)  # Golden answer per reward component
-    info_turns: list[dict] = field(default_factory=list)  # Per-turn text info (e.g. stderr, summaries)
-    sample_tags: dict[str, str] = field(default_factory=dict)  # Per-sample string tags for filtering
-    total_tokens: int = 0  # Total tokens that would have been passed to trainer
-    raw_string: str = ""  # Decoded raw input that would have been passed to trainer
-    compute_reward_time: float = 0.0  # Time in seconds for compute_reward() call
-    tail_idx: int = -1  # Index of the tail upload cycle when first uploaded
+    timestamp: float
+    discard_reason: str
+    trainer_step: int
+    inference_step: int
+    group_id: int
+    sample_id: int
+    agent_id: int = 0
+    env: str = ""
+    generations: list[GenerationRecord] = field(default_factory=list)
+    env_responses: list[EnvResponseRecord] = field(default_factory=list)
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    reward: float = 0.0
+    advantage: float = 0.0
+    sample_metrics: dict[str, float] = field(default_factory=dict)
+    golden_answers: dict[str, str | None] = field(default_factory=dict)
+    info_turns: list[dict] = field(default_factory=list)
+    sample_tags: dict[str, str] = field(default_factory=dict)
+    total_tokens: int = 0
+    raw_string: str = ""
+    compute_reward_time: float = 0.0
+    stop_reason: str = ""
+    off_policy_steps: int = 0
+    tail_idx: int = -1
 
 
 @dataclass
-class InferenceEvent:
-    """Single inference event."""
-    event_type: str
-    start_time: float
-    end_time: float
-    server: int  # Server index (0, 1, ...)
-    node_id: int = -1
-    node_ip: str = ""
-    hostname: str = ""
-    ray_node_id: str = ""
-    tp_group_id: int = -1
-    tp_size: int = 1
-    prompt_tokens: int = 0  # Number of prompt tokens
-    rollout_tokens: int = 0  # Number of generated tokens
-    group_id: int = -1  # Request group ID (shared by all rollouts in a group)
-    sample_id: int = -1  # Run-wide unique sample index for this request
-    tail_idx: int = -1  # Index of the tail upload cycle when this event was first uploaded
-    # vLLM per-request timing from OpenTelemetry spans
-    vllm_request_id: str = ""  # vLLM request ID (e.g. "cmpl-abc123")
-    queue_time: float = 0.0  # Time in vLLM queue
-    time_to_first_token: float = 0.0  # TTFT from vLLM
-    prefill_time: float = 0.0  # Model prefill time
-    decode_time: float = 0.0  # Model decode time
-    inference_time: float = 0.0  # prefill + decode
-    e2e_latency: float = 0.0  # End-to-end latency inside vLLM
-    vllm_max_tokens: int = 0  # max_tokens param for this request
-    is_eval: bool = False  # Whether this is an eval request
-    is_canceled: bool = False  # Whether this request was cancelled before completing
-    compute_reward_time: float = 0.0  # Time for compute_reward/compute_eval_metrics
-    step: int = -1  # Training step (populated for weight_broadcast, -1 for requests)
-    off_policy_steps: int = 0  # Number of weight updates since this rollout was dispatched
-    server_lane: int = -1  # Per-server lane slot for this sample
-    phase: str = ""  # "start" or "end" (empty for backward compat e.g. weight_broadcast)
+class RolloutEvent:
+    """Per-sample lifecycle event (generation, tool_execution, env_response, reward)."""
+    timestamp: float
+    event_type: str  # "generation", "tool_execution", "env_response", "reward"
+    phase: str  # "start" or "end"
+    group_id: int = -1
+    sample_id: int = -1
+    agent_id: int = 0
+    generation_idx: int = -1
+    tool_call_idx: int = -1
+    server_id: int = -1
+    server_lane: int = -1  # Per-server lane slot for timeline positioning
+    tail_idx: int = -1
+
+
+@dataclass
+class InfraEvent:
+    """Infrastructure lifecycle event (weight_sync, sandbox)."""
+    timestamp: float
+    event_type: str  # "weight_sync", "sandbox"
+    phase: str  # "start"/"end" for weight_sync; "create"/"setup"/"ready"/"execute"/"destroy" for sandbox
+    step: int = -1
+    server_id: int = -1
+    sandbox_id: str = ""
+    tail_idx: int = -1
 
 
 @dataclass
@@ -630,24 +845,30 @@ class EvalPrompt:
     tokens_prompt: int = 0
     system_prompt: str = ""
     tokens_system_prompt: int = 0
+    sample_id: int = -1  # Globally unique sample ID (correlates with events_rollout)
     tail_idx: int = -1
 
 
 @dataclass
-class EvalRollout:
-    """A single eval completion with all its turns."""
+class EvalGenerationRollout:
+    """A single eval completion structured around generations."""
     step: int
     eval_name: str
     model_step: int
     sample_idx: int
     completion_idx: int  # 0..max(pass_k)-1
-    env: str
-    turns: list[RolloutTurn]
+    env: str = ""
+    agent_id: int = 0
+    sample_id: int = -1  # Globally unique sample ID (correlates with events_rollout)
+    generations: list[GenerationRecord] = field(default_factory=list)
+    env_responses: list[EnvResponseRecord] = field(default_factory=list)
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
     sample_metrics: dict[str, float] = field(default_factory=dict)
     golden_answers: dict[str, str | None] = field(default_factory=dict)
     info_turns: list[dict] = field(default_factory=list)
     sample_tags: dict[str, str] = field(default_factory=dict)
     compute_eval_metrics_time: float = 0.0
+    stop_reason: str = ""
     tail_idx: int = -1
 
 
@@ -658,29 +879,30 @@ class EventLogger:
     This logger consolidates data from multiple sources:
     - Orchestrator events (instant events)
     - Trainer events (duration events with hierarchy)
-    - Inference events (request and weight broadcast timings)
+    - Rollout events (generation/tool_execution/env_response/reward lifecycle)
+    - Infrastructure events (weight_sync, sandbox lifecycle)
     - GPU metrics (from SystemMetricsLogger)
     - CPU metrics (from SystemMetricsLogger)
     - vLLM metrics (from VllmMetricsLogger)
-    
+
     All data is written to unified zip archives in the events/ folder.
-    
+
     Usage:
         logger = EventLogger()
         logger.initialize(wandb_run)
         logger.set_metrics_loggers(system_metrics_logger, vllm_metrics_logger)
-        
+
         # Log events
-        logger.log_event("forward", source="trainer", step=0, rank=0, 
+        logger.log_event("forward", source="trainer", step=0, rank=0,
                         start_time=t0, end_time=t1)
-        logger.log_instant_event("inference_call_start", source="orchestrator")
-        
+        logger.log_rollout_event(event_type="generation", phase="start", ...)
+
         # Log rollouts
-        logger.log_rollout(step=0, sample_idx=0, prompt="...", completion="...", ...)
-        
+        logger.log_generation_rollout(step=0, sample_id=0, generations=[...], ...)
+
         # Start background upload loop (call once)
         await logger.start_upload_loop()
-        
+
         # Or manually trigger upload
         logger.upload_now()
     """
@@ -711,11 +933,16 @@ class EventLogger:
 
         # Event buffers
         self._events: list[Event] = []
-        self._inference_events: list[InferenceEvent] = []
-        self._inflight_generations: dict[int, InferenceEvent] = {}  # sample_id -> start event
-        self._ended_generation_info: dict[int, InferenceEvent] = {}  # sample_id -> stashed start event after phase="end"
-        self._inflight_compute_reward: dict[int, dict] = {}  # sample_id -> compute_reward inflight info
-        self._inflight_env_response: dict[int, dict] = {}  # sample_id -> env_response inflight info
+        self._rollout_events: list[RolloutEvent] = []
+        self._infra_events: list[InfraEvent] = []
+
+        # Inflight tracking (for snapshot in tail.zip)
+        self._inflight_generations: dict[int, dict] = {}  # sample_id -> {sample_id, generation_idx, server_id, agent_id}
+        self._inflight_tool_executions: dict[tuple[int, int], dict] = {}  # (sample_id, tool_call_idx) -> {sample_id, generation_idx, tool_call_idx, tool_name, agent_id}
+        self._inflight_env_responses: dict[int, dict] = {}  # sample_id -> {sample_id, generation_idx, agent_id}
+        self._inflight_rewards: dict[int, dict] = {}  # sample_id -> {sample_id, agent_id}
+        self._inflight_weight_syncs: dict[int, dict] = {}  # server_id -> {server_id, step}
+        self._inflight_sandbox_ops: dict[str, dict] = {}  # sandbox_id -> {sandbox_id, phase}
 
         # External metrics loggers (set via set_metrics_loggers)
         self._system_metrics_logger: SystemMetricsLogger | None = None
@@ -739,7 +966,7 @@ class EventLogger:
         # Rollout tracking
         self._last_training_step: int = -1
         self._trainer_steps_done: int = 0
-        self._pending_rollouts: dict[int, list[Rollout]] = {}
+        self._pending_rollouts: dict[int, list[GenerationRollout]] = {}
         self._pending_prompts: dict[int, list[Prompt]] = {}  # Prompts per step
         self._logged_group_ids: set[int] = set()  # Track which group_ids have been logged
         
@@ -747,7 +974,7 @@ class EventLogger:
         self._pending_step_metrics: dict[int, list[StepMetric]] = {}
         
         # Step block tracking (by step count, not time) - includes rollouts, prompts, and metrics
-        self._rollout_block_data: dict[int, list[Rollout]] = {}  # All rollouts in current block
+        self._rollout_block_data: dict[int, list[GenerationRollout]] = {}  # All rollouts in current block
         self._prompts_block_data: dict[int, list[Prompt]] = {}  # All prompts in current block
         self._step_metrics_block_data: dict[int, list[StepMetric]] = {}  # All step metrics in current block
         self._step_block_start_step: int = 0  # First step in current block
@@ -756,16 +983,22 @@ class EventLogger:
 
         # Discarded rollouts tracking (uploaded in events zip, not rollouts)
         # These are rollouts that were not sent to the trainer (async limit, zero advantage, etc.)
-        self._discarded_rollouts: list[DiscardedRollout] = []
+        self._discarded_rollouts: list[DiscardedGenerationRollout] = []
         self._discarded_prompts: list[DiscardedPrompt] = []
         self._logged_discarded_group_ids: set[int] = set()  # Track which discarded group_ids have been logged
 
+        # Cancelled rollouts tracking (uploaded in events zip, same schema as discarded)
+        # These are rollouts that were interrupted mid-flight (off-policy cancellation, eval drain, etc.)
+        self._cancelled_rollouts: list[DiscardedGenerationRollout] = []
+        self._cancelled_prompts: list[DiscardedPrompt] = []
+        self._logged_cancelled_group_ids: set[int] = set()
+
         # Kept rollouts tracking (uploaded in events zip alongside discarded, for real-time incremental ingestion)
-        self._kept_rollouts: list[Rollout] = []
+        self._kept_rollouts: list[GenerationRollout] = []
         self._kept_prompts: list[Prompt] = []
 
         # Eval tracking (parallel to discarded, in events zip)
-        self._eval_rollouts: list[EvalRollout] = []
+        self._eval_rollouts: list[EvalGenerationRollout] = []
         self._eval_prompts: list[EvalPrompt] = []
         self._logged_eval_prompt_keys: set[tuple] = set()  # (step, eval_name, sample_idx)
 
@@ -900,260 +1133,286 @@ class EventLogger:
 
         with self._lock:
             self._events.append(event)
-            # Track inflight compute_reward for snapshot
-            if event_type == "compute_reward_start" and sample_id >= 0:
-                gen_event = self._ended_generation_info.get(sample_id)
-                entry = {
-                    "sample_id": sample_id,
-                    "group_id": group_id,
-                    "server": gen_event.server if gen_event else -1,
-                    "server_lane": gen_event.server_lane if gen_event else -1,
-                    "start_time": ts,
-                    "is_eval": gen_event.is_eval if gen_event else False,
-                    "prompt_tokens": gen_event.prompt_tokens if gen_event else 0,
-                }
-                self._inflight_compute_reward[sample_id] = entry
-            elif event_type == "compute_reward_end" and sample_id >= 0:
-                self._inflight_compute_reward.pop(sample_id, None)
-                self._ended_generation_info.pop(sample_id, None)
-            # Track inflight env_response for snapshot
-            elif event_type == "env_response_start" and sample_id >= 0:
-                gen_event = self._inflight_generations.get(sample_id)
-                entry = {
-                    "sample_id": sample_id,
-                    "group_id": group_id,
-                    "server": gen_event.server if gen_event else -1,
-                    "server_lane": gen_event.server_lane if gen_event else -1,
-                    "start_time": ts,
-                    "is_eval": gen_event.is_eval if gen_event else False,
-                    "prompt_tokens": gen_event.prompt_tokens if gen_event else 0,
-                }
-                self._inflight_env_response[sample_id] = entry
-            elif event_type == "env_response_end" and sample_id >= 0:
-                self._inflight_env_response.pop(sample_id, None)
 
-    def log_rollout(
+    def log_generation_rollout(
         self,
         step: int,
         group_id: int,
-        sample_idx: int,
+        sample_id: int,
         prompt: str,
-        turns: list[dict] | None,
-        reward: float,
-        advantage: float,
+        generations: list[dict] | None = None,
+        env_responses: list[dict] | None = None,
+        tool_calls: list[dict] | None = None,
+        reward: float = 0.0,
+        advantage: float = 0.0,
         env: str = "",
         sample_metrics: dict[str, float] | None = None,
         golden_answers: dict[str, str | None] | None = None,
         info_turns: list[dict] | None = None,
         sample_tags: dict[str, str] | None = None,
+        turn_metrics: list[dict] | None = None,
         tokens_prompt: int = 0,
         system_prompt: str = "",
         tokens_system_prompt: int = 0,
         total_tokens: int = 0,
         raw_string: str = "",
         compute_reward_time: float = 0.0,
+        stop_reason: str = "",
+        off_policy_steps: int = 0,
+        agent_id: int = 0,
     ):
         """
-        Log a rollout sample for a training step.
+        Log a generation-centric rollout sample for a training step.
 
         Args:
             step: Training step
-            group_id: Request group ID (shared by all completions with same prompt)
-            sample_idx: Run-wide unique sample index (starts at 0, grows throughout run)
-            prompt: Input prompt text (for the prompts table)
-            turns: List of turn dicts with keys:
-                   - "turn_order": int (0, 1, 2, ...)
-                   - "turn_type": str ("model" or env-provided type like "tool_result")
-                   - "content": str (the text content)
-                   - "tokens": int (number of tokens for this turn)
+            group_id: Request group ID
+            sample_id: Run-wide unique sample ID
+            prompt: Input prompt text
+            generations: List of generation dicts (generation_idx, content, tokens, prompt_tokens, ...)
+            env_responses: List of env response dicts (generation_idx, content, turn_type, tokens, ...)
+            tool_calls: List of tool call dicts (generation_idx, tool_call_idx, tool_name, ...)
             reward: Total reward
             advantage: Computed advantage
-            env: Environment name (e.g. "countdown", "coding")
-            sample_metrics: Dict of per-sample metric names to values
-                           (e.g. {"format_reward": 1.0, "equation_reward": 0.5, "char_count": 150.0})
-            golden_answers: Dict mapping golden answer keys to their values
-                           (e.g. {"correct": "42"})
-            info_turns: List of per-turn text info dicts with keys:
-                       - "turn_order": int (which turn this info is for)
-                       - "info_key": str (e.g. "stderr", "summary")
-                       - "info_value": str (the text content)
-                       - "info_type": str (default "text", can be "stderr", "stdout", etc.)
-            sample_tags: Dict of per-sample string tags for filtering
-                        (e.g. {"style": "4 numbers", "task": "coding"})
-            tokens_prompt: Number of prompt tokens (stored in prompts table)
-            system_prompt: The system message (if any)
-            tokens_system_prompt: Number of tokens in the system message
-            total_tokens: Total tokens passed to trainer (prompt + completion)
-            raw_string: Decoded raw input passed to trainer
+            env: Environment name
+            sample_metrics: Per-sample metrics
+            golden_answers: Golden answers
+            info_turns: Per-generation info items
+            sample_tags: Per-sample tags
+            turn_metrics: Per-generation/env-response metrics
+            tokens_prompt: Number of initial prompt tokens
+            system_prompt: System message
+            tokens_system_prompt: System message tokens
+            total_tokens: Total tokens passed to trainer
+            raw_string: Raw input passed to trainer
+            compute_reward_time: Reward computation time
+            stop_reason: Why the rollout ended
+            agent_id: Agent ID (0 = main)
         """
-        # Convert turns to RolloutTurn objects
-        if turns is None:
-            rollout_turns = []
-        else:
-            rollout_turns = [
-                RolloutTurn(
-                    turn_order=t["turn_order"],
-                    turn_type=t["turn_type"],
-                    content=t["content"],
-                    tokens=t.get("tokens", 0),
-                    stop_reason=t.get("stop_reason", ""),
-                    environment_response_time=t.get("environment_response_time", 0.0),
-                )
-                for t in turns
-            ]
-        
-        gen = Rollout(
+        gen_records = [
+            GenerationRecord(
+                generation_idx=g["generation_idx"],
+                content=g.get("content", ""),
+                tokens=g.get("tokens", 0),
+                prompt_tokens=g.get("prompt_tokens", 0),
+                tool_call_count=g.get("tool_call_count", 0),
+                stop_reason=g.get("stop_reason", ""),
+                queue_time=g.get("queue_time", 0.0),
+                ttft=g.get("ttft", 0.0),
+                prefill_time=g.get("prefill_time", 0.0),
+                decode_time=g.get("decode_time", 0.0),
+                inference_time=g.get("inference_time", 0.0),
+                e2e_latency=g.get("e2e_latency", 0.0),
+                server_id=g.get("server_id", -1),
+                vllm_request_id=g.get("vllm_request_id", ""),
+            )
+            for g in (generations or [])
+        ]
+
+        env_records = [
+            EnvResponseRecord(
+                generation_idx=e["generation_idx"],
+                content=e.get("content", ""),
+                turn_type=e.get("turn_type", "env_response"),
+                tokens=e.get("tokens", 0),
+                response_time=e.get("response_time", 0.0),
+            )
+            for e in (env_responses or [])
+        ]
+
+        tc_records = [
+            ToolCallRecord(
+                generation_idx=tc["generation_idx"],
+                tool_call_idx=tc.get("tool_call_idx", 0),
+                env_response_generation_idx=tc.get("env_response_generation_idx", tc["generation_idx"]),
+                tool_name=tc.get("tool_name", ""),
+                arguments=tc.get("arguments", ""),
+                raw_text=tc.get("raw_text", ""),
+                result=tc.get("result", ""),
+                success=tc.get("success", True),
+                error=tc.get("error", ""),
+                exit_code=tc.get("exit_code", -1),
+                truncated=tc.get("truncated", False),
+                result_tokens=tc.get("result_tokens", 0),
+                sandbox_id=tc.get("sandbox_id", ""),
+            )
+            for tc in (tool_calls or [])
+        ]
+
+        rollout = GenerationRollout(
             step=step,
             group_id=group_id,
-            sample_idx=sample_idx,
+            sample_id=sample_id,
+            agent_id=agent_id,
             env=env,
-            turns=rollout_turns,
+            generations=gen_records,
+            env_responses=env_records,
+            tool_calls=tc_records,
             reward=reward,
             advantage=advantage,
             sample_metrics=sample_metrics or {},
             golden_answers=golden_answers or {},
             info_turns=info_turns or [],
             sample_tags=sample_tags or {},
+            turn_metrics=turn_metrics or [],
             total_tokens=total_tokens,
             raw_string=raw_string,
             compute_reward_time=compute_reward_time,
+            stop_reason=stop_reason,
+            off_policy_steps=off_policy_steps,
         )
 
         with self._lock:
             if step not in self._pending_rollouts:
                 self._pending_rollouts[step] = []
-            self._pending_rollouts[step].append(gen)
-            # Also track for events system (tail_idx-based incremental)
-            self._kept_rollouts.append(gen)
+            self._pending_rollouts[step].append(rollout)
+            self._kept_rollouts.append(rollout)
 
             # Log prompt if this group_id hasn't been logged yet
             if group_id not in self._logged_group_ids:
                 self._logged_group_ids.add(group_id)
+                prompt_obj = Prompt(
+                    step=step,
+                    group_id=group_id,
+                    env=env,
+                    prompt=prompt,
+                    tokens_prompt=tokens_prompt,
+                    system_prompt=system_prompt,
+                    tokens_system_prompt=tokens_system_prompt,
+                )
                 if step not in self._pending_prompts:
                     self._pending_prompts[step] = []
-                self._pending_prompts[step].append(Prompt(
-                    step=step,
-                    group_id=group_id,
-                    env=env,
-                    prompt=prompt,
-                    tokens_prompt=tokens_prompt,
-                    system_prompt=system_prompt,
-                    tokens_system_prompt=tokens_system_prompt,
-                ))
-                # Also track for events system (tail_idx-based incremental)
-                self._kept_prompts.append(Prompt(
-                    step=step,
-                    group_id=group_id,
-                    env=env,
-                    prompt=prompt,
-                    tokens_prompt=tokens_prompt,
-                    system_prompt=system_prompt,
-                    tokens_system_prompt=tokens_system_prompt,
-                ))
+                self._pending_prompts[step].append(prompt_obj)
+                self._kept_prompts.append(prompt_obj)
             self._last_training_step = max(self._last_training_step, step)
 
-    def log_inference_event(
+    def log_rollout_event(
         self,
         event_type: str,
-        server: int,
-        start_time: float,
-        end_time: float,
-        node_id: int = -1,
-        node_ip: str = "",
-        hostname: str = "",
-        ray_node_id: str = "",
-        tp_group_id: int = -1,
-        tp_size: int = 1,
-        prompt_tokens: int = 0,
-        rollout_tokens: int = 0,
+        phase: str,
+        timestamp: float | None = None,
         group_id: int = -1,
         sample_id: int = -1,
-        vllm_request_id: str = "",
-        queue_time: float = 0.0,
-        time_to_first_token: float = 0.0,
-        prefill_time: float = 0.0,
-        decode_time: float = 0.0,
-        inference_time: float = 0.0,
-        e2e_latency: float = 0.0,
-        vllm_max_tokens: int = 0,
-        is_eval: bool = False,
-        is_canceled: bool = False,
-        compute_reward_time: float = 0.0,
-        step: int = -1,
-        off_policy_steps: int = 0,
+        agent_id: int = 0,
+        generation_idx: int = -1,
+        tool_call_idx: int = -1,
+        server_id: int = -1,
         server_lane: int = -1,
-        phase: str = "",
+        tool_name: str = "",
     ):
         """
-        Log an inference event (request or weight broadcast).
+        Log a rollout lifecycle event (generation, tool_execution, env_response, reward).
 
         Args:
-            event_type: "request" or "weight_broadcast"
-            server: Server index (0, 1, ...)
-            start_time: Event start timestamp
-            end_time: Event end timestamp
-            prompt_tokens: Number of prompt tokens (for requests)
-            rollout_tokens: Number of generated tokens (for requests)
-            group_id: Request group ID (shared by all rollouts in a group)
-            sample_id: Run-wide unique sample index (requests only)
-            vllm_request_id: vLLM request ID from completion response (e.g. "cmpl-abc123")
-            queue_time: Time request waited in vLLM's queue (from OTLP span)
-            time_to_first_token: TTFT from vLLM (from OTLP span)
-            prefill_time: Model prefill time (from OTLP span)
-            decode_time: Model decode time (from OTLP span)
-            inference_time: prefill + decode (from OTLP span)
-            e2e_latency: End-to-end latency inside vLLM (from OTLP span)
-            vllm_max_tokens: max_tokens param for this request
-            is_eval: Whether this is an eval request (not training)
-            is_canceled: Whether this request was cancelled before completing
-            compute_reward_time: Time for compute_reward or compute_eval_metrics (seconds)
-            step: Training step (populated for weight_broadcast events, -1 for requests)
-            off_policy_steps: Number of weight updates since this rollout was dispatched
-            server_lane: Per-server lane slot for this sample
-            phase: "start" or "end" (empty for weight_broadcast events)
+            event_type: "generation", "tool_execution", "env_response", "reward"
+            phase: "start" or "end"
+            timestamp: Event timestamp (defaults to now)
+            group_id: Request group ID
+            sample_id: Run-wide unique sample ID
+            agent_id: Agent ID (0 = main)
+            generation_idx: Generation index (-1 if N/A)
+            tool_call_idx: Tool call index (-1 if N/A)
+            server_id: Inference server index (-1 if N/A)
+            server_lane: Per-server lane slot for timeline positioning (-1 if N/A)
+            tool_name: Tool name for tool_execution events (inflight display only, not in events table)
         """
-        event = InferenceEvent(
+        ts = timestamp if timestamp is not None else time.time()
+        event = RolloutEvent(
+            timestamp=ts,
             event_type=event_type,
-            start_time=start_time,
-            end_time=end_time,
-            server=server,
-            node_id=node_id,
-            node_ip=node_ip,
-            hostname=hostname,
-            ray_node_id=ray_node_id,
-            tp_group_id=tp_group_id,
-            tp_size=tp_size,
-            prompt_tokens=prompt_tokens,
-            rollout_tokens=rollout_tokens,
+            phase=phase,
             group_id=group_id,
             sample_id=sample_id,
-            vllm_request_id=vllm_request_id,
-            queue_time=queue_time,
-            time_to_first_token=time_to_first_token,
-            prefill_time=prefill_time,
-            decode_time=decode_time,
-            inference_time=inference_time,
-            e2e_latency=e2e_latency,
-            vllm_max_tokens=vllm_max_tokens,
-            is_eval=is_eval,
-            is_canceled=is_canceled,
-            compute_reward_time=compute_reward_time,
-            step=step,
-            off_policy_steps=off_policy_steps,
+            agent_id=agent_id,
+            generation_idx=generation_idx,
+            tool_call_idx=tool_call_idx,
+            server_id=server_id,
             server_lane=server_lane,
-            phase=phase,
         )
 
         with self._lock:
-            self._inference_events.append(event)
-            # Track inflight generations for snapshot
-            if phase == "start" and sample_id >= 0:
-                self._inflight_generations[sample_id] = event
-            elif phase == "end" and sample_id >= 0:
-                # Stash server/lane info for compute_reward inflight tracking
-                start_ev = self._inflight_generations.pop(sample_id, None)
-                if start_ev is not None:
-                    self._ended_generation_info[sample_id] = start_ev
+            self._rollout_events.append(event)
+
+            # Update inflight tracking
+            if event_type == "generation":
+                if phase == "start" and sample_id >= 0:
+                    self._inflight_generations[sample_id] = {
+                        "sample_id": sample_id, "generation_idx": generation_idx,
+                        "server_id": server_id, "server_lane": server_lane,
+                        "group_id": group_id, "agent_id": agent_id,
+                        "start_time": ts,
+                    }
+                elif phase == "end" and sample_id >= 0:
+                    self._inflight_generations.pop(sample_id, None)
+            elif event_type == "tool_execution":
+                if phase == "start" and sample_id >= 0:
+                    self._inflight_tool_executions[(sample_id, tool_call_idx)] = {
+                        "sample_id": sample_id, "generation_idx": generation_idx,
+                        "tool_call_idx": tool_call_idx, "tool_name": tool_name,
+                        "agent_id": agent_id,
+                    }
+                elif phase == "end" and sample_id >= 0:
+                    self._inflight_tool_executions.pop((sample_id, tool_call_idx), None)
+            elif event_type == "env_response":
+                if phase == "start" and sample_id >= 0:
+                    self._inflight_env_responses[sample_id] = {
+                        "sample_id": sample_id, "generation_idx": generation_idx,
+                        "agent_id": agent_id,
+                    }
+                elif phase == "end" and sample_id >= 0:
+                    self._inflight_env_responses.pop(sample_id, None)
+            elif event_type == "reward":
+                if phase == "start" and sample_id >= 0:
+                    self._inflight_rewards[sample_id] = {
+                        "sample_id": sample_id, "agent_id": agent_id,
+                    }
+                elif phase == "end" and sample_id >= 0:
+                    self._inflight_rewards.pop(sample_id, None)
+
+    def log_infra_event(
+        self,
+        event_type: str,
+        phase: str,
+        timestamp: float | None = None,
+        step: int = -1,
+        server_id: int = -1,
+        sandbox_id: str = "",
+    ):
+        """
+        Log an infrastructure event (weight_sync, sandbox lifecycle).
+
+        Args:
+            event_type: "weight_sync" or "sandbox"
+            phase: "start"/"end" for weight_sync; "create"/"setup"/"ready"/"execute"/"destroy" for sandbox
+            timestamp: Event timestamp (defaults to now)
+            step: Training step (-1 if N/A)
+            server_id: Server index for weight_sync (-1 if N/A)
+            sandbox_id: Sandbox ID for sandbox events
+        """
+        ts = timestamp if timestamp is not None else time.time()
+        event = InfraEvent(
+            timestamp=ts,
+            event_type=event_type,
+            phase=phase,
+            step=step,
+            server_id=server_id,
+            sandbox_id=sandbox_id,
+        )
+
+        with self._lock:
+            self._infra_events.append(event)
+
+            # Update inflight tracking
+            if event_type == "weight_sync":
+                if phase == "start" and server_id >= 0:
+                    self._inflight_weight_syncs[server_id] = {"server_id": server_id, "step": step}
+                elif phase == "end" and server_id >= 0:
+                    self._inflight_weight_syncs.pop(server_id, None)
+            elif event_type == "sandbox":
+                if phase in ("create", "setup"):
+                    self._inflight_sandbox_ops[sandbox_id] = {"sandbox_id": sandbox_id, "phase": phase}
+                elif phase in ("ready", "destroy"):
+                    self._inflight_sandbox_ops.pop(sandbox_id, None)
 
     def log_step_metric(self, step: int, metric: str, value: float, section: str = "", group: str = ""):
         """Log a per-step metric."""
@@ -1169,17 +1428,19 @@ class EventLogger:
         with self._lock:
             self._trainer_steps_done = max(0, trainer_steps_done)
 
-    def log_discarded_rollout(
+    def log_discarded_generation_rollout(
         self,
         discard_reason: str,
         trainer_step: int,
         inference_step: int,
         group_id: int,
-        sample_idx: int,
+        sample_id: int,
         prompt: str,
-        turns: list[dict] | None,
-        reward: float,
-        advantage: float,
+        generations: list[dict] | None = None,
+        env_responses: list[dict] | None = None,
+        tool_calls: list[dict] | None = None,
+        reward: float = 0.0,
+        advantage: float = 0.0,
         env: str = "",
         sample_metrics: dict[str, float] | None = None,
         golden_answers: dict[str, str | None] | None = None,
@@ -1192,67 +1453,75 @@ class EventLogger:
         total_tokens: int = 0,
         raw_string: str = "",
         compute_reward_time: float = 0.0,
+        stop_reason: str = "",
+        off_policy_steps: int = 0,
+        agent_id: int = 0,
     ):
-        """
-        Log a discarded rollout sample.
-
-        These are rollouts that were not sent to the trainer due to:
-        - max_async: Async level exceeded the maximum allowed
-        - zero_advantage: All samples in the group had zero advantage
-
-        Args:
-            discard_reason: Why the rollout was discarded (e.g. "max_async", "zero_advantage")
-            trainer_step: Current trainer step at the time of discarding
-            inference_step: Current inference step (what step this rollout would have been for)
-            group_id: Request group ID (shared by all completions with same prompt)
-            sample_idx: Run-wide unique sample index (starts at 0, grows throughout run)
-            prompt: Input prompt text (for the prompts_discarded table)
-            turns: List of turn dicts with keys:
-                   - "turn_order": int (0, 1, 2, ...)
-                   - "turn_type": str ("model" or env-provided type)
-                   - "content": str (the text content)
-                   - "tokens": int (number of tokens for this turn)
-            reward: Total reward
-            advantage: Computed advantage
-            env: Environment name (e.g. "countdown", "coding")
-            sample_metrics: Dict of per-sample metric names to values
-            golden_answers: Dict mapping golden answer keys to their values
-            info_turns: List of per-turn text info dicts (see log_rollout)
-            sample_tags: Dict of per-sample string tags for filtering
-            tokens_prompt: Number of prompt tokens (stored in prompts_discarded table)
-            system_prompt: The system message (if any)
-            tokens_system_prompt: Number of tokens in the system message
-            timestamp: When the rollout was discarded (defaults to now)
-            total_tokens: Total tokens that would have been passed to trainer
-            raw_string: Decoded raw input that would have been passed to trainer
-        """
+        """Log a discarded rollout sample (not sent to trainer)."""
         ts = timestamp if timestamp is not None else time.time()
-        
-        # Convert turns to RolloutTurn objects
-        if turns is None:
-            rollout_turns = []
-        else:
-            rollout_turns = [
-                RolloutTurn(
-                    turn_order=t["turn_order"],
-                    turn_type=t["turn_type"],
-                    content=t["content"],
-                    tokens=t.get("tokens", 0),
-                    stop_reason=t.get("stop_reason", ""),
-                    environment_response_time=t.get("environment_response_time", 0.0),
-                )
-                for t in turns
-            ]
-        
-        gen = DiscardedRollout(
+
+        gen_records = [
+            GenerationRecord(
+                generation_idx=g["generation_idx"],
+                content=g.get("content", ""),
+                tokens=g.get("tokens", 0),
+                prompt_tokens=g.get("prompt_tokens", 0),
+                tool_call_count=g.get("tool_call_count", 0),
+                stop_reason=g.get("stop_reason", ""),
+                queue_time=g.get("queue_time", 0.0),
+                ttft=g.get("ttft", 0.0),
+                prefill_time=g.get("prefill_time", 0.0),
+                decode_time=g.get("decode_time", 0.0),
+                inference_time=g.get("inference_time", 0.0),
+                e2e_latency=g.get("e2e_latency", 0.0),
+                server_id=g.get("server_id", -1),
+                vllm_request_id=g.get("vllm_request_id", ""),
+            )
+            for g in (generations or [])
+        ]
+
+        env_records = [
+            EnvResponseRecord(
+                generation_idx=e["generation_idx"],
+                content=e.get("content", ""),
+                turn_type=e.get("turn_type", "env_response"),
+                tokens=e.get("tokens", 0),
+                response_time=e.get("response_time", 0.0),
+            )
+            for e in (env_responses or [])
+        ]
+
+        tc_records = [
+            ToolCallRecord(
+                generation_idx=tc["generation_idx"],
+                tool_call_idx=tc.get("tool_call_idx", 0),
+                env_response_generation_idx=tc.get("env_response_generation_idx", tc["generation_idx"]),
+                tool_name=tc.get("tool_name", ""),
+                arguments=tc.get("arguments", ""),
+                raw_text=tc.get("raw_text", ""),
+                result=tc.get("result", ""),
+                success=tc.get("success", True),
+                error=tc.get("error", ""),
+                exit_code=tc.get("exit_code", -1),
+                truncated=tc.get("truncated", False),
+                result_tokens=tc.get("result_tokens", 0),
+                sandbox_id=tc.get("sandbox_id", ""),
+            )
+            for tc in (tool_calls or [])
+        ]
+
+        rollout = DiscardedGenerationRollout(
             timestamp=ts,
             discard_reason=discard_reason,
             trainer_step=trainer_step,
             inference_step=inference_step,
             group_id=group_id,
-            sample_idx=sample_idx,
+            sample_id=sample_id,
+            agent_id=agent_id,
             env=env,
-            turns=rollout_turns,
+            generations=gen_records,
+            env_responses=env_records,
+            tool_calls=tc_records,
             reward=reward,
             advantage=advantage,
             sample_metrics=sample_metrics or {},
@@ -1262,12 +1531,13 @@ class EventLogger:
             total_tokens=total_tokens,
             raw_string=raw_string,
             compute_reward_time=compute_reward_time,
+            stop_reason=stop_reason,
+            off_policy_steps=off_policy_steps,
         )
 
         with self._lock:
-            self._discarded_rollouts.append(gen)
-            
-            # Log discarded prompt if this group_id hasn't been logged yet
+            self._discarded_rollouts.append(rollout)
+
             if group_id not in self._logged_discarded_group_ids:
                 self._logged_discarded_group_ids.add(group_id)
                 self._discarded_prompts.append(DiscardedPrompt(
@@ -1283,6 +1553,55 @@ class EventLogger:
                     tokens_system_prompt=tokens_system_prompt,
                 ))
 
+    def log_cancelled_generation_rollout(
+        self,
+        cancel_reason: str,
+        trainer_step: int,
+        inference_step: int,
+        group_id: int,
+        sample_id: int,
+        prompt: str = "",
+        env: str = "",
+        tokens_prompt: int = 0,
+        timestamp: float | None = None,
+        off_policy_steps: int = 0,
+        agent_id: int = 0,
+    ):
+        """Log a cancelled rollout sample (inference was interrupted).
+
+        Reuses DiscardedGenerationRollout with empty generation data since
+        the inference never completed.
+        """
+        ts = timestamp if timestamp is not None else time.time()
+
+        rollout = DiscardedGenerationRollout(
+            timestamp=ts,
+            discard_reason=cancel_reason,
+            trainer_step=trainer_step,
+            inference_step=inference_step,
+            group_id=group_id,
+            sample_id=sample_id,
+            agent_id=agent_id,
+            env=env,
+            off_policy_steps=off_policy_steps,
+        )
+
+        with self._lock:
+            self._cancelled_rollouts.append(rollout)
+
+            if group_id not in self._logged_cancelled_group_ids:
+                self._logged_cancelled_group_ids.add(group_id)
+                self._cancelled_prompts.append(DiscardedPrompt(
+                    timestamp=ts,
+                    discard_reason=cancel_reason,
+                    trainer_step=trainer_step,
+                    inference_step=inference_step,
+                    group_id=group_id,
+                    env=env,
+                    prompt=prompt,
+                    tokens_prompt=tokens_prompt,
+                ))
+
     def log_eval_prompt(self, prompt: EvalPrompt):
         """Buffer an eval prompt for upload (deduplicated by step+eval_name+sample_idx)."""
         key = (prompt.step, prompt.eval_name, prompt.sample_idx)
@@ -1291,7 +1610,7 @@ class EventLogger:
                 self._logged_eval_prompt_keys.add(key)
                 self._eval_prompts.append(prompt)
 
-    def log_eval_rollout(self, rollout: EvalRollout):
+    def log_eval_rollout(self, rollout: EvalGenerationRollout):
         """Buffer an eval rollout for upload."""
         with self._lock:
             self._eval_rollouts.append(rollout)
@@ -1380,69 +1699,39 @@ class EventLogger:
         }
         return pa.table(data, schema=TRAINER_EVENT_SCHEMA)
 
-    def _inference_events_to_table(self, events: list[InferenceEvent]) -> pa.Table:
-        """Convert list of inference events to PyArrow table."""
+    def _rollout_events_to_table(self, events: list[RolloutEvent]) -> pa.Table:
+        """Convert list of rollout events to PyArrow table."""
         if not events:
-            return pa.table({
-                "event_type": pa.array([], type=pa.string()),
-                "start_time": pa.array([], type=pa.float64()),
-                "end_time": pa.array([], type=pa.float64()),
-                "server": pa.array([], type=pa.int32()),
-                "node_id": pa.array([], type=pa.int32()),
-                "tp_group_id": pa.array([], type=pa.int32()),
-                "tp_size": pa.array([], type=pa.int32()),
-                "prompt_tokens": pa.array([], type=pa.int32()),
-                "rollout_tokens": pa.array([], type=pa.int32()),
-                "group_id": pa.array([], type=pa.int32()),
-                "sample_id": pa.array([], type=pa.int32()),
-                "tail_idx": pa.array([], type=pa.int32()),
-                "vllm_request_id": pa.array([], type=pa.string()),
-                "queue_time": pa.array([], type=pa.float64()),
-                "time_to_first_token": pa.array([], type=pa.float64()),
-                "prefill_time": pa.array([], type=pa.float64()),
-                "decode_time": pa.array([], type=pa.float64()),
-                "inference_time": pa.array([], type=pa.float64()),
-                "e2e_latency": pa.array([], type=pa.float64()),
-                "vllm_max_tokens": pa.array([], type=pa.int32()),
-                "is_eval": pa.array([], type=pa.bool_()),
-                "is_canceled": pa.array([], type=pa.bool_()),
-                "compute_reward_time": pa.array([], type=pa.float64()),
-                "step": pa.array([], type=pa.int32()),
-                "off_policy_steps": pa.array([], type=pa.int32()),
-                "server_lane": pa.array([], type=pa.int32()),
-                "phase": pa.array([], type=pa.string()),
-            })
-
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(EVENTS_ROLLOUT_SCHEMA.names, EVENTS_ROLLOUT_SCHEMA)})
         data = {
+            "timestamp": [e.timestamp for e in events],
+            "tail_idx": [e.tail_idx for e in events],
             "event_type": [e.event_type for e in events],
-            "start_time": [e.start_time for e in events],
-            "end_time": [e.end_time for e in events],
-            "server": [e.server for e in events],
-            "node_id": [e.node_id for e in events],
-            "tp_group_id": [e.tp_group_id for e in events],
-            "tp_size": [e.tp_size for e in events],
-            "prompt_tokens": [e.prompt_tokens for e in events],
-            "rollout_tokens": [e.rollout_tokens for e in events],
+            "phase": [e.phase for e in events],
             "group_id": [e.group_id for e in events],
             "sample_id": [e.sample_id for e in events],
-            "tail_idx": [e.tail_idx for e in events],
-            "vllm_request_id": [e.vllm_request_id for e in events],
-            "queue_time": [e.queue_time for e in events],
-            "time_to_first_token": [e.time_to_first_token for e in events],
-            "prefill_time": [e.prefill_time for e in events],
-            "decode_time": [e.decode_time for e in events],
-            "inference_time": [e.inference_time for e in events],
-            "e2e_latency": [e.e2e_latency for e in events],
-            "vllm_max_tokens": [e.vllm_max_tokens for e in events],
-            "is_eval": [e.is_eval for e in events],
-            "is_canceled": [e.is_canceled for e in events],
-            "compute_reward_time": [e.compute_reward_time for e in events],
-            "step": [e.step if e.step != -1 else None for e in events],
-            "off_policy_steps": [e.off_policy_steps for e in events],
+            "agent_id": [e.agent_id for e in events],
+            "generation_idx": [e.generation_idx for e in events],
+            "tool_call_idx": [e.tool_call_idx for e in events],
+            "server_id": [e.server_id for e in events],
             "server_lane": [e.server_lane for e in events],
-            "phase": [e.phase for e in events],
         }
-        return pa.table(data, schema=INFERENCE_EVENT_SCHEMA)
+        return pa.table(data, schema=EVENTS_ROLLOUT_SCHEMA)
+
+    def _infra_events_to_table(self, events: list[InfraEvent]) -> pa.Table:
+        """Convert list of infra events to PyArrow table."""
+        if not events:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(EVENTS_INFRA_SCHEMA.names, EVENTS_INFRA_SCHEMA)})
+        data = {
+            "timestamp": [e.timestamp for e in events],
+            "tail_idx": [e.tail_idx for e in events],
+            "event_type": [e.event_type for e in events],
+            "phase": [e.phase for e in events],
+            "step": [e.step for e in events],
+            "server_id": [e.server_id for e in events],
+            "sandbox_id": [e.sandbox_id for e in events],
+        }
+        return pa.table(data, schema=EVENTS_INFRA_SCHEMA)
 
     def _gpu_metrics_to_table(self, metrics: list[tuple[GpuMetricSample, int]]) -> pa.Table:
         """Convert list of GPU metrics (with tail_idx) to PyArrow table."""
@@ -1565,259 +1854,221 @@ class EventLogger:
         }
         return pa.table(data, schema=PROMPTS_SCHEMA)
 
-    def _rollouts_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """
-        Convert list of rollouts to PyArrow table.
-        
-        Each rollout may have multiple turns, so this creates one row per turn.
-        Each turn's content is just that turn's text, not accumulated from previous turns.
-        Summary fields (reward, advantage) are only filled on the last turn.
-        tokens is filled for every turn.
-        """
+    def _generations_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert generation rollouts to a generations PyArrow table (one row per generation)."""
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "group_id": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "turn_order": pa.array([], type=pa.int32()),
-                "turn_type": pa.array([], type=pa.string()),
-                "content": pa.array([], type=pa.binary()),
-                "tokens": pa.array([], type=pa.int32()),
-                "stop_reason": pa.array([], type=pa.string()),
-                "environment_response_time": pa.array([], type=pa.float64()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(GENERATIONS_SCHEMA.names, GENERATIONS_SCHEMA)})
 
-        # Flatten rollouts into turn rows
-        steps = []
-        group_ids = []
-        sample_idxs = []
-        turn_orders = []
-        turn_types = []
-        contents = []
-        tokens_list = []
-        stop_reasons = []
-        env_response_times = []
+        steps, group_ids, sample_ids, agent_ids = [], [], [], []
+        gen_idxs, contents, tokens_list, prompt_tokens_list = [], [], [], []
+        tool_call_counts, stop_reasons = [], []
+        queue_times, ttfts, prefill_times, decode_times = [], [], [], []
+        inference_times, e2e_latencies, server_ids, vllm_request_ids = [], [], [], []
 
-        for gen in rollouts:
-            for turn in gen.turns:
-                steps.append(gen.step)
-                group_ids.append(gen.group_id)
-                sample_idxs.append(gen.sample_idx)
-                turn_orders.append(turn.turn_order)
-                turn_types.append(turn.turn_type)
-                contents.append(_zstd_compress(turn.content))
-                tokens_list.append(turn.tokens)
-                stop_reasons.append(turn.stop_reason)
-                env_response_times.append(turn.environment_response_time)
+        for r in rollouts:
+            for g in r.generations:
+                steps.append(r.step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(g.generation_idx)
+                contents.append(_zstd_compress(g.content))
+                tokens_list.append(g.tokens)
+                prompt_tokens_list.append(g.prompt_tokens)
+                tool_call_counts.append(g.tool_call_count)
+                stop_reasons.append(g.stop_reason)
+                queue_times.append(g.queue_time)
+                ttfts.append(g.ttft)
+                prefill_times.append(g.prefill_time)
+                decode_times.append(g.decode_time)
+                inference_times.append(g.inference_time)
+                e2e_latencies.append(g.e2e_latency)
+                server_ids.append(g.server_id)
+                vllm_request_ids.append(g.vllm_request_id)
 
-        data = {
-            "step": steps,
-            "group_id": group_ids,
-            "sample_idx": sample_idxs,
-            "turn_order": turn_orders,
-            "turn_type": turn_types,
-            "content": contents,
-            "tokens": tokens_list,
-            "stop_reason": stop_reasons,
-            "environment_response_time": env_response_times,
-        }
-        return pa.table(data, schema=ROLLOUTS_SCHEMA)
+        return pa.table({
+            "step": steps, "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "content": contents, "tokens": tokens_list,
+            "prompt_tokens": prompt_tokens_list, "tool_call_count": tool_call_counts,
+            "stop_reason": stop_reasons, "queue_time": queue_times, "ttft": ttfts,
+            "prefill_time": prefill_times, "decode_time": decode_times,
+            "inference_time": inference_times, "e2e_latency": e2e_latencies,
+            "server_id": server_ids, "vllm_request_id": vllm_request_ids,
+        }, schema=GENERATIONS_SCHEMA)
 
-    def _samples_data_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """
-        Convert rollouts to a samples_data table with summary information per sample.
-        
-        Creates one row per sample with reward, advantage, turn count, total_tokens, raw_string,
-        and compute_reward_time.
-        """
+    def _env_responses_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert generation rollouts to an env_responses PyArrow table (one row per env response)."""
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "group_id": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "reward": pa.array([], type=pa.float64()),
-                "advantage": pa.array([], type=pa.float64()),
-                "turns": pa.array([], type=pa.int32()),
-                "total_tokens": pa.array([], type=pa.int32()),
-                "raw_string": pa.array([], type=pa.binary()),
-                "compute_reward_time": pa.array([], type=pa.float64()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(ENV_RESPONSES_SCHEMA.names, ENV_RESPONSES_SCHEMA)})
 
-        data = {
-            "step": [gen.step for gen in rollouts],
-            "group_id": [gen.group_id for gen in rollouts],
-            "sample_idx": [gen.sample_idx for gen in rollouts],
-            "reward": [gen.reward for gen in rollouts],
-            "advantage": [gen.advantage for gen in rollouts],
-            "turns": [len(gen.turns) for gen in rollouts],
-            "total_tokens": [gen.total_tokens for gen in rollouts],
-            "raw_string": [_zstd_compress(gen.raw_string) for gen in rollouts],
-            "compute_reward_time": [gen.compute_reward_time for gen in rollouts],
-        }
-        return pa.table(data, schema=SAMPLES_DATA_SCHEMA)
+        steps, group_ids, sample_ids, agent_ids = [], [], [], []
+        gen_idxs, contents, turn_types, tokens_list, response_times = [], [], [], [], []
 
-    def _rollouts_metrics_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """
-        Convert rollouts' reward components and rollout metrics to a normalized table.
-        
-        Creates one row per metric per rollout, combining both reward components
-        and other rollout metrics (e.g. char count, word frequency).
-        
-        Min/max ranges for metrics are registered at the environment level
-        (Environment.metrics_ranges) and uploaded in env_details, not per-sample.
-        """
+        for r in rollouts:
+            for e in r.env_responses:
+                steps.append(r.step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(e.generation_idx)
+                contents.append(_zstd_compress(e.content))
+                turn_types.append(e.turn_type)
+                tokens_list.append(e.tokens)
+                response_times.append(e.response_time)
+
+        return pa.table({
+            "step": steps, "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "content": contents, "turn_type": turn_types,
+            "tokens": tokens_list, "response_time": response_times,
+        }, schema=ENV_RESPONSES_SCHEMA)
+
+    def _tool_calls_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert generation rollouts to a tool_calls PyArrow table (one row per tool call)."""
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "metric_name": pa.array([], type=pa.string()),
-                "value": pa.array([], type=pa.float64()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(TOOL_CALLS_SCHEMA.names, TOOL_CALLS_SCHEMA)})
 
-        # Explode reward components + rollout metrics into normalized rows
-        steps = []
-        sample_idxs = []
-        envs = []
-        metric_names = []
-        values = []
+        steps, group_ids, sample_ids, agent_ids = [], [], [], []
+        gen_idxs, tc_idxs, env_resp_gen_idxs = [], [], []
+        tool_names, arguments_list, raw_texts, results = [], [], [], []
+        successes, errors, exit_codes, truncateds = [], [], [], []
+        result_tokens_list, sandbox_ids = [], []
 
-        for gen in rollouts:
-            for metric_name, value in gen.sample_metrics.items():
-                steps.append(gen.step)
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+        for r in rollouts:
+            for tc in r.tool_calls:
+                steps.append(r.step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(tc.generation_idx)
+                tc_idxs.append(tc.tool_call_idx)
+                env_resp_gen_idxs.append(tc.env_response_generation_idx)
+                tool_names.append(tc.tool_name)
+                arguments_list.append(tc.arguments)
+                raw_texts.append(tc.raw_text)
+                results.append(_zstd_compress(tc.result))
+                successes.append(tc.success)
+                errors.append(tc.error)
+                exit_codes.append(tc.exit_code)
+                truncateds.append(tc.truncated)
+                result_tokens_list.append(tc.result_tokens)
+                sandbox_ids.append(tc.sandbox_id)
+
+        return pa.table({
+            "step": steps, "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+            "env_response_generation_idx": env_resp_gen_idxs,
+            "tool_name": tool_names, "arguments": arguments_list, "raw_text": raw_texts,
+            "result": results, "success": successes, "error": errors, "exit_code": exit_codes,
+            "truncated": truncateds, "result_tokens": result_tokens_list, "sandbox_id": sandbox_ids,
+        }, schema=TOOL_CALLS_SCHEMA)
+
+    def _turn_metrics_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert generation rollouts to a turn_metrics PyArrow table."""
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(TURN_METRICS_SCHEMA.names, TURN_METRICS_SCHEMA)})
+
+        steps, sample_ids, agent_ids = [], [], []
+        gen_idxs, turn_types, envs, metric_names, values = [], [], [], [], []
+
+        for r in rollouts:
+            for tm in r.turn_metrics:
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(tm.get("generation_idx", 0))
+                turn_types.append(tm.get("turn_type", "generation"))
+                envs.append(r.env)
+                metric_names.append(tm.get("metric_name", ""))
+                values.append(float(tm.get("value", 0.0)))
+
+        return pa.table({
+            "step": steps, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "turn_type": turn_types, "env": envs,
+            "metric_name": metric_names, "value": values,
+        }, schema=TURN_METRICS_SCHEMA)
+
+    def _samples_data_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert generation rollouts to a samples_data table (one row per sample)."""
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(SAMPLES_DATA_SCHEMA.names, SAMPLES_DATA_SCHEMA)})
+        return pa.table({
+            "step": [r.step for r in rollouts],
+            "group_id": [r.group_id for r in rollouts],
+            "sample_id": [r.sample_id for r in rollouts],
+            "reward": [r.reward for r in rollouts],
+            "advantage": [r.advantage for r in rollouts],
+            "num_generations": [len(r.generations) for r in rollouts],
+            "total_tokens": [r.total_tokens for r in rollouts],
+            "raw_string": [_zstd_compress(r.raw_string) for r in rollouts],
+            "compute_reward_time": [r.compute_reward_time for r in rollouts],
+            "stop_reason": [r.stop_reason for r in rollouts],
+            "off_policy_steps": [r.off_policy_steps for r in rollouts],
+        }, schema=SAMPLES_DATA_SCHEMA)
+
+    def _rollouts_metrics_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert rollouts' sample_metrics to normalized table (one row per metric per sample)."""
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(ROLLOUTS_METRICS_SCHEMA.names, ROLLOUTS_METRICS_SCHEMA)})
+        steps, sample_ids, envs, metric_names, values = [], [], [], [], []
+        for r in rollouts:
+            for metric_name, value in r.sample_metrics.items():
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 metric_names.append(metric_name)
                 values.append(float(value))
+        return pa.table({"step": steps, "sample_id": sample_ids, "env": envs, "metric_name": metric_names, "value": values}, schema=ROLLOUTS_METRICS_SCHEMA)
 
-        data = {
-            "step": steps,
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "metric_name": metric_names,
-            "value": values,
-        }
-        return pa.table(data, schema=ROLLOUTS_METRICS_SCHEMA)
-
-    def _golden_answers_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """
-        Convert rollouts' golden answers to a normalized table.
-        
-        Creates one row per golden answer key/value per rollout.
-        Golden answers are completely independent from rollout metrics.
-        """
+    def _golden_answers_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert rollouts' golden_answers to normalized table (one row per answer per sample)."""
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "key": pa.array([], type=pa.string()),
-                "value": pa.array([], type=pa.string()),
-            })
-
-        steps = []
-        sample_idxs = []
-        envs = []
-        keys = []
-        values = []
-
-        for gen in rollouts:
-            for key, value in gen.golden_answers.items():
-                steps.append(gen.step)
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(GOLDEN_ANSWERS_SCHEMA.names, GOLDEN_ANSWERS_SCHEMA)})
+        steps, sample_ids, envs, keys, values = [], [], [], [], []
+        for r in rollouts:
+            for key, value in r.golden_answers.items():
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 keys.append(key)
                 values.append(value)
+        return pa.table({"step": steps, "sample_id": sample_ids, "env": envs, "key": keys, "value": values}, schema=GOLDEN_ANSWERS_SCHEMA)
 
-        data = {
-            "step": steps,
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "key": keys,
-            "value": values,
-        }
-        return pa.table(data, schema=GOLDEN_ANSWERS_SCHEMA)
-
-    def _info_turns_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """
-        Convert rollouts' info_turns to a normalized table.
-        
-        Creates one row per info item per turn per rollout.
-        Each info item has a key, value (text), and type hint for frontend rendering.
-        """
+    def _info_turns_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert rollouts' info_turns to normalized table (one row per info item)."""
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "turn_order": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "info_key": pa.array([], type=pa.string()),
-                "info_value": pa.array([], type=pa.string()),
-                "info_type": pa.array([], type=pa.string()),
-            })
-
-        steps = []
-        sample_idxs = []
-        turn_orders = []
-        envs = []
-        info_keys = []
-        info_values = []
-        info_types = []
-
-        for gen in rollouts:
-            for info in gen.info_turns:
-                steps.append(gen.step)
-                sample_idxs.append(gen.sample_idx)
-                turn_orders.append(info.get("turn_order", 0))
-                envs.append(gen.env)
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(INFO_TURNS_SCHEMA.names, INFO_TURNS_SCHEMA)})
+        steps, sample_ids, agent_ids, gen_idxs, tc_idxs = [], [], [], [], []
+        envs, info_keys, info_values, info_types = [], [], [], []
+        for r in rollouts:
+            for info in r.info_turns:
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
+                tc_idxs.append(info.get("tool_call_idx", -1))
+                envs.append(r.env)
                 info_keys.append(info.get("info_key", ""))
                 info_values.append(info.get("info_value", ""))
                 info_types.append(info.get("info_type", "text"))
+        return pa.table({
+            "step": steps, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+            "env": envs, "info_key": info_keys, "info_value": info_values, "info_type": info_types,
+        }, schema=INFO_TURNS_SCHEMA)
 
-        data = {
-            "step": steps,
-            "sample_idx": sample_idxs,
-            "turn_order": turn_orders,
-            "env": envs,
-            "info_key": info_keys,
-            "info_value": info_values,
-            "info_type": info_types,
-        }
-        return pa.table(data, schema=INFO_TURNS_SCHEMA)
-
-    def _sample_tags_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """Convert rollouts' sample_tags to a normalized table (one row per tag per rollout)."""
+    def _sample_tags_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert rollouts' sample_tags to normalized table (one row per tag per sample)."""
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "tag_name": pa.array([], type=pa.string()),
-                "tag_value": pa.array([], type=pa.string()),
-            })
-
-        steps = []
-        sample_idxs = []
-        envs = []
-        tag_names = []
-        tag_values = []
-
-        for gen in rollouts:
-            for tag_name, tag_value in gen.sample_tags.items():
-                steps.append(gen.step)
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(SAMPLE_TAGS_SCHEMA.names, SAMPLE_TAGS_SCHEMA)})
+        steps, sample_ids, envs, tag_names, tag_values = [], [], [], [], []
+        for r in rollouts:
+            for tag_name, tag_value in r.sample_tags.items():
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 tag_names.append(tag_name)
                 tag_values.append(str(tag_value))
-
-        data = {
-            "step": steps,
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "tag_name": tag_names,
-            "tag_value": tag_values,
-        }
-        return pa.table(data, schema=SAMPLE_TAGS_SCHEMA)
+        return pa.table({"step": steps, "sample_id": sample_ids, "env": envs, "tag_name": tag_names, "tag_value": tag_values}, schema=SAMPLE_TAGS_SCHEMA)
 
     def _kept_prompts_to_table(self, prompts: list[Prompt]) -> pa.Table:
         """Convert list of kept prompts to PyArrow table for events system."""
@@ -1845,249 +2096,236 @@ class EventLogger:
         }
         return pa.table(data)
 
-    def _kept_rollouts_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """Convert list of kept rollouts to PyArrow table for events system (one row per turn)."""
+    def _kept_generations_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert kept rollouts to a generations PyArrow table (one row per generation, with tail_idx)."""
+        schema = pa.schema([*GENERATIONS_SCHEMA, pa.field("tail_idx", pa.int32())])
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "group_id": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "turn_order": pa.array([], type=pa.int32()),
-                "turn_type": pa.array([], type=pa.string()),
-                "content": pa.array([], type=pa.binary()),
-                "tokens": pa.array([], type=pa.int32()),
-                "stop_reason": pa.array([], type=pa.string()),
-                "environment_response_time": pa.array([], type=pa.float64()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(schema.names, schema)})
 
-        steps = []
-        group_ids = []
-        sample_idxs = []
-        turn_orders = []
-        turn_types = []
-        contents = []
-        tokens_list = []
-        stop_reasons = []
-        env_response_times = []
+        steps, group_ids, sample_ids, agent_ids = [], [], [], []
+        gen_idxs, contents, tokens_list, prompt_tokens_list = [], [], [], []
+        tool_call_counts, stop_reasons = [], []
+        queue_times, ttfts, prefill_times, decode_times = [], [], [], []
+        inference_times, e2e_latencies, server_ids, vllm_request_ids = [], [], [], []
         tail_idxs = []
 
-        for gen in rollouts:
-            for turn in gen.turns:
-                steps.append(gen.step)
-                group_ids.append(gen.group_id)
-                sample_idxs.append(gen.sample_idx)
-                turn_orders.append(turn.turn_order)
-                turn_types.append(turn.turn_type)
-                contents.append(_zstd_compress(turn.content))
-                tokens_list.append(turn.tokens)
-                stop_reasons.append(turn.stop_reason)
-                env_response_times.append(turn.environment_response_time)
-                tail_idxs.append(gen.tail_idx)
+        for r in rollouts:
+            for g in r.generations:
+                steps.append(r.step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(g.generation_idx)
+                contents.append(_zstd_compress(g.content))
+                tokens_list.append(g.tokens)
+                prompt_tokens_list.append(g.prompt_tokens)
+                tool_call_counts.append(g.tool_call_count)
+                stop_reasons.append(g.stop_reason)
+                queue_times.append(g.queue_time)
+                ttfts.append(g.ttft)
+                prefill_times.append(g.prefill_time)
+                decode_times.append(g.decode_time)
+                inference_times.append(g.inference_time)
+                e2e_latencies.append(g.e2e_latency)
+                server_ids.append(g.server_id)
+                vllm_request_ids.append(g.vllm_request_id)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "step": steps,
-            "group_id": group_ids,
-            "sample_idx": sample_idxs,
-            "turn_order": turn_orders,
-            "turn_type": turn_types,
-            "content": contents,
-            "tokens": tokens_list,
-            "stop_reason": stop_reasons,
-            "environment_response_time": env_response_times,
+        return pa.table({
+            "step": steps, "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "content": contents, "tokens": tokens_list,
+            "prompt_tokens": prompt_tokens_list, "tool_call_count": tool_call_counts,
+            "stop_reason": stop_reasons, "queue_time": queue_times, "ttft": ttfts,
+            "prefill_time": prefill_times, "decode_time": decode_times,
+            "inference_time": inference_times, "e2e_latency": e2e_latencies,
+            "server_id": server_ids, "vllm_request_id": vllm_request_ids,
             "tail_idx": tail_idxs,
-        }
-        return pa.table(data)
+        }, schema=schema)
 
-    def _kept_samples_data_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """Convert kept rollouts to a samples_data table for events system."""
+    def _kept_env_responses_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert kept rollouts to an env_responses PyArrow table (one row per env response, with tail_idx)."""
+        schema = pa.schema([*ENV_RESPONSES_SCHEMA, pa.field("tail_idx", pa.int32())])
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "group_id": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "reward": pa.array([], type=pa.float64()),
-                "advantage": pa.array([], type=pa.float64()),
-                "turns": pa.array([], type=pa.int32()),
-                "total_tokens": pa.array([], type=pa.int32()),
-                "raw_string": pa.array([], type=pa.binary()),
-                "compute_reward_time": pa.array([], type=pa.float64()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(schema.names, schema)})
 
-        data = {
-            "step": [gen.step for gen in rollouts],
-            "group_id": [gen.group_id for gen in rollouts],
-            "sample_idx": [gen.sample_idx for gen in rollouts],
-            "reward": [gen.reward for gen in rollouts],
-            "advantage": [gen.advantage for gen in rollouts],
-            "turns": [len(gen.turns) for gen in rollouts],
-            "total_tokens": [gen.total_tokens for gen in rollouts],
-            "raw_string": [_zstd_compress(gen.raw_string) for gen in rollouts],
-            "compute_reward_time": [gen.compute_reward_time for gen in rollouts],
-            "tail_idx": [gen.tail_idx for gen in rollouts],
-        }
-        return pa.table(data)
-
-    def _kept_rollouts_metrics_to_table(self, rollouts: list[Rollout]) -> pa.Table:
-        """Convert kept rollouts' metrics to a normalized table for events system."""
-        if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "metric_name": pa.array([], type=pa.string()),
-                "value": pa.array([], type=pa.float64()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
-
-        steps = []
-        sample_idxs = []
-        envs = []
-        metric_names = []
-        values = []
+        steps, group_ids, sample_ids, agent_ids = [], [], [], []
+        gen_idxs, contents, turn_types, tokens_list, response_times = [], [], [], [], []
         tail_idxs = []
 
-        for gen in rollouts:
-            for metric_name, value in gen.sample_metrics.items():
-                steps.append(gen.step)
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+        for r in rollouts:
+            for e in r.env_responses:
+                steps.append(r.step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(e.generation_idx)
+                contents.append(_zstd_compress(e.content))
+                turn_types.append(e.turn_type)
+                tokens_list.append(e.tokens)
+                response_times.append(e.response_time)
+                tail_idxs.append(r.tail_idx)
+
+        return pa.table({
+            "step": steps, "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "content": contents, "turn_type": turn_types,
+            "tokens": tokens_list, "response_time": response_times,
+            "tail_idx": tail_idxs,
+        }, schema=schema)
+
+    def _kept_tool_calls_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert kept rollouts to a tool_calls PyArrow table (one row per tool call, with tail_idx)."""
+        schema = pa.schema([*TOOL_CALLS_SCHEMA, pa.field("tail_idx", pa.int32())])
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(schema.names, schema)})
+
+        steps, group_ids, sample_ids, agent_ids = [], [], [], []
+        gen_idxs, tc_idxs, env_resp_gen_idxs = [], [], []
+        tool_names, arguments_list, raw_texts, results = [], [], [], []
+        successes, errors, exit_codes, truncateds = [], [], [], []
+        result_tokens_list, sandbox_ids = [], []
+        tail_idxs = []
+
+        for r in rollouts:
+            for tc in r.tool_calls:
+                steps.append(r.step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(tc.generation_idx)
+                tc_idxs.append(tc.tool_call_idx)
+                env_resp_gen_idxs.append(tc.env_response_generation_idx)
+                tool_names.append(tc.tool_name)
+                arguments_list.append(tc.arguments)
+                raw_texts.append(tc.raw_text)
+                results.append(_zstd_compress(tc.result))
+                successes.append(tc.success)
+                errors.append(tc.error)
+                exit_codes.append(tc.exit_code)
+                truncateds.append(tc.truncated)
+                result_tokens_list.append(tc.result_tokens)
+                sandbox_ids.append(tc.sandbox_id)
+                tail_idxs.append(r.tail_idx)
+
+        return pa.table({
+            "step": steps, "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+            "env_response_generation_idx": env_resp_gen_idxs,
+            "tool_name": tool_names, "arguments": arguments_list, "raw_text": raw_texts,
+            "result": results, "success": successes, "error": errors, "exit_code": exit_codes,
+            "truncated": truncateds, "result_tokens": result_tokens_list, "sandbox_id": sandbox_ids,
+            "tail_idx": tail_idxs,
+        }, schema=schema)
+
+    def _kept_samples_data_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert kept rollouts to a samples_data table for events system."""
+        schema = pa.schema([*SAMPLES_DATA_SCHEMA, pa.field("tail_idx", pa.int32())])
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(schema.names, schema)})
+        return pa.table({
+            "step": [r.step for r in rollouts],
+            "group_id": [r.group_id for r in rollouts],
+            "sample_id": [r.sample_id for r in rollouts],
+            "reward": [r.reward for r in rollouts],
+            "advantage": [r.advantage for r in rollouts],
+            "num_generations": [len(r.generations) for r in rollouts],
+            "total_tokens": [r.total_tokens for r in rollouts],
+            "raw_string": [_zstd_compress(r.raw_string) for r in rollouts],
+            "compute_reward_time": [r.compute_reward_time for r in rollouts],
+            "stop_reason": [r.stop_reason for r in rollouts],
+            "off_policy_steps": [r.off_policy_steps for r in rollouts],
+            "tail_idx": [r.tail_idx for r in rollouts],
+        }, schema=schema)
+
+    def _kept_rollouts_metrics_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
+        """Convert kept rollouts' metrics to a normalized table for events system."""
+        schema = pa.schema([*ROLLOUTS_METRICS_SCHEMA, pa.field("tail_idx", pa.int32())])
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(schema.names, schema)})
+
+        steps, sample_ids, envs, metric_names, values, tail_idxs = [], [], [], [], [], []
+        for r in rollouts:
+            for metric_name, value in r.sample_metrics.items():
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 metric_names.append(metric_name)
                 values.append(float(value))
-                tail_idxs.append(gen.tail_idx)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "step": steps,
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "metric_name": metric_names,
-            "value": values,
-            "tail_idx": tail_idxs,
-        }
-        return pa.table(data)
+        return pa.table({
+            "step": steps, "sample_id": sample_ids, "env": envs,
+            "metric_name": metric_names, "value": values, "tail_idx": tail_idxs,
+        }, schema=schema)
 
-    def _kept_golden_answers_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+    def _kept_golden_answers_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
         """Convert kept rollouts' golden answers to a normalized table for events system."""
+        schema = pa.schema([*GOLDEN_ANSWERS_SCHEMA, pa.field("tail_idx", pa.int32())])
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "key": pa.array([], type=pa.string()),
-                "value": pa.array([], type=pa.string()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(schema.names, schema)})
 
-        steps = []
-        sample_idxs = []
-        envs = []
-        keys = []
-        values = []
-        tail_idxs = []
-
-        for gen in rollouts:
-            for key, value in gen.golden_answers.items():
-                steps.append(gen.step)
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+        steps, sample_ids, envs, keys, values, tail_idxs = [], [], [], [], [], []
+        for r in rollouts:
+            for key, value in r.golden_answers.items():
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 keys.append(key)
                 values.append(value)
-                tail_idxs.append(gen.tail_idx)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "step": steps,
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "key": keys,
-            "value": values,
-            "tail_idx": tail_idxs,
-        }
-        return pa.table(data)
+        return pa.table({
+            "step": steps, "sample_id": sample_ids, "env": envs,
+            "key": keys, "value": values, "tail_idx": tail_idxs,
+        }, schema=schema)
 
-    def _kept_info_turns_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+    def _kept_info_turns_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
         """Convert kept rollouts' info_turns to a normalized table for events system."""
+        schema = pa.schema([*INFO_TURNS_SCHEMA, pa.field("tail_idx", pa.int32())])
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "turn_order": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "info_key": pa.array([], type=pa.string()),
-                "info_value": pa.array([], type=pa.string()),
-                "info_type": pa.array([], type=pa.string()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(schema.names, schema)})
 
-        steps = []
-        sample_idxs = []
-        turn_orders = []
-        envs = []
-        info_keys = []
-        info_values = []
-        info_types = []
-        tail_idxs = []
-
-        for gen in rollouts:
-            for info in gen.info_turns:
-                steps.append(gen.step)
-                sample_idxs.append(gen.sample_idx)
-                turn_orders.append(info.get("turn_order", 0))
-                envs.append(gen.env)
+        steps, sample_ids, agent_ids, gen_idxs, tc_idxs = [], [], [], [], []
+        envs, info_keys, info_values, info_types, tail_idxs = [], [], [], [], []
+        for r in rollouts:
+            for info in r.info_turns:
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
+                tc_idxs.append(info.get("tool_call_idx", -1))
+                envs.append(r.env)
                 info_keys.append(info.get("info_key", ""))
                 info_values.append(info.get("info_value", ""))
                 info_types.append(info.get("info_type", "text"))
-                tail_idxs.append(gen.tail_idx)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "step": steps,
-            "sample_idx": sample_idxs,
-            "turn_order": turn_orders,
-            "env": envs,
-            "info_key": info_keys,
-            "info_value": info_values,
-            "info_type": info_types,
+        return pa.table({
+            "step": steps, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+            "env": envs, "info_key": info_keys, "info_value": info_values, "info_type": info_types,
             "tail_idx": tail_idxs,
-        }
-        return pa.table(data)
+        }, schema=schema)
 
-    def _kept_sample_tags_to_table(self, rollouts: list[Rollout]) -> pa.Table:
+    def _kept_sample_tags_to_table(self, rollouts: list[GenerationRollout]) -> pa.Table:
         """Convert kept rollouts' sample_tags to a normalized table for events system."""
+        schema = pa.schema([*SAMPLE_TAGS_SCHEMA, pa.field("tail_idx", pa.int32())])
         if not rollouts:
-            return pa.table({
-                "step": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "tag_name": pa.array([], type=pa.string()),
-                "tag_value": pa.array([], type=pa.string()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(schema.names, schema)})
 
-        steps = []
-        sample_idxs = []
-        envs = []
-        tag_names = []
-        tag_values = []
-        tail_idxs = []
-
-        for gen in rollouts:
-            for tag_name, tag_value in gen.sample_tags.items():
-                steps.append(gen.step)
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+        steps, sample_ids, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], []
+        for r in rollouts:
+            for tag_name, tag_value in r.sample_tags.items():
+                steps.append(r.step)
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 tag_names.append(tag_name)
                 tag_values.append(str(tag_value))
-                tail_idxs.append(gen.tail_idx)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "step": steps,
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "tag_name": tag_names,
-            "tag_value": tag_values,
-            "tail_idx": tail_idxs,
-        }
-        return pa.table(data)
+        return pa.table({
+            "step": steps, "sample_id": sample_ids, "env": envs,
+            "tag_name": tag_names, "tag_value": tag_values, "tail_idx": tail_idxs,
+        }, schema=schema)
 
     def _step_metrics_to_table(self, step_metrics: list[StepMetric]) -> pa.Table:
         """Convert list of step metrics to PyArrow table."""
@@ -2141,276 +2379,233 @@ class EventLogger:
         }
         return pa.table(data, schema=PROMPTS_DISCARDED_SCHEMA)
 
-    def _discarded_rollouts_to_table(self, rollouts: list[DiscardedRollout]) -> pa.Table:
-        """
-        Convert list of discarded rollouts to PyArrow table.
-        
-        Each rollout may have multiple turns, so this creates one row per turn.
-        tokens is filled for every turn.
-        Note: timestamp and discard_reason are in samples_data_discarded, not here.
-        """
+    def _discarded_generations_to_table(self, rollouts: list[DiscardedGenerationRollout]) -> pa.Table:
+        """Convert discarded rollouts to a generations table (one row per generation)."""
         if not rollouts:
-            return pa.table({
-                "trainer_step": pa.array([], type=pa.int32()),
-                "inference_step": pa.array([], type=pa.int32()),
-                "group_id": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "turn_order": pa.array([], type=pa.int32()),
-                "turn_type": pa.array([], type=pa.string()),
-                "content": pa.array([], type=pa.binary()),
-                "tokens": pa.array([], type=pa.int32()),
-                "stop_reason": pa.array([], type=pa.string()),
-                "environment_response_time": pa.array([], type=pa.float64()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(GENERATIONS_DISCARDED_SCHEMA.names, GENERATIONS_DISCARDED_SCHEMA)})
 
-        # Flatten rollouts into turn rows
-        trainer_steps = []
-        inference_steps = []
-        group_ids = []
-        sample_idxs = []
-        turn_orders = []
-        turn_types = []
-        contents = []
-        tokens_list = []
-        stop_reasons = []
-        env_response_times = []
+        trainer_steps, inference_steps, group_ids, sample_ids, agent_ids = [], [], [], [], []
+        gen_idxs, contents, tokens_list, prompt_tokens_list = [], [], [], []
+        tool_call_counts, stop_reasons = [], []
+        queue_times, ttfts, prefill_times, decode_times = [], [], [], []
+        inference_times, e2e_latencies, server_ids, vllm_request_ids = [], [], [], []
         tail_idxs = []
 
-        for gen in rollouts:
-            for turn in gen.turns:
-                trainer_steps.append(gen.trainer_step)
-                inference_steps.append(gen.inference_step)
-                group_ids.append(gen.group_id)
-                sample_idxs.append(gen.sample_idx)
-                turn_orders.append(turn.turn_order)
-                turn_types.append(turn.turn_type)
-                contents.append(_zstd_compress(turn.content))
-                tokens_list.append(turn.tokens)
-                stop_reasons.append(turn.stop_reason)
-                env_response_times.append(turn.environment_response_time)
-                tail_idxs.append(gen.tail_idx)
+        for r in rollouts:
+            for g in r.generations:
+                trainer_steps.append(r.trainer_step)
+                inference_steps.append(r.inference_step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(g.generation_idx)
+                contents.append(_zstd_compress(g.content))
+                tokens_list.append(g.tokens)
+                prompt_tokens_list.append(g.prompt_tokens)
+                tool_call_counts.append(g.tool_call_count)
+                stop_reasons.append(g.stop_reason)
+                queue_times.append(g.queue_time)
+                ttfts.append(g.ttft)
+                prefill_times.append(g.prefill_time)
+                decode_times.append(g.decode_time)
+                inference_times.append(g.inference_time)
+                e2e_latencies.append(g.e2e_latency)
+                server_ids.append(g.server_id)
+                vllm_request_ids.append(g.vllm_request_id)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "trainer_step": trainer_steps,
-            "inference_step": inference_steps,
-            "group_id": group_ids,
-            "sample_idx": sample_idxs,
-            "turn_order": turn_orders,
-            "turn_type": turn_types,
-            "content": contents,
-            "tokens": tokens_list,
-            "stop_reason": stop_reasons,
-            "environment_response_time": env_response_times,
+        return pa.table({
+            "trainer_step": trainer_steps, "inference_step": inference_steps,
+            "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "content": contents, "tokens": tokens_list,
+            "prompt_tokens": prompt_tokens_list, "tool_call_count": tool_call_counts,
+            "stop_reason": stop_reasons, "queue_time": queue_times, "ttft": ttfts,
+            "prefill_time": prefill_times, "decode_time": decode_times,
+            "inference_time": inference_times, "e2e_latency": e2e_latencies,
+            "server_id": server_ids, "vllm_request_id": vllm_request_ids,
             "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=ROLLOUTS_DISCARDED_SCHEMA)
+        }, schema=GENERATIONS_DISCARDED_SCHEMA)
 
-    def _samples_data_discarded_to_table(self, rollouts: list[DiscardedRollout]) -> pa.Table:
-        """
-        Convert discarded rollouts to a samples_data table with summary information per sample.
-        
-        Creates one row per discarded sample with reward, advantage, turn count, total_tokens,
-        raw_string, and compute_reward_time.
-        """
+    def _discarded_env_responses_to_table(self, rollouts: list[DiscardedGenerationRollout]) -> pa.Table:
+        """Convert discarded rollouts to an env_responses table (one row per env response)."""
         if not rollouts:
-            return pa.table({
-                "timestamp": pa.array([], type=pa.float64()),
-                "discard_reason": pa.array([], type=pa.string()),
-                "trainer_step": pa.array([], type=pa.int32()),
-                "inference_step": pa.array([], type=pa.int32()),
-                "group_id": pa.array([], type=pa.int32()),
-                "sample_idx": pa.array([], type=pa.int32()),
-                "reward": pa.array([], type=pa.float64()),
-                "advantage": pa.array([], type=pa.float64()),
-                "turns": pa.array([], type=pa.int32()),
-                "total_tokens": pa.array([], type=pa.int32()),
-                "raw_string": pa.array([], type=pa.binary()),
-                "compute_reward_time": pa.array([], type=pa.float64()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(ENV_RESPONSES_DISCARDED_SCHEMA.names, ENV_RESPONSES_DISCARDED_SCHEMA)})
 
-        data = {
-            "timestamp": [gen.timestamp for gen in rollouts],
-            "discard_reason": [gen.discard_reason for gen in rollouts],
-            "trainer_step": [gen.trainer_step for gen in rollouts],
-            "inference_step": [gen.inference_step for gen in rollouts],
-            "group_id": [gen.group_id for gen in rollouts],
-            "sample_idx": [gen.sample_idx for gen in rollouts],
-            "reward": [gen.reward for gen in rollouts],
-            "advantage": [gen.advantage for gen in rollouts],
-            "turns": [len(gen.turns) for gen in rollouts],
-            "total_tokens": [gen.total_tokens for gen in rollouts],
-            "raw_string": [_zstd_compress(gen.raw_string) for gen in rollouts],
-            "compute_reward_time": [gen.compute_reward_time for gen in rollouts],
-            "tail_idx": [gen.tail_idx for gen in rollouts],
-        }
-        return pa.table(data, schema=SAMPLES_DATA_DISCARDED_SCHEMA)
-
-    def _rollouts_metrics_discarded_to_table(self, rollouts: list[DiscardedRollout]) -> pa.Table:
-        """
-        Convert discarded rollouts' reward components and metrics to a normalized table.
-        
-        Creates one row per metric per discarded rollout, combining both reward
-        components and other rollout metrics.
-        Note: timestamp and discard_reason are in samples_data_discarded, not here.
-        
-        Min/max ranges for metrics are registered at the environment level
-        (Environment.metrics_ranges) and uploaded in env_details, not per-sample.
-        """
-        if not rollouts:
-            return pa.table({
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "metric_name": pa.array([], type=pa.string()),
-                "value": pa.array([], type=pa.float64()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
-
-        # Explode sample metrics into normalized rows
-        sample_idxs = []
-        envs = []
-        metric_names = []
-        values = []
+        trainer_steps, inference_steps, group_ids, sample_ids, agent_ids = [], [], [], [], []
+        gen_idxs, contents, turn_types, tokens_list, response_times = [], [], [], [], []
         tail_idxs = []
 
-        for gen in rollouts:
-            for metric_name, value in gen.sample_metrics.items():
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+        for r in rollouts:
+            for e in r.env_responses:
+                trainer_steps.append(r.trainer_step)
+                inference_steps.append(r.inference_step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(e.generation_idx)
+                contents.append(_zstd_compress(e.content))
+                turn_types.append(e.turn_type)
+                tokens_list.append(e.tokens)
+                response_times.append(e.response_time)
+                tail_idxs.append(r.tail_idx)
+
+        return pa.table({
+            "trainer_step": trainer_steps, "inference_step": inference_steps,
+            "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "content": contents, "turn_type": turn_types,
+            "tokens": tokens_list, "response_time": response_times,
+            "tail_idx": tail_idxs,
+        }, schema=ENV_RESPONSES_DISCARDED_SCHEMA)
+
+    def _discarded_tool_calls_to_table(self, rollouts: list[DiscardedGenerationRollout]) -> pa.Table:
+        """Convert discarded rollouts to a tool_calls table (one row per tool call)."""
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(TOOL_CALLS_DISCARDED_SCHEMA.names, TOOL_CALLS_DISCARDED_SCHEMA)})
+
+        trainer_steps, inference_steps, group_ids, sample_ids, agent_ids = [], [], [], [], []
+        gen_idxs, tc_idxs, env_resp_gen_idxs = [], [], []
+        tool_names, arguments_list, raw_texts, results = [], [], [], []
+        successes, errors, exit_codes, truncateds = [], [], [], []
+        result_tokens_list, sandbox_ids = [], []
+        tail_idxs = []
+
+        for r in rollouts:
+            for tc in r.tool_calls:
+                trainer_steps.append(r.trainer_step)
+                inference_steps.append(r.inference_step)
+                group_ids.append(r.group_id)
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(tc.generation_idx)
+                tc_idxs.append(tc.tool_call_idx)
+                env_resp_gen_idxs.append(tc.env_response_generation_idx)
+                tool_names.append(tc.tool_name)
+                arguments_list.append(tc.arguments)
+                raw_texts.append(tc.raw_text)
+                results.append(_zstd_compress(tc.result))
+                successes.append(tc.success)
+                errors.append(tc.error)
+                exit_codes.append(tc.exit_code)
+                truncateds.append(tc.truncated)
+                result_tokens_list.append(tc.result_tokens)
+                sandbox_ids.append(tc.sandbox_id)
+                tail_idxs.append(r.tail_idx)
+
+        return pa.table({
+            "trainer_step": trainer_steps, "inference_step": inference_steps,
+            "group_id": group_ids, "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+            "env_response_generation_idx": env_resp_gen_idxs,
+            "tool_name": tool_names, "arguments": arguments_list, "raw_text": raw_texts,
+            "result": results, "success": successes, "error": errors, "exit_code": exit_codes,
+            "truncated": truncateds, "result_tokens": result_tokens_list, "sandbox_id": sandbox_ids,
+            "tail_idx": tail_idxs,
+        }, schema=TOOL_CALLS_DISCARDED_SCHEMA)
+
+    def _samples_data_discarded_to_table(self, rollouts: list[DiscardedGenerationRollout]) -> pa.Table:
+        """Convert discarded rollouts to a samples_data table (one row per sample)."""
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(SAMPLES_DATA_DISCARDED_SCHEMA.names, SAMPLES_DATA_DISCARDED_SCHEMA)})
+        return pa.table({
+            "timestamp": [r.timestamp for r in rollouts],
+            "discard_reason": [r.discard_reason for r in rollouts],
+            "trainer_step": [r.trainer_step for r in rollouts],
+            "inference_step": [r.inference_step for r in rollouts],
+            "group_id": [r.group_id for r in rollouts],
+            "sample_id": [r.sample_id for r in rollouts],
+            "reward": [r.reward for r in rollouts],
+            "advantage": [r.advantage for r in rollouts],
+            "num_generations": [len(r.generations) for r in rollouts],
+            "total_tokens": [r.total_tokens for r in rollouts],
+            "raw_string": [_zstd_compress(r.raw_string) for r in rollouts],
+            "compute_reward_time": [r.compute_reward_time for r in rollouts],
+            "stop_reason": [r.stop_reason for r in rollouts],
+            "off_policy_steps": [r.off_policy_steps for r in rollouts],
+            "tail_idx": [r.tail_idx for r in rollouts],
+        }, schema=SAMPLES_DATA_DISCARDED_SCHEMA)
+
+    def _rollouts_metrics_discarded_to_table(self, rollouts: list[DiscardedGenerationRollout]) -> pa.Table:
+        """Convert discarded rollouts' metrics to a normalized table (one row per metric per sample)."""
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(ROLLOUTS_METRICS_DISCARDED_SCHEMA.names, ROLLOUTS_METRICS_DISCARDED_SCHEMA)})
+
+        sample_ids, envs, metric_names, values, tail_idxs = [], [], [], [], []
+        for r in rollouts:
+            for metric_name, value in r.sample_metrics.items():
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 metric_names.append(metric_name)
                 values.append(float(value))
-                tail_idxs.append(gen.tail_idx)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "metric_name": metric_names,
-            "value": values,
-            "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=ROLLOUTS_METRICS_DISCARDED_SCHEMA)
+        return pa.table({
+            "sample_id": sample_ids, "env": envs, "metric_name": metric_names,
+            "value": values, "tail_idx": tail_idxs,
+        }, schema=ROLLOUTS_METRICS_DISCARDED_SCHEMA)
 
-    def _golden_answers_discarded_to_table(self, rollouts: list[DiscardedRollout]) -> pa.Table:
-        """
-        Convert discarded rollouts' golden answers to a normalized table.
-        
-        Creates one row per golden answer key/value per discarded rollout.
-        Golden answers are completely independent from rollout metrics.
-        Note: timestamp and discard_reason are in samples_data_discarded, not here.
-        """
+    def _golden_answers_discarded_to_table(self, rollouts: list[DiscardedGenerationRollout]) -> pa.Table:
+        """Convert discarded rollouts' golden answers to a normalized table (one row per answer per sample)."""
         if not rollouts:
-            return pa.table({
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "key": pa.array([], type=pa.string()),
-                "value": pa.array([], type=pa.string()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(GOLDEN_ANSWERS_DISCARDED_SCHEMA.names, GOLDEN_ANSWERS_DISCARDED_SCHEMA)})
 
-        sample_idxs = []
-        envs = []
-        keys = []
-        values = []
-        tail_idxs = []
-
-        for gen in rollouts:
-            for key, value in gen.golden_answers.items():
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+        sample_ids, envs, keys, values, tail_idxs = [], [], [], [], []
+        for r in rollouts:
+            for key, value in r.golden_answers.items():
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 keys.append(key)
                 values.append(value)
-                tail_idxs.append(gen.tail_idx)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "key": keys,
-            "value": values,
-            "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=GOLDEN_ANSWERS_DISCARDED_SCHEMA)
+        return pa.table({
+            "sample_id": sample_ids, "env": envs, "key": keys,
+            "value": values, "tail_idx": tail_idxs,
+        }, schema=GOLDEN_ANSWERS_DISCARDED_SCHEMA)
 
-    def _info_turns_discarded_to_table(self, rollouts: list[DiscardedRollout]) -> pa.Table:
-        """
-        Convert discarded rollouts' info_turns to a normalized table.
-        
-        Creates one row per info item per turn per discarded rollout.
-        Note: timestamp and discard_reason are in samples_data_discarded, not here.
-        """
+    def _info_turns_discarded_to_table(self, rollouts: list[DiscardedGenerationRollout]) -> pa.Table:
+        """Convert discarded rollouts' info_turns to a normalized table (one row per info item)."""
         if not rollouts:
-            return pa.table({
-                "sample_idx": pa.array([], type=pa.int32()),
-                "turn_order": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "info_key": pa.array([], type=pa.string()),
-                "info_value": pa.array([], type=pa.string()),
-                "info_type": pa.array([], type=pa.string()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(INFO_TURNS_DISCARDED_SCHEMA.names, INFO_TURNS_DISCARDED_SCHEMA)})
 
-        sample_idxs = []
-        turn_orders = []
-        envs = []
-        info_keys = []
-        info_values = []
-        info_types = []
-        tail_idxs = []
-
-        for gen in rollouts:
-            for info in gen.info_turns:
-                sample_idxs.append(gen.sample_idx)
-                turn_orders.append(info.get("turn_order", 0))
-                envs.append(gen.env)
+        sample_ids, agent_ids, gen_idxs, tc_idxs = [], [], [], []
+        envs, info_keys, info_values, info_types, tail_idxs = [], [], [], [], []
+        for r in rollouts:
+            for info in r.info_turns:
+                sample_ids.append(r.sample_id)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
+                tc_idxs.append(info.get("tool_call_idx", -1))
+                envs.append(r.env)
                 info_keys.append(info.get("info_key", ""))
                 info_values.append(info.get("info_value", ""))
                 info_types.append(info.get("info_type", "text"))
-                tail_idxs.append(gen.tail_idx)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "sample_idx": sample_idxs,
-            "turn_order": turn_orders,
-            "env": envs,
-            "info_key": info_keys,
-            "info_value": info_values,
-            "info_type": info_types,
+        return pa.table({
+            "sample_id": sample_ids, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+            "env": envs, "info_key": info_keys, "info_value": info_values, "info_type": info_types,
             "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=INFO_TURNS_DISCARDED_SCHEMA)
+        }, schema=INFO_TURNS_DISCARDED_SCHEMA)
 
-    def _sample_tags_discarded_to_table(self, rollouts: list[DiscardedRollout]) -> pa.Table:
-        """Convert discarded rollouts' sample_tags to a normalized table."""
+    def _sample_tags_discarded_to_table(self, rollouts: list[DiscardedGenerationRollout]) -> pa.Table:
+        """Convert discarded rollouts' sample_tags to a normalized table (one row per tag per sample)."""
         if not rollouts:
-            return pa.table({
-                "sample_idx": pa.array([], type=pa.int32()),
-                "env": pa.array([], type=pa.string()),
-                "tag_name": pa.array([], type=pa.string()),
-                "tag_value": pa.array([], type=pa.string()),
-                "tail_idx": pa.array([], type=pa.int32()),
-            })
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(SAMPLE_TAGS_DISCARDED_SCHEMA.names, SAMPLE_TAGS_DISCARDED_SCHEMA)})
 
-        sample_idxs = []
-        envs = []
-        tag_names = []
-        tag_values = []
-        tail_idxs = []
-
-        for gen in rollouts:
-            for tag_name, tag_value in gen.sample_tags.items():
-                sample_idxs.append(gen.sample_idx)
-                envs.append(gen.env)
+        sample_ids, envs, tag_names, tag_values, tail_idxs = [], [], [], [], []
+        for r in rollouts:
+            for tag_name, tag_value in r.sample_tags.items():
+                sample_ids.append(r.sample_id)
+                envs.append(r.env)
                 tag_names.append(tag_name)
                 tag_values.append(str(tag_value))
-                tail_idxs.append(gen.tail_idx)
+                tail_idxs.append(r.tail_idx)
 
-        data = {
-            "sample_idx": sample_idxs,
-            "env": envs,
-            "tag_name": tag_names,
-            "tag_value": tag_values,
-            "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=SAMPLE_TAGS_DISCARDED_SCHEMA)
+        return pa.table({
+            "sample_id": sample_ids, "env": envs, "tag_name": tag_names,
+            "tag_value": tag_values, "tail_idx": tail_idxs,
+        }, schema=SAMPLE_TAGS_DISCARDED_SCHEMA)
 
     # ------------------------------------------------------------------
     # Eval table converters (mirror discarded pattern)
@@ -2424,6 +2619,7 @@ class EventLogger:
             "eval_name": [p.eval_name for p in prompts],
             "model_step": [p.model_step for p in prompts],
             "sample_idx": [p.sample_idx for p in prompts],
+            "sample_id": [p.sample_id for p in prompts],
             "env": [p.env for p in prompts],
             "prompt": [p.prompt for p in prompts],
             "tokens_prompt": [p.tokens_prompt for p in prompts],
@@ -2433,141 +2629,239 @@ class EventLogger:
         }
         return pa.table(data, schema=PROMPTS_EVAL_SCHEMA)
 
-    def _eval_rollouts_to_table(self, rollouts: list[EvalRollout]) -> pa.Table:
+    def _eval_generations_to_table(self, rollouts: list[EvalGenerationRollout]) -> pa.Table:
+        """Convert eval rollouts to a generations table (one row per generation)."""
         if not rollouts:
-            return pa.table({f.name: pa.array([], type=f.type) for f in ROLLOUTS_EVAL_SCHEMA})
-        steps, eval_names, model_steps, sample_idxs, comp_idxs = [], [], [], [], []
-        turn_orders, turn_types, contents, tokens_list, stop_reasons, env_resp_times, tail_idxs = [], [], [], [], [], [], []
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(GENERATIONS_EVAL_SCHEMA.names, GENERATIONS_EVAL_SCHEMA)})
+
+        steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
+        gen_idxs, contents, tokens_list, prompt_tokens_list = [], [], [], []
+        tool_call_counts, stop_reasons, tail_idxs = [], [], []
+
         for r in rollouts:
-            for turn in r.turns:
+            for g in r.generations:
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 model_steps.append(r.model_step)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
-                turn_orders.append(turn.turn_order)
-                turn_types.append(turn.turn_type)
-                contents.append(_zstd_compress(turn.content))
-                tokens_list.append(turn.tokens)
-                stop_reasons.append(turn.stop_reason)
-                env_resp_times.append(turn.environment_response_time)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(g.generation_idx)
+                contents.append(_zstd_compress(g.content))
+                tokens_list.append(g.tokens)
+                prompt_tokens_list.append(g.prompt_tokens)
+                tool_call_counts.append(g.tool_call_count)
+                stop_reasons.append(g.stop_reason)
                 tail_idxs.append(r.tail_idx)
-        data = {
-            "step": steps, "eval_name": eval_names, "model_step": model_steps,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
-            "turn_order": turn_orders, "turn_type": turn_types, "content": contents,
-            "tokens": tokens_list, "stop_reason": stop_reasons,
-            "environment_response_time": env_resp_times, "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=ROLLOUTS_EVAL_SCHEMA)
 
-    def _samples_data_eval_to_table(self, rollouts: list[EvalRollout]) -> pa.Table:
+        return pa.table({
+            "step": steps, "eval_name": eval_names, "model_step": model_steps,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "content": contents, "tokens": tokens_list,
+            "prompt_tokens": prompt_tokens_list, "tool_call_count": tool_call_counts,
+            "stop_reason": stop_reasons, "tail_idx": tail_idxs,
+        }, schema=GENERATIONS_EVAL_SCHEMA)
+
+    def _eval_env_responses_to_table(self, rollouts: list[EvalGenerationRollout]) -> pa.Table:
+        """Convert eval rollouts to an env_responses table (one row per env response)."""
         if not rollouts:
-            return pa.table({f.name: pa.array([], type=f.type) for f in SAMPLES_DATA_EVAL_SCHEMA})
-        data = {
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(ENV_RESPONSES_EVAL_SCHEMA.names, ENV_RESPONSES_EVAL_SCHEMA)})
+
+        steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
+        gen_idxs, contents, turn_types, tokens_list, response_times, tail_idxs = [], [], [], [], [], []
+
+        for r in rollouts:
+            for e in r.env_responses:
+                steps.append(r.step)
+                eval_names.append(r.eval_name)
+                model_steps.append(r.model_step)
+                sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
+                comp_idxs.append(r.completion_idx)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(e.generation_idx)
+                contents.append(_zstd_compress(e.content))
+                turn_types.append(e.turn_type)
+                tokens_list.append(e.tokens)
+                response_times.append(e.response_time)
+                tail_idxs.append(r.tail_idx)
+
+        return pa.table({
+            "step": steps, "eval_name": eval_names, "model_step": model_steps,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "content": contents, "turn_type": turn_types,
+            "tokens": tokens_list, "response_time": response_times, "tail_idx": tail_idxs,
+        }, schema=ENV_RESPONSES_EVAL_SCHEMA)
+
+    def _eval_tool_calls_to_table(self, rollouts: list[EvalGenerationRollout]) -> pa.Table:
+        """Convert eval rollouts to a tool_calls table (one row per tool call)."""
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(TOOL_CALLS_EVAL_SCHEMA.names, TOOL_CALLS_EVAL_SCHEMA)})
+
+        steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
+        gen_idxs, tc_idxs, env_resp_gen_idxs = [], [], []
+        tool_names, arguments_list, raw_texts, results = [], [], [], []
+        successes, errors, exit_codes, truncateds = [], [], [], []
+        result_tokens_list, sandbox_ids, tail_idxs = [], [], []
+
+        for r in rollouts:
+            for tc in r.tool_calls:
+                steps.append(r.step)
+                eval_names.append(r.eval_name)
+                model_steps.append(r.model_step)
+                sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
+                comp_idxs.append(r.completion_idx)
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(tc.generation_idx)
+                tc_idxs.append(tc.tool_call_idx)
+                env_resp_gen_idxs.append(tc.env_response_generation_idx)
+                tool_names.append(tc.tool_name)
+                arguments_list.append(tc.arguments)
+                raw_texts.append(tc.raw_text)
+                results.append(_zstd_compress(tc.result))
+                successes.append(tc.success)
+                errors.append(tc.error)
+                exit_codes.append(tc.exit_code)
+                truncateds.append(tc.truncated)
+                result_tokens_list.append(tc.result_tokens)
+                sandbox_ids.append(tc.sandbox_id)
+                tail_idxs.append(r.tail_idx)
+
+        return pa.table({
+            "step": steps, "eval_name": eval_names, "model_step": model_steps,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs, "agent_id": agent_ids,
+            "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+            "env_response_generation_idx": env_resp_gen_idxs,
+            "tool_name": tool_names, "arguments": arguments_list, "raw_text": raw_texts,
+            "result": results, "success": successes, "error": errors, "exit_code": exit_codes,
+            "truncated": truncateds, "result_tokens": result_tokens_list, "sandbox_id": sandbox_ids,
+            "tail_idx": tail_idxs,
+        }, schema=TOOL_CALLS_EVAL_SCHEMA)
+
+    def _samples_data_eval_to_table(self, rollouts: list[EvalGenerationRollout]) -> pa.Table:
+        """Convert eval rollouts to a samples_data table (one row per sample)."""
+        if not rollouts:
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(SAMPLES_DATA_EVAL_SCHEMA.names, SAMPLES_DATA_EVAL_SCHEMA)})
+        return pa.table({
             "step": [r.step for r in rollouts],
             "eval_name": [r.eval_name for r in rollouts],
             "model_step": [r.model_step for r in rollouts],
             "sample_idx": [r.sample_idx for r in rollouts],
+            "sample_id": [r.sample_id for r in rollouts],
             "completion_idx": [r.completion_idx for r in rollouts],
             "env": [r.env for r in rollouts],
-            "turns": [len(r.turns) for r in rollouts],
+            "num_generations": [len(r.generations) for r in rollouts],
             "compute_eval_metrics_time": [r.compute_eval_metrics_time for r in rollouts],
+            "stop_reason": [r.stop_reason for r in rollouts],
             "tail_idx": [r.tail_idx for r in rollouts],
-        }
-        return pa.table(data, schema=SAMPLES_DATA_EVAL_SCHEMA)
+        }, schema=SAMPLES_DATA_EVAL_SCHEMA)
 
-    def _rollouts_metrics_eval_to_table(self, rollouts: list[EvalRollout]) -> pa.Table:
+    def _rollouts_metrics_eval_to_table(self, rollouts: list[EvalGenerationRollout]) -> pa.Table:
+        """Convert eval rollouts' metrics to a normalized table (one row per metric per sample)."""
         if not rollouts:
-            return pa.table({f.name: pa.array([], type=f.type) for f in ROLLOUTS_METRICS_EVAL_SCHEMA})
-        steps, eval_names, sample_idxs, comp_idxs, envs, metric_names, values, tail_idxs = [], [], [], [], [], [], [], []
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(ROLLOUTS_METRICS_EVAL_SCHEMA.names, ROLLOUTS_METRICS_EVAL_SCHEMA)})
+        steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, metric_names, values, tail_idxs = [], [], [], [], [], [], [], [], []
         for r in rollouts:
             for metric_name, value in r.sample_metrics.items():
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 envs.append(r.env)
                 metric_names.append(metric_name)
                 values.append(float(value))
                 tail_idxs.append(r.tail_idx)
-        data = {
+        return pa.table({
             "step": steps, "eval_name": eval_names,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs,
             "env": envs, "metric_name": metric_names,
             "value": values, "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=ROLLOUTS_METRICS_EVAL_SCHEMA)
+        }, schema=ROLLOUTS_METRICS_EVAL_SCHEMA)
 
-    def _golden_answers_eval_to_table(self, rollouts: list[EvalRollout]) -> pa.Table:
+    def _golden_answers_eval_to_table(self, rollouts: list[EvalGenerationRollout]) -> pa.Table:
+        """Convert eval rollouts' golden answers to a normalized table (one row per answer per sample)."""
         if not rollouts:
-            return pa.table({f.name: pa.array([], type=f.type) for f in GOLDEN_ANSWERS_EVAL_SCHEMA})
-        steps, eval_names, sample_idxs, comp_idxs, envs, keys, values, tail_idxs = [], [], [], [], [], [], [], []
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(GOLDEN_ANSWERS_EVAL_SCHEMA.names, GOLDEN_ANSWERS_EVAL_SCHEMA)})
+        steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, keys, values, tail_idxs = [], [], [], [], [], [], [], [], []
         for r in rollouts:
             for key, value in r.golden_answers.items():
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 envs.append(r.env)
                 keys.append(key)
                 values.append(value)
                 tail_idxs.append(r.tail_idx)
-        data = {
+        return pa.table({
             "step": steps, "eval_name": eval_names,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs,
             "env": envs, "key": keys, "value": values, "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=GOLDEN_ANSWERS_EVAL_SCHEMA)
+        }, schema=GOLDEN_ANSWERS_EVAL_SCHEMA)
 
-    def _info_turns_eval_to_table(self, rollouts: list[EvalRollout]) -> pa.Table:
+    def _info_turns_eval_to_table(self, rollouts: list[EvalGenerationRollout]) -> pa.Table:
+        """Convert eval rollouts' info_turns to a normalized table (one row per info item)."""
         if not rollouts:
-            return pa.table({f.name: pa.array([], type=f.type) for f in INFO_TURNS_EVAL_SCHEMA})
-        steps, eval_names, sample_idxs, comp_idxs, turn_orders, envs = [], [], [], [], [], []
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(INFO_TURNS_EVAL_SCHEMA.names, INFO_TURNS_EVAL_SCHEMA)})
+        steps, eval_names, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], []
+        gen_idxs, tc_idxs, envs = [], [], []
         info_keys, info_values, info_types, tail_idxs = [], [], [], []
         for r in rollouts:
             for info in r.info_turns:
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
-                turn_orders.append(info.get("turn_order", 0))
+                agent_ids.append(r.agent_id)
+                gen_idxs.append(info.get("generation_idx", info.get("turn_order", 0)))
+                tc_idxs.append(info.get("tool_call_idx", -1))
                 envs.append(r.env)
                 info_keys.append(info.get("info_key", ""))
                 info_values.append(info.get("info_value", ""))
                 info_types.append(info.get("info_type", "text"))
                 tail_idxs.append(r.tail_idx)
-        data = {
+        return pa.table({
             "step": steps, "eval_name": eval_names,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
-            "turn_order": turn_orders, "env": envs,
-            "info_key": info_keys, "info_value": info_values,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs,
+            "agent_id": agent_ids, "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
+            "env": envs, "info_key": info_keys, "info_value": info_values,
             "info_type": info_types, "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=INFO_TURNS_EVAL_SCHEMA)
+        }, schema=INFO_TURNS_EVAL_SCHEMA)
 
-    def _sample_tags_eval_to_table(self, rollouts: list[EvalRollout]) -> pa.Table:
-        """Convert eval rollouts' sample_tags to a normalized table."""
+    def _sample_tags_eval_to_table(self, rollouts: list[EvalGenerationRollout]) -> pa.Table:
+        """Convert eval rollouts' sample_tags to a normalized table (one row per tag per sample)."""
         if not rollouts:
-            return pa.table({f.name: pa.array([], type=f.type) for f in SAMPLE_TAGS_EVAL_SCHEMA})
-        steps, eval_names, sample_idxs, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], []
+            return pa.table({col: pa.array([], type=field.type) for col, field in zip(SAMPLE_TAGS_EVAL_SCHEMA.names, SAMPLE_TAGS_EVAL_SCHEMA)})
+        steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], [], []
         for r in rollouts:
             for tag_name, tag_value in r.sample_tags.items():
                 steps.append(r.step)
                 eval_names.append(r.eval_name)
                 sample_idxs.append(r.sample_idx)
+                sample_ids.append(r.sample_id)
                 comp_idxs.append(r.completion_idx)
                 envs.append(r.env)
                 tag_names.append(tag_name)
                 tag_values.append(str(tag_value))
                 tail_idxs.append(r.tail_idx)
-        data = {
+        return pa.table({
             "step": steps, "eval_name": eval_names,
-            "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+            "sample_idx": sample_idxs, "sample_id": sample_ids,
+            "completion_idx": comp_idxs,
             "env": envs, "tag_name": tag_names,
             "tag_value": tag_values, "tail_idx": tail_idxs,
-        }
-        return pa.table(data, schema=SAMPLE_TAGS_EVAL_SCHEMA)
+        }, schema=SAMPLE_TAGS_EVAL_SCHEMA)
 
     def _write_parquet_to_wandb(self, table: pa.Table, path: str):
         """Write a PyArrow table to W&B as a parquet file."""
@@ -2584,26 +2878,28 @@ class EventLogger:
         self,
         orchestrator_events: list[Event],
         trainer_events: list[Event],
-        inference_events: list[InferenceEvent],
+        rollout_events: list[RolloutEvent],
+        infra_events: list[InfraEvent],
         gpu_metrics: list,
         cpu_metrics: list,
         vllm_metrics: list,
     ) -> tuple[int, int]:
         """
         Compute the min and max tail_idx from all data sources.
-        
+
         Returns:
             (min_tail_idx, max_tail_idx) tuple, or (-1, -1) if no data
         """
         all_tail_indices = (
             [e.tail_idx for e in orchestrator_events] +
             [e.tail_idx for e in trainer_events] +
-            [e.tail_idx for e in inference_events] +
+            [e.tail_idx for e in rollout_events] +
+            [e.tail_idx for e in infra_events] +
             [idx for _, idx in gpu_metrics] +
             [idx for _, idx in cpu_metrics] +
             [idx for _, idx in vllm_metrics]
         )
-        
+
         if all_tail_indices:
             return min(all_tail_indices), max(all_tail_indices)
         return -1, -1
@@ -2612,22 +2908,23 @@ class EventLogger:
         self,
         orchestrator_events: list[Event],
         trainer_events: list[Event],
-        inference_events: list[InferenceEvent],
+        rollout_events: list[RolloutEvent],
+        infra_events: list[InfraEvent],
         gpu_metrics: list,
         cpu_metrics: list,
         vllm_metrics: list,
         path: str,
         metadata: dict | None = None,
-        discarded_rollouts: list[DiscardedRollout] | None = None,
+        discarded_rollouts: list[DiscardedGenerationRollout] | None = None,
         discarded_prompts: list[DiscardedPrompt] | None = None,
-        kept_rollouts: list[Rollout] | None = None,
+        kept_rollouts: list[GenerationRollout] | None = None,
         kept_prompts: list[Prompt] | None = None,
-        eval_rollouts: list[EvalRollout] | None = None,
+        eval_rollouts: list[EvalGenerationRollout] | None = None,
         eval_prompts: list[EvalPrompt] | None = None,
+        cancelled_rollouts: list[DiscardedGenerationRollout] | None = None,
+        cancelled_prompts: list[DiscardedPrompt] | None = None,
         logs: list[tuple[LogRecord, int]] | None = None,
-        inflight_snapshot: list[dict] | None = None,
-        inflight_compute_reward: list[dict] | None = None,
-        inflight_env_response: list[dict] | None = None,
+        inflight_snapshot: dict | None = None,
     ):
         """Write all event data as separate parquet files in a single zip archive."""
         if self.run is None:
@@ -2639,27 +2936,45 @@ class EventLogger:
         # Convert all data to tables
         orchestrator_table = self._orchestrator_events_to_table(orchestrator_events)
         trainer_table = self._trainer_events_to_table(trainer_events)
-        inference_table = self._inference_events_to_table(inference_events)
+        rollout_events_table = self._rollout_events_to_table(rollout_events)
+        infra_events_table = self._infra_events_to_table(infra_events)
         gpu_table = self._gpu_metrics_to_table(gpu_metrics)
         cpu_table = self._cpu_metrics_to_table(cpu_metrics)
         vllm_table = self._vllm_metrics_to_table(vllm_metrics)
-        
+
         # Convert discarded prompts and rollouts (empty lists if None)
         discarded_proms = discarded_prompts or []
         discarded_gens = discarded_rollouts or []
         discarded_prompts_table = self._discarded_prompts_to_table(discarded_proms)
-        discarded_gen_table = self._discarded_rollouts_to_table(discarded_gens)
+        discarded_gen_table = self._discarded_generations_to_table(discarded_gens)
+        discarded_env_resp_table = self._discarded_env_responses_to_table(discarded_gens)
+        discarded_tool_calls_table = self._discarded_tool_calls_to_table(discarded_gens)
         discarded_metrics_table = self._rollouts_metrics_discarded_to_table(discarded_gens)
         discarded_golden_answers_table = self._golden_answers_discarded_to_table(discarded_gens)
         discarded_samples_data_table = self._samples_data_discarded_to_table(discarded_gens)
         discarded_info_turns_table = self._info_turns_discarded_to_table(discarded_gens)
         discarded_sample_tags_table = self._sample_tags_discarded_to_table(discarded_gens)
 
+        # Convert cancelled prompts and rollouts (reuse discarded table methods — same schema)
+        cancelled_proms = cancelled_prompts or []
+        cancelled_gens = cancelled_rollouts or []
+        cancelled_prompts_table = self._discarded_prompts_to_table(cancelled_proms)
+        cancelled_gen_table = self._discarded_generations_to_table(cancelled_gens)
+        cancelled_env_resp_table = self._discarded_env_responses_to_table(cancelled_gens)
+        cancelled_tool_calls_table = self._discarded_tool_calls_to_table(cancelled_gens)
+        cancelled_metrics_table = self._rollouts_metrics_discarded_to_table(cancelled_gens)
+        cancelled_golden_answers_table = self._golden_answers_discarded_to_table(cancelled_gens)
+        cancelled_samples_data_table = self._samples_data_discarded_to_table(cancelled_gens)
+        cancelled_info_turns_table = self._info_turns_discarded_to_table(cancelled_gens)
+        cancelled_sample_tags_table = self._sample_tags_discarded_to_table(cancelled_gens)
+
         # Convert kept prompts and rollouts (empty lists if None)
         kept_proms = kept_prompts or []
         kept_gens = kept_rollouts or []
         kept_prompts_table = self._kept_prompts_to_table(kept_proms)
-        kept_rollouts_table = self._kept_rollouts_to_table(kept_gens)
+        kept_gen_table = self._kept_generations_to_table(kept_gens)
+        kept_env_resp_table = self._kept_env_responses_to_table(kept_gens)
+        kept_tool_calls_table = self._kept_tool_calls_to_table(kept_gens)
         kept_samples_data_table = self._kept_samples_data_to_table(kept_gens)
         kept_metrics_table = self._kept_rollouts_metrics_to_table(kept_gens)
         kept_golden_answers_table = self._kept_golden_answers_to_table(kept_gens)
@@ -2670,7 +2985,9 @@ class EventLogger:
         eval_rols = eval_rollouts or []
         eval_proms = eval_prompts or []
         eval_prompts_table = self._eval_prompts_to_table(eval_proms)
-        eval_rollouts_table = self._eval_rollouts_to_table(eval_rols)
+        eval_gen_table = self._eval_generations_to_table(eval_rols)
+        eval_env_resp_table = self._eval_env_responses_to_table(eval_rols)
+        eval_tool_calls_table = self._eval_tool_calls_to_table(eval_rols)
         eval_samples_data_table = self._samples_data_eval_to_table(eval_rols)
         eval_metrics_table = self._rollouts_metrics_eval_to_table(eval_rols)
         eval_golden_answers_table = self._golden_answers_eval_to_table(eval_rols)
@@ -2692,8 +3009,12 @@ class EventLogger:
             zf.writestr("trainer.parquet", buf.getvalue())
 
             buf = io.BytesIO()
-            pq.write_table(inference_table, buf)
-            zf.writestr("inference.parquet", buf.getvalue())
+            pq.write_table(rollout_events_table, buf)
+            zf.writestr("events_rollout.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(infra_events_table, buf)
+            zf.writestr("events_infra.parquet", buf.getvalue())
 
             buf = io.BytesIO()
             pq.write_table(gpu_table, buf)
@@ -2714,7 +3035,15 @@ class EventLogger:
 
             buf = io.BytesIO()
             pq.write_table(discarded_gen_table, buf)
-            zf.writestr("rollouts_discarded.parquet", buf.getvalue())
+            zf.writestr("generations_discarded.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(discarded_env_resp_table, buf)
+            zf.writestr("env_responses_discarded.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(discarded_tool_calls_table, buf)
+            zf.writestr("tool_calls_discarded.parquet", buf.getvalue())
 
             buf = io.BytesIO()
             pq.write_table(discarded_samples_data_table, buf)
@@ -2742,8 +3071,16 @@ class EventLogger:
             zf.writestr("prompts_kept.parquet", buf.getvalue())
 
             buf = io.BytesIO()
-            pq.write_table(kept_rollouts_table, buf)
-            zf.writestr("rollouts_kept.parquet", buf.getvalue())
+            pq.write_table(kept_gen_table, buf)
+            zf.writestr("generations_kept.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(kept_env_resp_table, buf)
+            zf.writestr("env_responses_kept.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(kept_tool_calls_table, buf)
+            zf.writestr("tool_calls_kept.parquet", buf.getvalue())
 
             buf = io.BytesIO()
             pq.write_table(kept_samples_data_table, buf)
@@ -2771,8 +3108,16 @@ class EventLogger:
             zf.writestr("prompts_eval.parquet", buf.getvalue())
 
             buf = io.BytesIO()
-            pq.write_table(eval_rollouts_table, buf)
-            zf.writestr("rollouts_eval.parquet", buf.getvalue())
+            pq.write_table(eval_gen_table, buf)
+            zf.writestr("generations_eval.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(eval_env_resp_table, buf)
+            zf.writestr("env_responses_eval.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(eval_tool_calls_table, buf)
+            zf.writestr("tool_calls_eval.parquet", buf.getvalue())
 
             buf = io.BytesIO()
             pq.write_table(eval_samples_data_table, buf)
@@ -2794,6 +3139,43 @@ class EventLogger:
             pq.write_table(eval_sample_tags_table, buf)
             zf.writestr("sample_tags_eval.parquet", buf.getvalue())
 
+            # Cancelled tables
+            buf = io.BytesIO()
+            pq.write_table(cancelled_prompts_table, buf)
+            zf.writestr("prompts_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_gen_table, buf)
+            zf.writestr("generations_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_env_resp_table, buf)
+            zf.writestr("env_responses_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_tool_calls_table, buf)
+            zf.writestr("tool_calls_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_samples_data_table, buf)
+            zf.writestr("samples_data_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_metrics_table, buf)
+            zf.writestr("rollouts_metrics_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_golden_answers_table, buf)
+            zf.writestr("golden_answers_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_info_turns_table, buf)
+            zf.writestr("info_turns_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_sample_tags_table, buf)
+            zf.writestr("sample_tags_cancelled.parquet", buf.getvalue())
+
             # Logs table
             buf = io.BytesIO()
             pq.write_table(logs_table, buf)
@@ -2806,21 +3188,13 @@ class EventLogger:
 
             # Write inflight snapshot if provided (only for tail.zip)
             if inflight_snapshot is not None:
-                inflight_data = {
-                    "snapshot_time": time.time(),
-                    "running": inflight_snapshot,
-                }
-                if inflight_compute_reward:
-                    inflight_data["running_compute_reward"] = inflight_compute_reward
-                if inflight_env_response:
-                    inflight_data["running_env_response"] = inflight_env_response
-                zf.writestr("inflight.json", json.dumps(inflight_data))
+                zf.writestr("inflight.json", json.dumps(inflight_snapshot))
 
         self.run.save(str(dest_path), base_path=self.run.dir, policy="now")
 
     def _write_steps_zip_to_wandb(
         self,
-        rollouts: list[Rollout],
+        rollouts: list[GenerationRollout],
         prompts: list[Prompt],
         step_metrics: list[StepMetric],
         path: str,
@@ -2828,15 +3202,17 @@ class EventLogger:
     ):
         """
         Write step data (prompts, rollouts, metrics) as parquet files inside a zip archive.
-        
+
         Creates files in the zip:
         - prompts.parquet: One row per group with the initial prompt
-        - rollouts.parquet: One row per turn per completion (model + env responses)
-        - samples_data.parquet: One row per sample with reward, advantage, turn count, total_tokens, raw_string
-        - rollouts_metrics.parquet: Normalized metrics table (step, sample_idx, env, metric_name, value)
-        - golden_answers.parquet: Golden answers table (step, sample_idx, env, key, value)
-        - info_turns.parquet: Per-turn text info table (step, sample_idx, turn_order, env, info_key, info_value, info_type)
-        - sample_tags.parquet: Per-sample string tags table (step, sample_idx, env, tag_name, tag_value)
+        - generations.parquet: One row per generation (model response)
+        - env_responses.parquet: One row per environment response
+        - tool_calls.parquet: One row per tool call
+        - samples_data.parquet: One row per sample with reward, advantage, num_generations, total_tokens, raw_string
+        - rollouts_metrics.parquet: Normalized metrics table (step, sample_id, env, metric_name, value)
+        - golden_answers.parquet: Golden answers table (step, sample_id, env, key, value)
+        - info_turns.parquet: Per-generation info table (step, sample_id, generation_idx, env, info_key, info_value, info_type)
+        - sample_tags.parquet: Per-sample string tags table (step, sample_id, env, tag_name, tag_value)
         - metrics.parquet: Per-step, per-rank metrics (step, metric, value, rank)
         - metadata.json: Archive metadata (if provided)
         """
@@ -2847,12 +3223,15 @@ class EventLogger:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         prompts_table = self._prompts_to_table(prompts)
-        gen_table = self._rollouts_to_table(rollouts)
+        gen_table = self._generations_to_table(rollouts)
+        env_resp_table = self._env_responses_to_table(rollouts)
+        tool_calls_table = self._tool_calls_to_table(rollouts)
         samples_data_table = self._samples_data_to_table(rollouts)
         gen_metrics_table = self._rollouts_metrics_to_table(rollouts)
         golden_answers_table = self._golden_answers_to_table(rollouts)
         info_turns_table = self._info_turns_to_table(rollouts)
         sample_tags_table = self._sample_tags_to_table(rollouts)
+        turn_metrics_table = self._turn_metrics_to_table(rollouts)
         metrics_table = self._step_metrics_to_table(step_metrics)
 
         with zipfile.ZipFile(dest_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -2860,28 +3239,38 @@ class EventLogger:
             buf = io.BytesIO()
             pq.write_table(prompts_table, buf)
             zf.writestr("prompts.parquet", buf.getvalue())
-            
-            # Write rollouts table (one row per turn)
+
+            # Write generations table (one row per generation)
             buf = io.BytesIO()
             pq.write_table(gen_table, buf)
-            zf.writestr("rollouts.parquet", buf.getvalue())
-            
+            zf.writestr("generations.parquet", buf.getvalue())
+
+            # Write env_responses table (one row per env response)
+            buf = io.BytesIO()
+            pq.write_table(env_resp_table, buf)
+            zf.writestr("env_responses.parquet", buf.getvalue())
+
+            # Write tool_calls table (one row per tool call)
+            buf = io.BytesIO()
+            pq.write_table(tool_calls_table, buf)
+            zf.writestr("tool_calls.parquet", buf.getvalue())
+
             # Write samples_data table (one row per sample with summary info)
             buf = io.BytesIO()
             pq.write_table(samples_data_table, buf)
             zf.writestr("samples_data.parquet", buf.getvalue())
-            
+
             # Write rollouts metrics table (normalized format: reward components + other metrics)
             buf = io.BytesIO()
             pq.write_table(gen_metrics_table, buf)
             zf.writestr("rollouts_metrics.parquet", buf.getvalue())
-            
+
             # Write golden answers table (completely independent from metrics)
             buf = io.BytesIO()
             pq.write_table(golden_answers_table, buf)
             zf.writestr("golden_answers.parquet", buf.getvalue())
-            
-            # Write info turns table (per-turn text info: stderr, summaries, etc.)
+
+            # Write info turns table (per-generation text info: stderr, summaries, etc.)
             buf = io.BytesIO()
             pq.write_table(info_turns_table, buf)
             zf.writestr("info_turns.parquet", buf.getvalue())
@@ -2890,6 +3279,11 @@ class EventLogger:
             buf = io.BytesIO()
             pq.write_table(sample_tags_table, buf)
             zf.writestr("sample_tags.parquet", buf.getvalue())
+
+            # Write turn metrics table (per-turn numeric metrics)
+            buf = io.BytesIO()
+            pq.write_table(turn_metrics_table, buf)
+            zf.writestr("turn_metrics.parquet", buf.getvalue())
 
             # Write step metrics table (grad_norm, kl_divergence_inference, entropy per rank)
             buf = io.BytesIO()
@@ -2926,18 +3320,27 @@ class EventLogger:
         now = time.time()
         current_tail_idx = self._current_tail_idx
 
-        # Assign tail_idx to events/inference_events/discarded_rollouts that don't have one yet
+        # Assign tail_idx to events/rollout_events/infra_events/discarded_rollouts that don't have one yet
         with self._lock:
             for e in self._events:
                 if e.tail_idx == -1:
                     e.tail_idx = current_tail_idx
-            for e in self._inference_events:
+            for e in self._rollout_events:
+                if e.tail_idx == -1:
+                    e.tail_idx = current_tail_idx
+            for e in self._infra_events:
                 if e.tail_idx == -1:
                     e.tail_idx = current_tail_idx
             for g in self._discarded_rollouts:
                 if g.tail_idx == -1:
                     g.tail_idx = current_tail_idx
             for p in self._discarded_prompts:
+                if p.tail_idx == -1:
+                    p.tail_idx = current_tail_idx
+            for g in self._cancelled_rollouts:
+                if g.tail_idx == -1:
+                    g.tail_idx = current_tail_idx
+            for p in self._cancelled_prompts:
                 if p.tail_idx == -1:
                     p.tail_idx = current_tail_idx
             for g in self._kept_rollouts:
@@ -2952,27 +3355,23 @@ class EventLogger:
             for p in self._eval_prompts:
                 if p.tail_idx == -1:
                     p.tail_idx = current_tail_idx
-            # Snapshot inflight generations for tail.zip
-            inflight_snapshot = [
-                {
-                    "sample_id": e.sample_id,
-                    "group_id": e.group_id,
-                    "server": e.server,
-                    "server_lane": e.server_lane,
-                    "start_time": e.start_time,
-                    "is_eval": e.is_eval,
-                    "prompt_tokens": e.prompt_tokens,
-                }
-                for e in self._inflight_generations.values()
-            ]
-            # Snapshot inflight compute_reward for tail.zip
-            inflight_compute_reward_snapshot = list(self._inflight_compute_reward.values())
-            # Snapshot inflight env_response for tail.zip
-            inflight_env_response_snapshot = list(self._inflight_env_response.values())
+            # Snapshot all inflight tracking dicts for tail.zip
+            inflight_snapshot = {
+                "timestamp": time.time(),
+                "inflight_generations": list(self._inflight_generations.values()),
+                "inflight_tool_executions": list(self._inflight_tool_executions.values()),
+                "inflight_env_responses": list(self._inflight_env_responses.values()),
+                "inflight_sandbox_ops": list(self._inflight_sandbox_ops.values()),
+                "inflight_weight_syncs": list(self._inflight_weight_syncs.values()),
+                "inflight_rewards": list(self._inflight_rewards.values()),
+            }
             all_events = list(self._events)
-            all_inference_events = list(self._inference_events)
+            all_rollout_events = list(self._rollout_events)
+            all_infra_events = list(self._infra_events)
             all_discarded_rollouts = list(self._discarded_rollouts)
             all_discarded_prompts = list(self._discarded_prompts)
+            all_cancelled_rollouts = list(self._cancelled_rollouts)
+            all_cancelled_prompts = list(self._cancelled_prompts)
             all_kept_rollouts = list(self._kept_rollouts)
             all_kept_prompts = list(self._kept_prompts)
             all_eval_rollouts = list(self._eval_rollouts)
@@ -3041,8 +3440,12 @@ class EventLogger:
                 e for e in all_events
                 if e.tail_idx >= self._block_first_tail_idx and e.tail_idx <= block_last_tail_idx
             ]
-            block_inference_events = [
-                e for e in all_inference_events
+            block_rollout_events = [
+                e for e in all_rollout_events
+                if e.tail_idx >= self._block_first_tail_idx and e.tail_idx <= block_last_tail_idx
+            ]
+            block_infra_events = [
+                e for e in all_infra_events
                 if e.tail_idx >= self._block_first_tail_idx and e.tail_idx <= block_last_tail_idx
             ]
             block_gpu_metrics = [
@@ -3069,6 +3472,14 @@ class EventLogger:
                 p for p in all_discarded_prompts
                 if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
             ]
+            block_cancelled_rollouts = [
+                g for g in all_cancelled_rollouts
+                if g.tail_idx >= self._block_first_tail_idx and g.tail_idx <= block_last_tail_idx
+            ]
+            block_cancelled_prompts = [
+                p for p in all_cancelled_prompts
+                if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
+            ]
             block_kept_rollouts = [
                 g for g in all_kept_rollouts
                 if g.tail_idx >= self._block_first_tail_idx and g.tail_idx <= block_last_tail_idx
@@ -3086,7 +3497,7 @@ class EventLogger:
                 if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
             ]
 
-            if block_events or block_inference_events or block_gpu_metrics or block_cpu_metrics or block_vllm_metrics or block_discarded_rollouts or block_discarded_prompts or block_kept_rollouts or block_kept_prompts or block_eval_rollouts or block_eval_prompts:
+            if block_events or block_rollout_events or block_infra_events or block_gpu_metrics or block_cpu_metrics or block_vllm_metrics or block_discarded_rollouts or block_discarded_prompts or block_cancelled_rollouts or block_cancelled_prompts or block_kept_rollouts or block_kept_prompts or block_eval_rollouts or block_eval_prompts:
                 orch_events = [e for e in block_events if e.source == "orchestrator"]
                 trainer_events = [e for e in block_events if e.source == "trainer"]
 
@@ -3097,12 +3508,14 @@ class EventLogger:
                     "max_tail_idx": block_last_tail_idx,
                 }
                 self._write_events_zip_to_wandb(
-                    orch_events, trainer_events, block_inference_events,
+                    orch_events, trainer_events, block_rollout_events, block_infra_events,
                     block_gpu_metrics, block_cpu_metrics, block_vllm_metrics,
                     block_path,
                     metadata=finalized_block_metadata,
                     discarded_rollouts=block_discarded_rollouts,
                     discarded_prompts=block_discarded_prompts,
+                    cancelled_rollouts=block_cancelled_rollouts,
+                    cancelled_prompts=block_cancelled_prompts,
                     kept_rollouts=block_kept_rollouts,
                     kept_prompts=block_kept_prompts,
                     eval_rollouts=block_eval_rollouts,
@@ -3125,13 +3538,22 @@ class EventLogger:
                 for e in self._events:
                     if e.tail_idx == -1:
                         e.tail_idx = current_tail_idx
-                for e in self._inference_events:
+                for e in self._rollout_events:
+                    if e.tail_idx == -1:
+                        e.tail_idx = current_tail_idx
+                for e in self._infra_events:
                     if e.tail_idx == -1:
                         e.tail_idx = current_tail_idx
                 for g in self._discarded_rollouts:
                     if g.tail_idx == -1:
                         g.tail_idx = current_tail_idx
                 for p in self._discarded_prompts:
+                    if p.tail_idx == -1:
+                        p.tail_idx = current_tail_idx
+                for g in self._cancelled_rollouts:
+                    if g.tail_idx == -1:
+                        g.tail_idx = current_tail_idx
+                for p in self._cancelled_prompts:
                     if p.tail_idx == -1:
                         p.tail_idx = current_tail_idx
                 for g in self._kept_rollouts:
@@ -3147,14 +3569,17 @@ class EventLogger:
                     if p.tail_idx == -1:
                         p.tail_idx = current_tail_idx
                 self._events = [e for e in self._events if e.tail_idx >= new_block_first_tail_idx]
-                self._inference_events = [e for e in self._inference_events if e.tail_idx >= new_block_first_tail_idx]
+                self._rollout_events = [e for e in self._rollout_events if e.tail_idx >= new_block_first_tail_idx]
+                self._infra_events = [e for e in self._infra_events if e.tail_idx >= new_block_first_tail_idx]
                 self._discarded_rollouts = [g for g in self._discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
                 self._discarded_prompts = [p for p in self._discarded_prompts if p.tail_idx >= new_block_first_tail_idx]
+                self._cancelled_rollouts = [g for g in self._cancelled_rollouts if g.tail_idx >= new_block_first_tail_idx]
+                self._cancelled_prompts = [p for p in self._cancelled_prompts if p.tail_idx >= new_block_first_tail_idx]
                 self._kept_rollouts = [g for g in self._kept_rollouts if g.tail_idx >= new_block_first_tail_idx]
                 self._kept_prompts = [p for p in self._kept_prompts if p.tail_idx >= new_block_first_tail_idx]
                 self._eval_rollouts = [r for r in self._eval_rollouts if r.tail_idx >= new_block_first_tail_idx]
                 self._eval_prompts = [p for p in self._eval_prompts if p.tail_idx >= new_block_first_tail_idx]
-            
+
             # Also assign tail_idx to any new metrics added during this cycle
             self._gpu_metrics = [(m, current_tail_idx if idx == -1 else idx) for m, idx in self._gpu_metrics]
             self._gpu_metrics = [(m, idx) for m, idx in self._gpu_metrics if idx >= new_block_first_tail_idx]
@@ -3163,12 +3588,15 @@ class EventLogger:
             self._log_records = [(r, idx) for r, idx in self._log_records if idx >= new_block_first_tail_idx]
 
             all_events = [e for e in all_events if e.tail_idx >= new_block_first_tail_idx]
-            all_inference_events = [e for e in all_inference_events if e.tail_idx >= new_block_first_tail_idx]
+            all_rollout_events = [e for e in all_rollout_events if e.tail_idx >= new_block_first_tail_idx]
+            all_infra_events = [e for e in all_infra_events if e.tail_idx >= new_block_first_tail_idx]
             all_gpu_metrics = [(m, idx) for m, idx in all_gpu_metrics if idx >= new_block_first_tail_idx]
             all_cpu_metrics = [(m, idx) for m, idx in all_cpu_metrics if idx >= new_block_first_tail_idx]
             all_vllm_metrics = [(m, idx) for m, idx in all_vllm_metrics if idx >= new_block_first_tail_idx]
             all_log_records = [(r, idx) for r, idx in all_log_records if idx >= new_block_first_tail_idx]
             all_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
+            all_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= new_block_first_tail_idx]
+            all_cancelled_prompts = [p for p in all_cancelled_prompts if p.tail_idx >= new_block_first_tail_idx]
             all_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= new_block_first_tail_idx]
             all_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= new_block_first_tail_idx]
             all_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= new_block_first_tail_idx]
@@ -3179,12 +3607,15 @@ class EventLogger:
 
         # Filter for current block BY TAIL_IDX (ensures complete tails)
         current_block_events = [e for e in all_events if e.tail_idx >= self._block_first_tail_idx]
-        current_block_inference_events = [e for e in all_inference_events if e.tail_idx >= self._block_first_tail_idx]
+        current_block_rollout_events = [e for e in all_rollout_events if e.tail_idx >= self._block_first_tail_idx]
+        current_block_infra_events = [e for e in all_infra_events if e.tail_idx >= self._block_first_tail_idx]
         current_block_gpu = [(m, idx) for m, idx in all_gpu_metrics if idx >= self._block_first_tail_idx]
         current_block_cpu = [(m, idx) for m, idx in all_cpu_metrics if idx >= self._block_first_tail_idx]
         current_block_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= self._block_first_tail_idx]
         current_block_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= self._block_first_tail_idx]
         current_block_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= self._block_first_tail_idx]
+        current_block_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= self._block_first_tail_idx]
+        current_block_cancelled_prompts = [p for p in all_cancelled_prompts if p.tail_idx >= self._block_first_tail_idx]
         current_block_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= self._block_first_tail_idx]
         current_block_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= self._block_first_tail_idx]
         current_block_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= self._block_first_tail_idx]
@@ -3193,12 +3624,15 @@ class EventLogger:
 
         # Filter for tail BY TAIL_IDX (ensures complete tails)
         tail_events = [e for e in all_events if e.tail_idx >= tail_min_idx_for_window]
-        tail_inference_events = [e for e in all_inference_events if e.tail_idx >= tail_min_idx_for_window]
+        tail_rollout_events = [e for e in all_rollout_events if e.tail_idx >= tail_min_idx_for_window]
+        tail_infra_events = [e for e in all_infra_events if e.tail_idx >= tail_min_idx_for_window]
         tail_gpu = [(m, idx) for m, idx in all_gpu_metrics if idx >= tail_min_idx_for_window]
         tail_cpu = [(m, idx) for m, idx in all_cpu_metrics if idx >= tail_min_idx_for_window]
         tail_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= tail_min_idx_for_window]
         tail_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= tail_min_idx_for_window]
         tail_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= tail_min_idx_for_window]
+        tail_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= tail_min_idx_for_window]
+        tail_cancelled_prompts = [p for p in all_cancelled_prompts if p.tail_idx >= tail_min_idx_for_window]
         tail_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= tail_min_idx_for_window]
         tail_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= tail_min_idx_for_window]
         tail_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= tail_min_idx_for_window]
@@ -3214,7 +3648,8 @@ class EventLogger:
         # Calculate tail time range (from all data sources) - for informational purposes
         all_tail_timestamps = (
             [e.timestamp for e in tail_events] +
-            [e.start_time for e in tail_inference_events] +
+            [e.timestamp for e in tail_rollout_events] +
+            [e.timestamp for e in tail_infra_events] +
             [m.timestamp for m, _ in tail_gpu] +
             [m.timestamp for m, _ in tail_cpu] +
             [m.timestamp for m, _ in tail_vllm]
@@ -3231,20 +3666,20 @@ class EventLogger:
             "max_tail_idx": current_tail_idx,
         }
         self._write_events_zip_to_wandb(
-            tail_orch_events, tail_trainer_events, tail_inference_events,
+            tail_orch_events, tail_trainer_events, tail_rollout_events, tail_infra_events,
             tail_gpu, tail_cpu, tail_vllm,
             "events/tail.zip",
             metadata=tail_metadata,
             discarded_rollouts=tail_discarded_rollouts,
             discarded_prompts=tail_discarded_prompts,
+            cancelled_rollouts=tail_cancelled_rollouts,
+            cancelled_prompts=tail_cancelled_prompts,
             kept_rollouts=tail_kept_rollouts,
             kept_prompts=tail_kept_prompts,
             eval_rollouts=tail_eval_rollouts,
             eval_prompts=tail_eval_prompts,
             logs=tail_log_records,
             inflight_snapshot=inflight_snapshot,
-            inflight_compute_reward=inflight_compute_reward_snapshot,
-            inflight_env_response=inflight_env_response_snapshot,
         )
 
         # Write block_live.zip with all data
@@ -3256,12 +3691,14 @@ class EventLogger:
             "max_tail_idx": current_tail_idx,
         }
         self._write_events_zip_to_wandb(
-            block_orch_events, block_trainer_events, current_block_inference_events,
+            block_orch_events, block_trainer_events, current_block_rollout_events, current_block_infra_events,
             current_block_gpu, current_block_cpu, current_block_vllm,
             "events/block_live.zip",
             metadata=block_live_metadata,
             discarded_rollouts=current_block_discarded_rollouts,
             discarded_prompts=current_block_discarded_prompts,
+            cancelled_rollouts=current_block_cancelled_rollouts,
+            cancelled_prompts=current_block_cancelled_prompts,
             kept_rollouts=current_block_kept_rollouts,
             kept_prompts=current_block_kept_prompts,
             eval_rollouts=current_block_eval_rollouts,
@@ -3405,19 +3842,23 @@ class EventLogger:
             # Events counts in tail
             "events/tail_orchestrator_count": len(tail_orch_events),
             "events/tail_trainer_count": len(tail_trainer_events),
-            "events/tail_inference_count": len(tail_inference_events),
+            "events/tail_rollout_events_count": len(tail_rollout_events),
+            "events/tail_infra_events_count": len(tail_infra_events),
             "events/tail_gpu_count": len(tail_gpu),
             "events/tail_cpu_count": len(tail_cpu),
             "events/tail_vllm_count": len(tail_vllm),
             "events/tail_discarded_rollouts_count": len(tail_discarded_rollouts),
+            "events/tail_cancelled_rollouts_count": len(tail_cancelled_rollouts),
             # Events counts in block_live
             "events/block_live_orchestrator_count": len(block_orch_events),
             "events/block_live_trainer_count": len(block_trainer_events),
-            "events/block_live_inference_count": len(current_block_inference_events),
+            "events/block_live_rollout_events_count": len(current_block_rollout_events),
+            "events/block_live_infra_events_count": len(current_block_infra_events),
             "events/block_live_gpu_count": len(current_block_gpu),
             "events/block_live_cpu_count": len(current_block_cpu),
             "events/block_live_vllm_count": len(current_block_vllm),
             "events/block_live_discarded_rollouts_count": len(current_block_discarded_rollouts),
+            "events/block_live_cancelled_rollouts_count": len(current_block_cancelled_rollouts),
             # Eval counts
             "events/tail_eval_rollouts_count": len(tail_eval_rollouts),
             "events/block_live_eval_rollouts_count": len(current_block_eval_rollouts),
@@ -3440,7 +3881,7 @@ class EventLogger:
         self._summary_id += 1
         # Increment tail_idx for the next upload cycle
         self._current_tail_idx += 1
-        _log.debug(f"Uploaded tail {current_tail_idx}: events={len(tail_orch_events)}+{len(tail_trainer_events)}+{len(tail_inference_events)}, metrics={len(tail_gpu)}+{len(tail_cpu)}+{len(tail_vllm)}, discarded={len(tail_discarded_rollouts)}")
+        _log.debug(f"Uploaded tail {current_tail_idx}: events={len(tail_orch_events)}+{len(tail_trainer_events)}+{len(tail_rollout_events)}+{len(tail_infra_events)}, metrics={len(tail_gpu)}+{len(tail_cpu)}+{len(tail_vllm)}, discarded={len(tail_discarded_rollouts)}, cancelled={len(tail_cancelled_rollouts)}")
 
     def upload_now(self, blocking: bool = False):
         """Trigger an upload cycle."""
