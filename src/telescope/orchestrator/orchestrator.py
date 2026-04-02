@@ -68,14 +68,15 @@ _log = get_logger("orchestrator")
 
 class InflightRolloutInfo:
     """Mutable metadata for an in-flight rollout group."""
-    __slots__ = ("sample_off_policy_steps", "sample_timings", "tasks", "server_url", "sample_ids")
+    __slots__ = ("sample_off_policy_steps", "sample_timings", "tasks", "server_url", "sample_ids", "prompt_data")
 
-    def __init__(self, server_url: str):
+    def __init__(self, server_url: str, prompt_data: dict | None = None):
         self.sample_off_policy_steps: dict[int, int] = {}  # sample_idx -> off_policy_steps
         self.sample_timings: dict[int, dict] = {}  # sample_idx -> timing dict (shared with generate_completion)
         self.tasks: list[asyncio.Task] = []
         self.server_url: str = server_url
         self.sample_ids: dict[int, int] = {}  # sample_idx -> pre-assigned run-wide sample_id
+        self.prompt_data: dict | None = prompt_data  # Original prompt data for cancelled rollout logging
 
 
 class Orchestrator:
@@ -983,7 +984,7 @@ class Orchestrator:
         )
         self.active_tasks_by_server.setdefault(server_url, set()).add(task)
         task.add_done_callback(lambda t: (self.active_tasks_by_server.get(server_url, set()).discard(t), t.exception() if not t.cancelled() else None))
-        info = InflightRolloutInfo(server_url=server_url)
+        info = InflightRolloutInfo(server_url=server_url, prompt_data=prompt_data)
         info.tasks.append(task)
         info.sample_off_policy_steps = {idx: 0 for idx in range(config.cfg.group_size)}
         info.sample_ids = sample_ids
@@ -1050,7 +1051,7 @@ class Orchestrator:
             f"(env={env_name}, active={self.active_count})"
         )
         self.wandb_logger.log_orchestrator_timeline_event("inference_call", group_id=request_id)
-        self.inflight_rollout_info[request_id] = InflightRolloutInfo(server_url=server_url)
+        self.inflight_rollout_info[request_id] = InflightRolloutInfo(server_url=server_url, prompt_data=prompt_data)
 
         # Enqueue GROUP_SIZE samples for this group.
         queue = self.individual_sample_queues.setdefault(server_url, collections.deque())
@@ -1410,6 +1411,8 @@ class Orchestrator:
         self._schedule_dispatch()
 
         if group["remaining"] == 0:
+            if not generate_module._shutting_down:
+                self._log_cancelled_rollouts(request_id, "off_policy")
             self.active_count -= 1
             del self.pending_individual_groups[request_id]
             self.inflight_rollout_info.pop(request_id, None)
@@ -1489,6 +1492,10 @@ class Orchestrator:
         # Return lane slots to the pool.
         if server_url in self.available_server_lane_slots:
             self.available_server_lane_slots[server_url].update(lane_slots)
+
+        # Log cancelled rollout tables before popping inflight info.
+        if not generate_module._shutting_down:
+            self._log_cancelled_rollouts(request_id, "off_policy")
 
         rollout_info = self.inflight_rollout_info.pop(request_id, None)
         sample_off_policy = rollout_info.sample_off_policy_steps if rollout_info else {}
@@ -2169,6 +2176,50 @@ class Orchestrator:
                 off_policy_steps=off_policy_steps_map.get(idx, 0),
             )
 
+    def _log_cancelled_rollouts(self, request_id: int, cancel_reason: str):
+        """
+        Log all samples from a cancelled rollout group.
+
+        Cancelled rollouts have no result data (inference was interrupted),
+        so most fields are empty/zero. The main value is recording which
+        prompts were cancelled and why.
+
+        Args:
+            request_id: The group's request_id
+            cancel_reason: Why the group was cancelled (e.g. "off_policy", "eval_drain")
+        """
+        rollout_info = self.inflight_rollout_info.get(request_id)
+        if rollout_info is None:
+            return
+
+        prompt_data = rollout_info.prompt_data or {}
+        prompt_text = prompt_data.get("prompt", "")
+        env_name = prompt_data.get("env_name", "")
+
+        # Compute tokens_prompt if we have a tokenizer
+        tokens_prompt = 0
+        if self.tokenizer is not None and prompt_text:
+            tokens_prompt = len(self.tokenizer.encode(prompt_text))
+
+        sample_ids = rollout_info.sample_ids or {}
+        off_policy_steps_map = rollout_info.sample_off_policy_steps or {}
+        num_samples = max(len(sample_ids), config.cfg.group_size)
+
+        for idx in range(num_samples):
+            sample_id = sample_ids.get(idx, -1)
+
+            self.wandb_logger.event_logger.log_cancelled_generation_rollout(
+                cancel_reason=cancel_reason,
+                trainer_step=self.trainer_step,
+                inference_step=self.inference_step,
+                group_id=request_id,
+                sample_id=sample_id,
+                prompt=prompt_text,
+                env=env_name,
+                tokens_prompt=tokens_prompt,
+                off_policy_steps=off_policy_steps_map.get(idx, 0),
+            )
+
     def _try_start_pending_rollouts(self):
         """Try to start new rollouts after weights are updated."""
         while self._has_pending_prompt_data():
@@ -2510,6 +2561,8 @@ class Orchestrator:
         # and no CancelledError handler will fire to clean up.
         group = self.pending_individual_groups.get(request_id)
         if group is not None and group["remaining"] == 0:
+            if not generate_module._shutting_down:
+                self._log_cancelled_rollouts(request_id, "off_policy")
             self.active_count -= 1
             del self.pending_individual_groups[request_id]
             self.inflight_rollout_info.pop(request_id, None)
@@ -2840,8 +2893,11 @@ class Orchestrator:
                         "error_message": "Server drained before dispatch",
                     }
                     if group["remaining"] == 0:
+                        if not generate_module._shutting_down:
+                            self._log_cancelled_rollouts(request_id, "eval_drain")
                         self.active_count -= 1
                         del self.pending_individual_groups[request_id]
+                        self.inflight_rollout_info.pop(request_id, None)
                         _log.debug(
                             f"Drained group {request_id} fully resolved "
                             f"(active={self.active_count})"

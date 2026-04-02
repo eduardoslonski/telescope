@@ -976,6 +976,12 @@ class EventLogger:
         self._discarded_prompts: list[DiscardedPrompt] = []
         self._logged_discarded_group_ids: set[int] = set()  # Track which discarded group_ids have been logged
 
+        # Cancelled rollouts tracking (uploaded in events zip, same schema as discarded)
+        # These are rollouts that were interrupted mid-flight (off-policy cancellation, eval drain, etc.)
+        self._cancelled_rollouts: list[DiscardedGenerationRollout] = []
+        self._cancelled_prompts: list[DiscardedPrompt] = []
+        self._logged_cancelled_group_ids: set[int] = set()
+
         # Kept rollouts tracking (uploaded in events zip alongside discarded, for real-time incremental ingestion)
         self._kept_rollouts: list[GenerationRollout] = []
         self._kept_prompts: list[Prompt] = []
@@ -1534,6 +1540,55 @@ class EventLogger:
                     tokens_prompt=tokens_prompt,
                     system_prompt=system_prompt,
                     tokens_system_prompt=tokens_system_prompt,
+                ))
+
+    def log_cancelled_generation_rollout(
+        self,
+        cancel_reason: str,
+        trainer_step: int,
+        inference_step: int,
+        group_id: int,
+        sample_id: int,
+        prompt: str = "",
+        env: str = "",
+        tokens_prompt: int = 0,
+        timestamp: float | None = None,
+        off_policy_steps: int = 0,
+        agent_id: int = 0,
+    ):
+        """Log a cancelled rollout sample (inference was interrupted).
+
+        Reuses DiscardedGenerationRollout with empty generation data since
+        the inference never completed.
+        """
+        ts = timestamp if timestamp is not None else time.time()
+
+        rollout = DiscardedGenerationRollout(
+            timestamp=ts,
+            discard_reason=cancel_reason,
+            trainer_step=trainer_step,
+            inference_step=inference_step,
+            group_id=group_id,
+            sample_id=sample_id,
+            agent_id=agent_id,
+            env=env,
+            off_policy_steps=off_policy_steps,
+        )
+
+        with self._lock:
+            self._cancelled_rollouts.append(rollout)
+
+            if group_id not in self._logged_cancelled_group_ids:
+                self._logged_cancelled_group_ids.add(group_id)
+                self._cancelled_prompts.append(DiscardedPrompt(
+                    timestamp=ts,
+                    discard_reason=cancel_reason,
+                    trainer_step=trainer_step,
+                    inference_step=inference_step,
+                    group_id=group_id,
+                    env=env,
+                    prompt=prompt,
+                    tokens_prompt=tokens_prompt,
                 ))
 
     def log_eval_prompt(self, prompt: EvalPrompt):
@@ -2839,6 +2894,8 @@ class EventLogger:
         kept_prompts: list[Prompt] | None = None,
         eval_rollouts: list[EvalGenerationRollout] | None = None,
         eval_prompts: list[EvalPrompt] | None = None,
+        cancelled_rollouts: list[DiscardedGenerationRollout] | None = None,
+        cancelled_prompts: list[DiscardedPrompt] | None = None,
         logs: list[tuple[LogRecord, int]] | None = None,
         inflight_snapshot: dict | None = None,
     ):
@@ -2857,7 +2914,7 @@ class EventLogger:
         gpu_table = self._gpu_metrics_to_table(gpu_metrics)
         cpu_table = self._cpu_metrics_to_table(cpu_metrics)
         vllm_table = self._vllm_metrics_to_table(vllm_metrics)
-        
+
         # Convert discarded prompts and rollouts (empty lists if None)
         discarded_proms = discarded_prompts or []
         discarded_gens = discarded_rollouts or []
@@ -2870,6 +2927,19 @@ class EventLogger:
         discarded_samples_data_table = self._samples_data_discarded_to_table(discarded_gens)
         discarded_info_turns_table = self._info_turns_discarded_to_table(discarded_gens)
         discarded_sample_tags_table = self._sample_tags_discarded_to_table(discarded_gens)
+
+        # Convert cancelled prompts and rollouts (reuse discarded table methods — same schema)
+        cancelled_proms = cancelled_prompts or []
+        cancelled_gens = cancelled_rollouts or []
+        cancelled_prompts_table = self._discarded_prompts_to_table(cancelled_proms)
+        cancelled_gen_table = self._discarded_generations_to_table(cancelled_gens)
+        cancelled_env_resp_table = self._discarded_env_responses_to_table(cancelled_gens)
+        cancelled_tool_calls_table = self._discarded_tool_calls_to_table(cancelled_gens)
+        cancelled_metrics_table = self._rollouts_metrics_discarded_to_table(cancelled_gens)
+        cancelled_golden_answers_table = self._golden_answers_discarded_to_table(cancelled_gens)
+        cancelled_samples_data_table = self._samples_data_discarded_to_table(cancelled_gens)
+        cancelled_info_turns_table = self._info_turns_discarded_to_table(cancelled_gens)
+        cancelled_sample_tags_table = self._sample_tags_discarded_to_table(cancelled_gens)
 
         # Convert kept prompts and rollouts (empty lists if None)
         kept_proms = kept_prompts or []
@@ -3042,6 +3112,43 @@ class EventLogger:
             pq.write_table(eval_sample_tags_table, buf)
             zf.writestr("sample_tags_eval.parquet", buf.getvalue())
 
+            # Cancelled tables
+            buf = io.BytesIO()
+            pq.write_table(cancelled_prompts_table, buf)
+            zf.writestr("prompts_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_gen_table, buf)
+            zf.writestr("generations_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_env_resp_table, buf)
+            zf.writestr("env_responses_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_tool_calls_table, buf)
+            zf.writestr("tool_calls_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_samples_data_table, buf)
+            zf.writestr("samples_data_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_metrics_table, buf)
+            zf.writestr("rollouts_metrics_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_golden_answers_table, buf)
+            zf.writestr("golden_answers_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_info_turns_table, buf)
+            zf.writestr("info_turns_cancelled.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(cancelled_sample_tags_table, buf)
+            zf.writestr("sample_tags_cancelled.parquet", buf.getvalue())
+
             # Logs table
             buf = io.BytesIO()
             pq.write_table(logs_table, buf)
@@ -3203,6 +3310,12 @@ class EventLogger:
             for p in self._discarded_prompts:
                 if p.tail_idx == -1:
                     p.tail_idx = current_tail_idx
+            for g in self._cancelled_rollouts:
+                if g.tail_idx == -1:
+                    g.tail_idx = current_tail_idx
+            for p in self._cancelled_prompts:
+                if p.tail_idx == -1:
+                    p.tail_idx = current_tail_idx
             for g in self._kept_rollouts:
                 if g.tail_idx == -1:
                     g.tail_idx = current_tail_idx
@@ -3230,6 +3343,8 @@ class EventLogger:
             all_infra_events = list(self._infra_events)
             all_discarded_rollouts = list(self._discarded_rollouts)
             all_discarded_prompts = list(self._discarded_prompts)
+            all_cancelled_rollouts = list(self._cancelled_rollouts)
+            all_cancelled_prompts = list(self._cancelled_prompts)
             all_kept_rollouts = list(self._kept_rollouts)
             all_kept_prompts = list(self._kept_prompts)
             all_eval_rollouts = list(self._eval_rollouts)
@@ -3330,6 +3445,14 @@ class EventLogger:
                 p for p in all_discarded_prompts
                 if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
             ]
+            block_cancelled_rollouts = [
+                g for g in all_cancelled_rollouts
+                if g.tail_idx >= self._block_first_tail_idx and g.tail_idx <= block_last_tail_idx
+            ]
+            block_cancelled_prompts = [
+                p for p in all_cancelled_prompts
+                if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
+            ]
             block_kept_rollouts = [
                 g for g in all_kept_rollouts
                 if g.tail_idx >= self._block_first_tail_idx and g.tail_idx <= block_last_tail_idx
@@ -3347,7 +3470,7 @@ class EventLogger:
                 if p.tail_idx >= self._block_first_tail_idx and p.tail_idx <= block_last_tail_idx
             ]
 
-            if block_events or block_rollout_events or block_infra_events or block_gpu_metrics or block_cpu_metrics or block_vllm_metrics or block_discarded_rollouts or block_discarded_prompts or block_kept_rollouts or block_kept_prompts or block_eval_rollouts or block_eval_prompts:
+            if block_events or block_rollout_events or block_infra_events or block_gpu_metrics or block_cpu_metrics or block_vllm_metrics or block_discarded_rollouts or block_discarded_prompts or block_cancelled_rollouts or block_cancelled_prompts or block_kept_rollouts or block_kept_prompts or block_eval_rollouts or block_eval_prompts:
                 orch_events = [e for e in block_events if e.source == "orchestrator"]
                 trainer_events = [e for e in block_events if e.source == "trainer"]
 
@@ -3364,6 +3487,8 @@ class EventLogger:
                     metadata=finalized_block_metadata,
                     discarded_rollouts=block_discarded_rollouts,
                     discarded_prompts=block_discarded_prompts,
+                    cancelled_rollouts=block_cancelled_rollouts,
+                    cancelled_prompts=block_cancelled_prompts,
                     kept_rollouts=block_kept_rollouts,
                     kept_prompts=block_kept_prompts,
                     eval_rollouts=block_eval_rollouts,
@@ -3398,6 +3523,12 @@ class EventLogger:
                 for p in self._discarded_prompts:
                     if p.tail_idx == -1:
                         p.tail_idx = current_tail_idx
+                for g in self._cancelled_rollouts:
+                    if g.tail_idx == -1:
+                        g.tail_idx = current_tail_idx
+                for p in self._cancelled_prompts:
+                    if p.tail_idx == -1:
+                        p.tail_idx = current_tail_idx
                 for g in self._kept_rollouts:
                     if g.tail_idx == -1:
                         g.tail_idx = current_tail_idx
@@ -3415,11 +3546,13 @@ class EventLogger:
                 self._infra_events = [e for e in self._infra_events if e.tail_idx >= new_block_first_tail_idx]
                 self._discarded_rollouts = [g for g in self._discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
                 self._discarded_prompts = [p for p in self._discarded_prompts if p.tail_idx >= new_block_first_tail_idx]
+                self._cancelled_rollouts = [g for g in self._cancelled_rollouts if g.tail_idx >= new_block_first_tail_idx]
+                self._cancelled_prompts = [p for p in self._cancelled_prompts if p.tail_idx >= new_block_first_tail_idx]
                 self._kept_rollouts = [g for g in self._kept_rollouts if g.tail_idx >= new_block_first_tail_idx]
                 self._kept_prompts = [p for p in self._kept_prompts if p.tail_idx >= new_block_first_tail_idx]
                 self._eval_rollouts = [r for r in self._eval_rollouts if r.tail_idx >= new_block_first_tail_idx]
                 self._eval_prompts = [p for p in self._eval_prompts if p.tail_idx >= new_block_first_tail_idx]
-            
+
             # Also assign tail_idx to any new metrics added during this cycle
             self._gpu_metrics = [(m, current_tail_idx if idx == -1 else idx) for m, idx in self._gpu_metrics]
             self._gpu_metrics = [(m, idx) for m, idx in self._gpu_metrics if idx >= new_block_first_tail_idx]
@@ -3435,6 +3568,8 @@ class EventLogger:
             all_vllm_metrics = [(m, idx) for m, idx in all_vllm_metrics if idx >= new_block_first_tail_idx]
             all_log_records = [(r, idx) for r, idx in all_log_records if idx >= new_block_first_tail_idx]
             all_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
+            all_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= new_block_first_tail_idx]
+            all_cancelled_prompts = [p for p in all_cancelled_prompts if p.tail_idx >= new_block_first_tail_idx]
             all_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= new_block_first_tail_idx]
             all_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= new_block_first_tail_idx]
             all_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= new_block_first_tail_idx]
@@ -3452,6 +3587,8 @@ class EventLogger:
         current_block_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= self._block_first_tail_idx]
         current_block_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= self._block_first_tail_idx]
         current_block_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= self._block_first_tail_idx]
+        current_block_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= self._block_first_tail_idx]
+        current_block_cancelled_prompts = [p for p in all_cancelled_prompts if p.tail_idx >= self._block_first_tail_idx]
         current_block_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= self._block_first_tail_idx]
         current_block_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= self._block_first_tail_idx]
         current_block_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= self._block_first_tail_idx]
@@ -3467,6 +3604,8 @@ class EventLogger:
         tail_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= tail_min_idx_for_window]
         tail_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= tail_min_idx_for_window]
         tail_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= tail_min_idx_for_window]
+        tail_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= tail_min_idx_for_window]
+        tail_cancelled_prompts = [p for p in all_cancelled_prompts if p.tail_idx >= tail_min_idx_for_window]
         tail_kept_rollouts = [g for g in all_kept_rollouts if g.tail_idx >= tail_min_idx_for_window]
         tail_kept_prompts = [p for p in all_kept_prompts if p.tail_idx >= tail_min_idx_for_window]
         tail_eval_rollouts = [r for r in all_eval_rollouts if r.tail_idx >= tail_min_idx_for_window]
@@ -3506,6 +3645,8 @@ class EventLogger:
             metadata=tail_metadata,
             discarded_rollouts=tail_discarded_rollouts,
             discarded_prompts=tail_discarded_prompts,
+            cancelled_rollouts=tail_cancelled_rollouts,
+            cancelled_prompts=tail_cancelled_prompts,
             kept_rollouts=tail_kept_rollouts,
             kept_prompts=tail_kept_prompts,
             eval_rollouts=tail_eval_rollouts,
@@ -3529,6 +3670,8 @@ class EventLogger:
             metadata=block_live_metadata,
             discarded_rollouts=current_block_discarded_rollouts,
             discarded_prompts=current_block_discarded_prompts,
+            cancelled_rollouts=current_block_cancelled_rollouts,
+            cancelled_prompts=current_block_cancelled_prompts,
             kept_rollouts=current_block_kept_rollouts,
             kept_prompts=current_block_kept_prompts,
             eval_rollouts=current_block_eval_rollouts,
@@ -3678,6 +3821,7 @@ class EventLogger:
             "events/tail_cpu_count": len(tail_cpu),
             "events/tail_vllm_count": len(tail_vllm),
             "events/tail_discarded_rollouts_count": len(tail_discarded_rollouts),
+            "events/tail_cancelled_rollouts_count": len(tail_cancelled_rollouts),
             # Events counts in block_live
             "events/block_live_orchestrator_count": len(block_orch_events),
             "events/block_live_trainer_count": len(block_trainer_events),
@@ -3687,6 +3831,7 @@ class EventLogger:
             "events/block_live_cpu_count": len(current_block_cpu),
             "events/block_live_vllm_count": len(current_block_vllm),
             "events/block_live_discarded_rollouts_count": len(current_block_discarded_rollouts),
+            "events/block_live_cancelled_rollouts_count": len(current_block_cancelled_rollouts),
             # Eval counts
             "events/tail_eval_rollouts_count": len(tail_eval_rollouts),
             "events/block_live_eval_rollouts_count": len(current_block_eval_rollouts),
@@ -3709,7 +3854,7 @@ class EventLogger:
         self._summary_id += 1
         # Increment tail_idx for the next upload cycle
         self._current_tail_idx += 1
-        _log.debug(f"Uploaded tail {current_tail_idx}: events={len(tail_orch_events)}+{len(tail_trainer_events)}+{len(tail_rollout_events)}+{len(tail_infra_events)}, metrics={len(tail_gpu)}+{len(tail_cpu)}+{len(tail_vllm)}, discarded={len(tail_discarded_rollouts)}")
+        _log.debug(f"Uploaded tail {current_tail_idx}: events={len(tail_orch_events)}+{len(tail_trainer_events)}+{len(tail_rollout_events)}+{len(tail_infra_events)}, metrics={len(tail_gpu)}+{len(tail_cpu)}+{len(tail_vllm)}, discarded={len(tail_discarded_rollouts)}, cancelled={len(tail_cancelled_rollouts)}")
 
     def upload_now(self, blocking: bool = False):
         """Trigger an upload cycle."""
