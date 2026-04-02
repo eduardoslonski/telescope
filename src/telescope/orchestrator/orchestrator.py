@@ -960,24 +960,12 @@ class Orchestrator:
         )
         self.wandb_logger.log_orchestrator_timeline_event("inference_call", group_id=request_id)
 
-        # Pre-assign sample_ids and log start events for each sample in the group
+        # Pre-assign sample_ids for each sample in the group
+        # (generation start/end events are now emitted per-turn from inside the rollout loop)
         sample_ids = {}
-        now = time.time()
-        server_idx = self._get_server_index(server_url)
-        server_info = self._get_server_info(server_url)
         for i in range(config.cfg.group_size):
             sample_ids[i] = self.next_sample_idx
             self.next_sample_idx += 1
-            self.wandb_logger.event_logger.log_rollout_event(
-                event_type="generation",
-                phase="start",
-                timestamp=now,
-                sample_id=sample_ids[i],
-                server_id=server_idx,
-                server_lane=lane_slots[i],
-                generation_idx=0,
-                group_id=request_id,
-            )
 
         task = asyncio.create_task(
             self._run_prompt(prompt_data, server_url, request_id, lane_slots)
@@ -1098,23 +1086,10 @@ class Orchestrator:
                 if rollout_info is not None:
                     rollout_info.tasks.append(task)
                     rollout_info.sample_off_policy_steps[sample_idx] = 0
-                    # Pre-assign sample_id and log start event
+                    # Pre-assign sample_id (generation start/end events emitted per-turn from rollout loop)
                     sample_id = self.next_sample_idx
                     self.next_sample_idx += 1
                     rollout_info.sample_ids[sample_idx] = sample_id
-                    now = time.time()
-                    server_idx = self._get_server_index(server_url)
-                    server_info = self._get_server_info(server_url)
-                    self.wandb_logger.event_logger.log_rollout_event(
-                        event_type="generation",
-                        phase="start",
-                        timestamp=now,
-                        sample_id=sample_id,
-                        server_id=server_idx,
-                        server_lane=lane_slot,
-                        generation_idx=0,
-                        group_id=request_id,
-                    )
                 _log.debug(
                     f"Dispatched individual sample: request_id={request_id}, "
                     f"sample_idx={sample_idx}, lane_slot={lane_slot}, "
@@ -1137,28 +1112,41 @@ class Orchestrator:
         """Create per-sample lifecycle callbacks for decoupled event logging.
 
         The returned callbacks log:
-        - on_inference_end: phase="end" inference event at generation-complete time, optionally frees lane
-        - on_reward_start: compute_reward_start orchestrator event
-        - on_reward_end: compute_reward_end orchestrator event
+        - on_generation_start/end: per-turn generation events (called from inside the rollout loop)
+        - on_inference_end: optionally frees lane slot (no longer logs generation events)
+        - on_reward_start/end: compute_reward orchestrator events
+        - on_env_response_start/end: env_response orchestrator events
         """
         server_idx = self._get_server_index(server_url)
-        server_info = self._get_server_info(server_url)
         lane_freed = False
 
-        def on_inference_end():
-            nonlocal lane_freed
+        def on_generation_start(generation_idx: int):
             rollout_info = self.inflight_rollout_info.get(request_id)
             sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
+            self.wandb_logger.event_logger.log_rollout_event(
+                event_type="generation",
+                phase="start",
+                sample_id=sample_id,
+                server_id=server_idx,
+                server_lane=lane_slot,
+                generation_idx=generation_idx,
+                group_id=request_id,
+            )
 
-            # Log generation end event (vLLM timing now goes in domain table via log_generation_rollout)
+        def on_generation_end(generation_idx: int):
+            rollout_info = self.inflight_rollout_info.get(request_id)
+            sample_id = rollout_info.sample_ids.get(sample_idx, -1) if rollout_info else -1
             self.wandb_logger.event_logger.log_rollout_event(
                 event_type="generation",
                 phase="end",
                 sample_id=sample_id,
                 server_id=server_idx,
+                generation_idx=generation_idx,
                 group_id=request_id,
-                generation_idx=0,  # single-turn; multi-turn sets this per-turn in generate.py
             )
+
+        def on_inference_end():
+            nonlocal lane_freed
             timing["inference_end_logged"] = True
 
             # Optionally free lane slot (individual mode with free_lane_after_generation)
@@ -1212,6 +1200,8 @@ class Orchestrator:
             )
 
         lifecycle = SampleLifecycleCallbacks(
+            on_generation_start=on_generation_start,
+            on_generation_end=on_generation_end,
             on_inference_end=on_inference_end,
             on_reward_start=on_reward_start,
             on_reward_end=on_reward_end,
@@ -1520,8 +1510,8 @@ class Orchestrator:
     ):
         """Placeholder for individual-mode sample completion.
 
-        The generation end event is already emitted by the on_inference_end
-        lifecycle callback inside process_sample/process_multiturn_sample.
+        The generation start/end events are emitted per-turn by the
+        on_generation_start/end lifecycle callbacks inside the rollout loop.
         This method is kept as a hook point but does not emit events.
         """
         pass

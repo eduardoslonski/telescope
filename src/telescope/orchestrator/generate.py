@@ -94,7 +94,9 @@ class SampleLifecycleCallbacks:
     The orchestrator builds closures that capture request context
     (request_id, sample_idx, server info) and log the appropriate events.
     """
-    on_inference_end: Callable[[], None] | None = None    # Log phase="end" inference event + free lane
+    on_generation_start: Callable[[int], None] | None = None  # Log generation start (receives generation_idx)
+    on_generation_end: Callable[[int], None] | None = None    # Log generation end (receives generation_idx)
+    on_inference_end: Callable[[], None] | None = None    # Free lane slot (no longer logs generation end)
     on_reward_start: Callable[[], None] | None = None     # Log compute_reward_start orchestrator event
     on_reward_end: Callable[[float], None] | None = None   # Log compute_reward_end (receives duration in seconds)
     on_env_response_start: Callable[[], None] | None = None  # Log env_response_start orchestrator event
@@ -766,6 +768,10 @@ async def run_multiturn_rollout(
     
     try:
         while True:
+            # Log per-turn generation start
+            if lifecycle is not None and lifecycle.on_generation_start is not None:
+                lifecycle.on_generation_start(generation_idx)
+
             if state.num_turns == 0 or not use_interleaved:
                 # First turn OR non-interleaved: use string-based rollout
                 if state.num_turns == 0 and prefetched_prompt_str is not None:
@@ -874,6 +880,10 @@ async def run_multiturn_rollout(
                 "max_tokens": req_max_tokens,
             })
             
+            # Log per-turn generation end (LLM call complete, before env_response)
+            if lifecycle is not None and lifecycle.on_generation_end is not None:
+                lifecycle.on_generation_end(generation_idx)
+
             # Get environment response for next turn
             # env_response processes the model's action (e.g. evaluates a guess,
             # executes tool calls) and returns feedback messages.
@@ -1133,6 +1143,9 @@ async def process_sample(
         prompt = raw_prompt
         prompt_token_count = None
 
+    if lifecycle is not None and lifecycle.on_generation_start is not None:
+        lifecycle.on_generation_start(0)
+
     try:
         completion_data, start_time, end_time, req_max_tokens = await generate_completion(
             client,
@@ -1155,10 +1168,12 @@ async def process_sample(
             "error_message": str(e),
             "error_type": e.error_type,
         }
-    
+
     choice = completion_data["choices"][0]
     completion_text = choice["text"]
 
+    if lifecycle is not None and lifecycle.on_generation_end is not None:
+        lifecycle.on_generation_end(0)
     if on_generation_complete is not None:
         on_generation_complete()
     if lifecycle is not None and lifecycle.on_inference_end is not None:
