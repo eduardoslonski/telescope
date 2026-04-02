@@ -27,6 +27,7 @@ from telescope.orchestrator.generate import (
     ContextExhaustedError,
     PromptTooLongError,
     RolloutError,
+    SampleLifecycleCallbacks,
     _retry_request,
     get_chat_template_kwargs,
     run_multiturn_rollout,
@@ -220,6 +221,67 @@ class EvalRunner:
         # env name -> (Environment, list[Sample])
         self.envs: dict[str, tuple[Environment, list[Sample]]] = {}
         self._http_client: httpx.AsyncClient | None = None
+        # Set during run_evals() for real-time rollout event logging
+        self._event_logger: Any | None = None
+        self._all_server_urls: list[str] = []
+        self._allocate_sample_id: Any | None = None
+        self._allocate_group_id: Any | None = None
+
+    # ------------------------------------------------------------------
+    # Rollout event helpers
+    # ------------------------------------------------------------------
+
+    def _make_eval_lifecycle(
+        self, sample_id: int, group_id: int, server_url: str,
+    ) -> SampleLifecycleCallbacks | None:
+        """Create per-sample lifecycle callbacks for real-time rollout event logging."""
+        if self._event_logger is None:
+            return None
+        server_idx = (
+            self._all_server_urls.index(server_url)
+            if server_url in self._all_server_urls else -1
+        )
+
+        def on_generation_start(generation_idx: int):
+            self._event_logger.log_rollout_event(
+                event_type="generation", phase="start",
+                sample_id=sample_id, server_id=server_idx,
+                generation_idx=generation_idx, group_id=group_id,
+            )
+
+        def on_generation_end(generation_idx: int):
+            self._event_logger.log_rollout_event(
+                event_type="generation", phase="end",
+                sample_id=sample_id, server_id=server_idx,
+                generation_idx=generation_idx, group_id=group_id,
+            )
+
+        def on_env_response_start():
+            self._event_logger.log_rollout_event(
+                event_type="env_response", phase="start",
+                sample_id=sample_id, group_id=group_id,
+            )
+
+        def on_env_response_end():
+            self._event_logger.log_rollout_event(
+                event_type="env_response", phase="end",
+                sample_id=sample_id, group_id=group_id,
+            )
+
+        return SampleLifecycleCallbacks(
+            on_generation_start=on_generation_start,
+            on_generation_end=on_generation_end,
+            on_env_response_start=on_env_response_start,
+            on_env_response_end=on_env_response_end,
+        )
+
+    def _log_eval_metrics_event(self, phase: str, sample_id: int, group_id: int):
+        """Emit an eval_metrics start/end rollout event."""
+        if self._event_logger is not None:
+            self._event_logger.log_rollout_event(
+                event_type="eval_metrics", phase=phase,
+                sample_id=sample_id, group_id=group_id,
+            )
 
     # ------------------------------------------------------------------
     # Init
@@ -298,11 +360,27 @@ class EvalRunner:
         step: int,
         model_step: int,
         http_client: httpx.AsyncClient | None = None,
+        event_logger: Any | None = None,
+        all_server_urls: list[str] | None = None,
+        allocate_sample_id: Any | None = None,
+        allocate_group_id: Any | None = None,
     ) -> list[dict[str, Any]]:
         """Run all evals for a given step concurrently on the eval servers.
 
         Returns a list of per-eval result dicts suitable for logging.
+
+        Args:
+            event_logger: EventLogger for real-time rollout event logging.
+            all_server_urls: All inference server URLs (for server_id mapping).
+            allocate_sample_id: Callable returning a globally unique sample ID.
+            allocate_group_id: Callable returning a globally unique group ID.
         """
+        # Store event logging state for use by helper methods
+        self._event_logger = event_logger
+        self._all_server_urls = all_server_urls or []
+        self._allocate_sample_id = allocate_sample_id
+        self._allocate_group_id = allocate_group_id
+
         client = http_client or self._http_client
         if client is None:
             limits = httpx.Limits(max_connections=4096, max_keepalive_connections=0)
@@ -335,7 +413,10 @@ class EvalRunner:
             all_k = (ec.pass_k.at_k.k or []) + (ec.pass_k.pow_k.k or [])
             max_completions = max(all_k) if all_k else 1
             for sample_idx, sample in enumerate(selected):
+                # One group_id per unique prompt (shared across pass@k completions)
+                group_id = self._allocate_group_id() if self._allocate_group_id else -1
                 for comp_idx in range(max_completions):
+                    sample_id = self._allocate_sample_id() if self._allocate_sample_id else -1
                     fut = asyncio.get_event_loop().create_future()
                     per_eval_futures.append(fut)
 
@@ -351,6 +432,8 @@ class EvalRunner:
                             server_cycle=server_cycle,
                             result_future=fut,
                             prefetched_data=prefetched.get(sample_idx, {}),
+                            sample_id=sample_id,
+                            group_id=group_id,
                         )
                     )
                     all_tasks.append(task)
@@ -370,6 +453,12 @@ class EvalRunner:
             elif isinstance(item, Exception):
                 _log.warning(f"Eval task failed: {item}")
 
+        # Clear event logging state
+        self._event_logger = None
+        self._all_server_urls = []
+        self._allocate_sample_id = None
+        self._allocate_group_id = None
+
         return eval_results
 
     async def _run_one_eval_completion(
@@ -384,6 +473,8 @@ class EvalRunner:
         server_cycle,
         result_future: asyncio.Future,
         prefetched_data: dict | None = None,
+        sample_id: int = -1,
+        group_id: int = -1,
     ):
         """Run a single eval completion, respecting concurrency limits."""
         async with semaphore:
@@ -398,6 +489,8 @@ class EvalRunner:
                     eval_config=eval_config,
                     server_url=server_url,
                     prefetched_data=prefetched_data,
+                    sample_id=sample_id,
+                    group_id=group_id,
                 )
                 result_future.set_result(result)
             except Exception as exc:
@@ -414,6 +507,8 @@ class EvalRunner:
         eval_config: EvalConfig,
         server_url: str,
         prefetched_data: dict | None = None,
+        sample_id: int = -1,
+        group_id: int = -1,
     ) -> EvalSampleResult | None:
         """Evaluate one completion for one sample."""
 
@@ -421,9 +516,12 @@ class EvalRunner:
             return await self._eval_multiturn(
                 client, env, sample, sample_idx, completion_idx, eval_config, server_url,
                 prefetched_data=prefetched_data,
+                sample_id=sample_id,
+                group_id=group_id,
             )
 
         # Single-turn eval
+        lifecycle = self._make_eval_lifecycle(sample_id, group_id, server_url)
         system_prompt = env.system_prompt or ""
         actual_env_name = getattr(env, "name", eval_config.name) or eval_config.name
 
@@ -442,6 +540,8 @@ class EvalRunner:
                 prompt_str = sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
             prompt_token_count = len(self.tokenizer.encode(prompt_str)) if self.tokenizer else None
 
+        if lifecycle and lifecycle.on_generation_start:
+            lifecycle.on_generation_start(0)
         try:
             result, req_start_time, req_end_time, actual_max_tokens = await _generate_eval_completion(
                 client, prompt_str, server_url,
@@ -449,8 +549,12 @@ class EvalRunner:
                 prompt_token_count=prompt_token_count,
             )
         except (PromptTooLongError, ContextExhaustedError, RolloutError) as exc:
+            if lifecycle and lifecycle.on_generation_end:
+                lifecycle.on_generation_end(0)
             _log.warning(f"Eval generation error: {exc}")
             return None
+        if lifecycle and lifecycle.on_generation_end:
+            lifecycle.on_generation_end(0)
 
         choice = result["choices"][0]
         completion_text = choice.get("text", "")
@@ -461,9 +565,11 @@ class EvalRunner:
         vllm_request_id = result.get("id", "")
 
         eos_token = getattr(env, "eos_token", "")
+        self._log_eval_metrics_event("start", sample_id, group_id)
         metrics_start = time.time()
         eval_result = await env.compute_eval_metrics(completion_text, sample, eos_token)
         compute_eval_metrics_time = time.time() - metrics_start
+        self._log_eval_metrics_event("end", sample_id, group_id)
 
         prompt_text = sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
         turns = [{
@@ -509,6 +615,8 @@ class EvalRunner:
         eval_config: EvalConfig,
         server_url: str,
         prefetched_data: dict | None = None,
+        sample_id: int = -1,
+        group_id: int = -1,
     ) -> EvalSampleResult | None:
         """Evaluate one multi-turn completion for one sample.
 
@@ -517,6 +625,7 @@ class EvalRunner:
         """
         assert getattr(env, "is_multi_turn", False), f"{env} is not multi-turn"
 
+        lifecycle = self._make_eval_lifecycle(sample_id, group_id, server_url)
         system_prompt = env.system_prompt or ""
         actual_env_name = getattr(env, "name", eval_config.name) or eval_config.name
 
@@ -528,6 +637,7 @@ class EvalRunner:
             prefetched_prompt_token_count=prefetched_data.get("prefetched_prompt_token_count") if prefetched_data else None,
             sampling_params=eval_config.sampling_params,
             interleaved=False,
+            lifecycle=lifecycle,
         )
         req_end_time = time.time()
 
@@ -535,9 +645,11 @@ class EvalRunner:
             return None
 
         eos_token = getattr(env, "eos_token", "")
+        self._log_eval_metrics_event("start", sample_id, group_id)
         metrics_start = time.time()
         eval_result = await env.compute_eval_metrics(state, eos_token)
         compute_eval_metrics_time = time.time() - metrics_start
+        self._log_eval_metrics_event("end", sample_id, group_id)
 
         total_prompt_tokens = 0
         total_rollout_tokens = 0

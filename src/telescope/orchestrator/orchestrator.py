@@ -2741,6 +2741,18 @@ class Orchestrator:
         _log.info(f"Starting eval phase ({label}) at step {step}")
 
         eval_max_concurrent = self.max_concurrent_prompts_per_server * config.cfg.group_size
+        all_server_urls = list(self.inference_group.server_urls) if self.inference_group else []
+
+        def _alloc_sample_id():
+            sid = self.next_sample_idx
+            self.next_sample_idx += 1
+            return sid
+
+        def _alloc_group_id():
+            gid = self.next_request_id
+            self.next_request_id += 1
+            return gid
+
         results = await self.eval_runner.run_evals(
             eval_configs=eval_configs,
             eval_server_urls=eval_server_urls,
@@ -2748,6 +2760,10 @@ class Orchestrator:
             step=step,
             model_step=model_step,
             http_client=self.http_client,
+            event_logger=self.wandb_logger.event_logger,
+            all_server_urls=all_server_urls,
+            allocate_sample_id=_alloc_sample_id,
+            allocate_group_id=_alloc_group_id,
         )
 
         for result in results:
@@ -2765,37 +2781,10 @@ class Orchestrator:
                 step=step,
             )
 
-            # Log individual sample results as EvalGenerationRollout/EvalPrompt + rollout events
-            all_server_urls = list(self.inference_group.server_urls) if self.inference_group else []
+            # Log individual sample results as EvalGenerationRollout/EvalPrompt
             sample_results = result.get("sample_results", [])
 
-            # Allocate globally unique group_ids: one per unique prompt (shared across pass@k completions)
-            eval_group_ids: dict[int, int] = {}
             for sr in sample_results:
-                if sr.sample_idx not in eval_group_ids:
-                    eval_group_ids[sr.sample_idx] = self.next_request_id
-                    self.next_request_id += 1
-
-            for sr in sample_results:
-                eval_sample_id = self.next_sample_idx
-                self.next_sample_idx += 1
-                eval_request_id = self.next_request_id
-                self.next_request_id += 1
-                eval_group_id = eval_group_ids[sr.sample_idx]
-
-                # Log generation end rollout event for eval
-                if sr.start_time and sr.end_time and sr.server_url:
-                    server_idx = all_server_urls.index(sr.server_url) if sr.server_url in all_server_urls else -1
-
-                    self.wandb_logger.event_logger.log_rollout_event(
-                        event_type="generation",
-                        phase="end",
-                        sample_id=eval_sample_id,
-                        server_id=server_idx,
-                        group_id=eval_group_id,
-                        generation_idx=0,
-                    )
-
                 tokens_prompt = 0
                 tokens_system_prompt = 0
                 if self.tokenizer is not None:
