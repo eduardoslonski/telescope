@@ -232,7 +232,7 @@ class EvalRunner:
     # ------------------------------------------------------------------
 
     def _make_eval_lifecycle(
-        self, sample_id: int, group_id: int, server_url: str,
+        self, sample_id: int, group_id: int, server_url: str, server_lane: int = -1,
     ) -> SampleLifecycleCallbacks | None:
         """Create per-sample lifecycle callbacks for real-time rollout event logging."""
         if self._event_logger is None:
@@ -246,6 +246,7 @@ class EvalRunner:
             self._event_logger.log_rollout_event(
                 event_type="generation", phase="start",
                 sample_id=sample_id, server_id=server_idx,
+                server_lane=server_lane,
                 generation_idx=generation_idx, group_id=group_id,
             )
 
@@ -253,6 +254,7 @@ class EvalRunner:
             self._event_logger.log_rollout_event(
                 event_type="generation", phase="end",
                 sample_id=sample_id, server_id=server_idx,
+                server_lane=server_lane,
                 generation_idx=generation_idx, group_id=group_id,
             )
 
@@ -391,6 +393,11 @@ class EvalRunner:
         semaphore = asyncio.Semaphore(total_capacity)
         server_cycle = _cycle(eval_server_urls)
 
+        # Per-server lane pools for timeline visualization
+        server_lane_pools: dict[str, set[int]] = {
+            url: set(range(max_concurrent_per_server)) for url in eval_server_urls
+        }
+
         all_tasks: list[asyncio.Task] = []
         eval_results: list[dict[str, Any]] = []
 
@@ -434,6 +441,7 @@ class EvalRunner:
                             prefetched_data=prefetched.get(sample_idx, {}),
                             sample_id=sample_id,
                             group_id=group_id,
+                            server_lane_pools=server_lane_pools,
                         )
                     )
                     all_tasks.append(task)
@@ -475,10 +483,17 @@ class EvalRunner:
         prefetched_data: dict | None = None,
         sample_id: int = -1,
         group_id: int = -1,
+        server_lane_pools: dict[str, set[int]] | None = None,
     ):
         """Run a single eval completion, respecting concurrency limits."""
         async with semaphore:
             server_url = next(server_cycle)
+            # Acquire a lane slot for timeline visualization
+            lane_slot = -1
+            pool = server_lane_pools.get(server_url) if server_lane_pools else None
+            if pool:
+                lane_slot = min(pool)
+                pool.discard(lane_slot)
             try:
                 result = await self._eval_single_sample(
                     client=client,
@@ -491,11 +506,15 @@ class EvalRunner:
                     prefetched_data=prefetched_data,
                     sample_id=sample_id,
                     group_id=group_id,
+                    server_lane=lane_slot,
                 )
                 result_future.set_result(result)
             except Exception as exc:
                 _log.warning(f"Eval completion failed ({eval_config.name} sample={sample_idx} comp={completion_idx}): {exc}")
                 result_future.set_result(None)
+            finally:
+                if pool is not None and lane_slot >= 0:
+                    pool.add(lane_slot)
 
     async def _eval_single_sample(
         self,
@@ -509,6 +528,7 @@ class EvalRunner:
         prefetched_data: dict | None = None,
         sample_id: int = -1,
         group_id: int = -1,
+        server_lane: int = -1,
     ) -> EvalSampleResult | None:
         """Evaluate one completion for one sample."""
 
@@ -518,10 +538,11 @@ class EvalRunner:
                 prefetched_data=prefetched_data,
                 sample_id=sample_id,
                 group_id=group_id,
+                server_lane=server_lane,
             )
 
         # Single-turn eval
-        lifecycle = self._make_eval_lifecycle(sample_id, group_id, server_url)
+        lifecycle = self._make_eval_lifecycle(sample_id, group_id, server_url, server_lane)
         system_prompt = env.system_prompt or ""
         actual_env_name = getattr(env, "name", eval_config.name) or eval_config.name
 
@@ -617,6 +638,7 @@ class EvalRunner:
         prefetched_data: dict | None = None,
         sample_id: int = -1,
         group_id: int = -1,
+        server_lane: int = -1,
     ) -> EvalSampleResult | None:
         """Evaluate one multi-turn completion for one sample.
 
@@ -625,7 +647,7 @@ class EvalRunner:
         """
         assert getattr(env, "is_multi_turn", False), f"{env} is not multi-turn"
 
-        lifecycle = self._make_eval_lifecycle(sample_id, group_id, server_url)
+        lifecycle = self._make_eval_lifecycle(sample_id, group_id, server_url, server_lane)
         system_prompt = env.system_prompt or ""
         actual_env_name = getattr(env, "name", eval_config.name) or eval_config.name
 
