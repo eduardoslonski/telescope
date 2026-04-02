@@ -1411,8 +1411,6 @@ class Orchestrator:
         self._schedule_dispatch()
 
         if group["remaining"] == 0:
-            if not generate_module._shutting_down:
-                self._log_cancelled_rollouts(request_id, "off_policy")
             self.active_count -= 1
             del self.pending_individual_groups[request_id]
             self.inflight_rollout_info.pop(request_id, None)
@@ -1492,10 +1490,6 @@ class Orchestrator:
         # Return lane slots to the pool.
         if server_url in self.available_server_lane_slots:
             self.available_server_lane_slots[server_url].update(lane_slots)
-
-        # Log cancelled rollout tables before popping inflight info.
-        if not generate_module._shutting_down:
-            self._log_cancelled_rollouts(request_id, "off_policy")
 
         rollout_info = self.inflight_rollout_info.pop(request_id, None)
         sample_off_policy = rollout_info.sample_off_policy_steps if rollout_info else {}
@@ -2207,6 +2201,7 @@ class Orchestrator:
 
         for idx in range(num_samples):
             sample_id = sample_ids.get(idx, -1)
+            _log.debug(f"Cancelled sample: group_id={request_id}, sample_id={sample_id}, reason={cancel_reason}, env={env_name}, off_policy={off_policy_steps_map.get(idx, 0)}")
 
             self.wandb_logger.event_logger.log_cancelled_generation_rollout(
                 cancel_reason=cancel_reason,
@@ -2511,6 +2506,11 @@ class Orchestrator:
                 max_sample = max(info.sample_off_policy_steps.values()) if info.sample_off_policy_steps else 0
                 if max_off_policy >= 0 and max_sample > max_off_policy:
                     cancelled_request_ids.append(request_id)
+                    # Log cancelled rollout tables synchronously BEFORE task.cancel(),
+                    # since CancelledError handlers fire asynchronously and may not
+                    # run before the next upload cycle (or at all if the task completes
+                    # before cancellation takes effect).
+                    self._log_cancelled_rollouts(request_id, "off_policy")
                     for task in info.tasks:
                         if not task.done():
                             task.cancel()
@@ -2561,8 +2561,6 @@ class Orchestrator:
         # and no CancelledError handler will fire to clean up.
         group = self.pending_individual_groups.get(request_id)
         if group is not None and group["remaining"] == 0:
-            if not generate_module._shutting_down:
-                self._log_cancelled_rollouts(request_id, "off_policy")
             self.active_count -= 1
             del self.pending_individual_groups[request_id]
             self.inflight_rollout_info.pop(request_id, None)
