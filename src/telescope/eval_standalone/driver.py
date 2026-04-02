@@ -325,6 +325,7 @@ def _collect_eval_objects(
                     eval_name=eval_name,
                     model_step=model_step,
                     sample_idx=sr.sample_idx,
+                    sample_id=sr.sample_id,
                     env=sr.env_name or eval_name,
                     prompt=sr.prompt_text,
                     tokens_prompt=tokens_prompt,
@@ -367,6 +368,7 @@ def _collect_eval_objects(
                 eval_name=eval_name,
                 model_step=model_step,
                 sample_idx=sr.sample_idx,
+                sample_id=sr.sample_id,
                 completion_idx=sr.completion_idx,
                 env=sr.env_name or eval_name,
                 generations=generations,
@@ -395,6 +397,7 @@ def _eval_prompts_to_table(prompts: list[EvalPrompt]) -> pa.Table:
         "eval_name": [p.eval_name for p in prompts],
         "model_step": [p.model_step for p in prompts],
         "sample_idx": [p.sample_idx for p in prompts],
+        "sample_id": [p.sample_id for p in prompts],
         "env": [p.env for p in prompts],
         "prompt": [p.prompt for p in prompts],
         "tokens_prompt": [p.tokens_prompt for p in prompts],
@@ -408,7 +411,7 @@ def _eval_prompts_to_table(prompts: list[EvalPrompt]) -> pa.Table:
 def _eval_generations_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in GENERATIONS_EVAL_SCHEMA})
-    steps, eval_names, model_steps, sample_idxs, comp_idxs, agent_ids = [], [], [], [], [], []
+    steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
     gen_idxs, contents, tokens_list, prompt_tokens_list = [], [], [], []
     tool_call_counts, stop_reasons, tail_idxs = [], [], []
     for r in rollouts:
@@ -417,6 +420,7 @@ def _eval_generations_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Tabl
             eval_names.append(r.eval_name)
             model_steps.append(r.model_step)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             agent_ids.append(r.agent_id)
             gen_idxs.append(g.generation_idx)
@@ -428,7 +432,8 @@ def _eval_generations_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Tabl
             tail_idxs.append(r.tail_idx)
     return pa.table({
         "step": steps, "eval_name": eval_names, "model_step": model_steps,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs, "agent_id": agent_ids,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs, "agent_id": agent_ids,
         "generation_idx": gen_idxs, "content": contents, "tokens": tokens_list,
         "prompt_tokens": prompt_tokens_list, "tool_call_count": tool_call_counts,
         "stop_reason": stop_reasons, "tail_idx": tail_idxs,
@@ -438,7 +443,7 @@ def _eval_generations_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Tabl
 def _eval_env_responses_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in ENV_RESPONSES_EVAL_SCHEMA})
-    steps, eval_names, model_steps, sample_idxs, comp_idxs, agent_ids = [], [], [], [], [], []
+    steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
     gen_idxs, contents, turn_types, tokens_list, response_times, tail_idxs = [], [], [], [], [], []
     for r in rollouts:
         for e in r.env_responses:
@@ -446,6 +451,7 @@ def _eval_env_responses_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Ta
             eval_names.append(r.eval_name)
             model_steps.append(r.model_step)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             agent_ids.append(r.agent_id)
             gen_idxs.append(e.generation_idx)
@@ -456,7 +462,8 @@ def _eval_env_responses_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Ta
             tail_idxs.append(r.tail_idx)
     return pa.table({
         "step": steps, "eval_name": eval_names, "model_step": model_steps,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs, "agent_id": agent_ids,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs, "agent_id": agent_ids,
         "generation_idx": gen_idxs, "content": contents, "turn_type": turn_types,
         "tokens": tokens_list, "response_time": response_times, "tail_idx": tail_idxs,
     }, schema=ENV_RESPONSES_EVAL_SCHEMA)
@@ -465,7 +472,7 @@ def _eval_env_responses_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Ta
 def _eval_tool_calls_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in TOOL_CALLS_EVAL_SCHEMA})
-    steps, eval_names, model_steps, sample_idxs, comp_idxs, agent_ids = [], [], [], [], [], []
+    steps, eval_names, model_steps, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], [], []
     gen_idxs, tc_idxs, env_resp_gen_idxs = [], [], []
     tool_names, arguments_list, raw_texts, results = [], [], [], []
     successes, errors, exit_codes, truncateds = [], [], [], []
@@ -476,6 +483,7 @@ def _eval_tool_calls_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table
             eval_names.append(r.eval_name)
             model_steps.append(r.model_step)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             agent_ids.append(r.agent_id)
             gen_idxs.append(tc.generation_idx)
@@ -494,7 +502,8 @@ def _eval_tool_calls_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table
             tail_idxs.append(r.tail_idx)
     return pa.table({
         "step": steps, "eval_name": eval_names, "model_step": model_steps,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs, "agent_id": agent_ids,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs, "agent_id": agent_ids,
         "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
         "env_response_generation_idx": env_resp_gen_idxs,
         "tool_name": tool_names, "arguments": arguments_list, "raw_text": raw_texts,
@@ -512,6 +521,7 @@ def _samples_data_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Tab
         "eval_name": [r.eval_name for r in rollouts],
         "model_step": [r.model_step for r in rollouts],
         "sample_idx": [r.sample_idx for r in rollouts],
+        "sample_id": [r.sample_id for r in rollouts],
         "completion_idx": [r.completion_idx for r in rollouts],
         "env": [r.env for r in rollouts],
         "num_generations": [len(r.generations) for r in rollouts],
@@ -525,12 +535,13 @@ def _samples_data_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Tab
 def _rollouts_metrics_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in ROLLOUTS_METRICS_EVAL_SCHEMA})
-    steps, eval_names, sample_idxs, comp_idxs, envs, metric_names, values, tail_idxs = [], [], [], [], [], [], [], []
+    steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, metric_names, values, tail_idxs = [], [], [], [], [], [], [], [], []
     for r in rollouts:
         for metric_name, value in r.sample_metrics.items():
             steps.append(r.step)
             eval_names.append(r.eval_name)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             envs.append(r.env)
             metric_names.append(metric_name)
@@ -538,7 +549,8 @@ def _rollouts_metrics_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa
             tail_idxs.append(r.tail_idx)
     data = {
         "step": steps, "eval_name": eval_names,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs,
         "env": envs, "metric_name": metric_names,
         "value": values, "tail_idx": tail_idxs,
     }
@@ -548,12 +560,13 @@ def _rollouts_metrics_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa
 def _golden_answers_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in GOLDEN_ANSWERS_EVAL_SCHEMA})
-    steps, eval_names, sample_idxs, comp_idxs, envs, keys, values, tail_idxs = [], [], [], [], [], [], [], []
+    steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, keys, values, tail_idxs = [], [], [], [], [], [], [], [], []
     for r in rollouts:
         for key, value in r.golden_answers.items():
             steps.append(r.step)
             eval_names.append(r.eval_name)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             envs.append(r.env)
             keys.append(key)
@@ -561,7 +574,8 @@ def _golden_answers_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.T
             tail_idxs.append(r.tail_idx)
     data = {
         "step": steps, "eval_name": eval_names,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs,
         "env": envs, "key": keys, "value": values, "tail_idx": tail_idxs,
     }
     return pa.table(data, schema=GOLDEN_ANSWERS_EVAL_SCHEMA)
@@ -570,7 +584,7 @@ def _golden_answers_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.T
 def _info_turns_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in INFO_TURNS_EVAL_SCHEMA})
-    steps, eval_names, sample_idxs, comp_idxs, agent_ids = [], [], [], [], []
+    steps, eval_names, sample_idxs, sample_ids, comp_idxs, agent_ids = [], [], [], [], [], []
     gen_idxs, tc_idxs, envs = [], [], []
     info_keys, info_values, info_types, tail_idxs = [], [], [], []
     for r in rollouts:
@@ -578,6 +592,7 @@ def _info_turns_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table
             steps.append(r.step)
             eval_names.append(r.eval_name)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             agent_ids.append(r.agent_id)
             gen_idxs.append(info.get("generation_idx", 0))
@@ -589,7 +604,8 @@ def _info_turns_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table
             tail_idxs.append(r.tail_idx)
     data = {
         "step": steps, "eval_name": eval_names,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs,
         "agent_id": agent_ids, "generation_idx": gen_idxs, "tool_call_idx": tc_idxs,
         "env": envs, "info_key": info_keys, "info_value": info_values,
         "info_type": info_types, "tail_idx": tail_idxs,
@@ -600,12 +616,13 @@ def _info_turns_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table
 def _sample_tags_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Table:
     if not rollouts:
         return pa.table({f.name: pa.array([], type=f.type) for f in SAMPLE_TAGS_EVAL_SCHEMA})
-    steps, eval_names, sample_idxs, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], []
+    steps, eval_names, sample_idxs, sample_ids, comp_idxs, envs, tag_names, tag_values, tail_idxs = [], [], [], [], [], [], [], [], []
     for r in rollouts:
         for tag_name, tag_value in r.sample_tags.items():
             steps.append(r.step)
             eval_names.append(r.eval_name)
             sample_idxs.append(r.sample_idx)
+            sample_ids.append(r.sample_id)
             comp_idxs.append(r.completion_idx)
             envs.append(r.env)
             tag_names.append(tag_name)
@@ -613,7 +630,8 @@ def _sample_tags_eval_to_table(rollouts: list[EvalGenerationRollout]) -> pa.Tabl
             tail_idxs.append(r.tail_idx)
     data = {
         "step": steps, "eval_name": eval_names,
-        "sample_idx": sample_idxs, "completion_idx": comp_idxs,
+        "sample_idx": sample_idxs, "sample_id": sample_ids,
+        "completion_idx": comp_idxs,
         "env": envs, "tag_name": tag_names,
         "tag_value": tag_values, "tail_idx": tail_idxs,
     }
