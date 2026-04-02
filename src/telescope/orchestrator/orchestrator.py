@@ -2883,7 +2883,15 @@ class Orchestrator:
         self.server_urls = list(self.training_server_urls)
         self.server_cycle = itertools.cycle(self.server_urls)
 
-        # 2. Cancel in-flight tasks on each eval server and properly await
+        # 2. Log cancelled rollout tables for in-flight tasks on eval servers
+        #    BEFORE cancelling, so the data is captured (same pattern as
+        #    off-policy cancellation).
+        for url in self.eval_server_urls:
+            for request_id, info in list(self.inflight_rollout_info.items()):
+                if info.server_url == url:
+                    self._log_cancelled_rollouts(request_id, "eval_drain")
+
+        # 3. Cancel in-flight tasks on each eval server and properly await
         #    them so active_count stays consistent.
         #    The CancelledError handlers in _run_prompt (_on_cancelled_group)
         #    and _run_individual_sample (_handle_cancelled_sample) handle
