@@ -40,6 +40,8 @@ def build_base_args(host: str = None, port: int = None, model: str = None):
     args.max_model_len = config.cfg.max_model_len
     args.tensor_parallel_size = max(1, int(config.cfg.inference_tensor_parallel_size))
     args.worker_extension_cls = "telescope.inference.worker.NCCLWeightUpdateWorker"
+    if config.cfg.max_num_seqs is not None:
+        args.max_num_seqs = config.cfg.max_num_seqs
     args.enable_prefix_caching = False
     args.override_generation_config = {"max_new_tokens": None}
 
