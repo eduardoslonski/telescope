@@ -32,6 +32,7 @@ from telescope.orchestrator.loggers.system_metrics_logger import (
     SystemMetricsLogger,
 )
 from telescope.orchestrator.loggers.vllm_metrics_logger import VllmMetricsLogger
+from telescope.orchestrator.loggers.thread_pool_metrics_logger import ThreadPoolMetricsLogger
 
 _log = get_logger("orchestrator")
 
@@ -99,6 +100,7 @@ class WandbLogger:
             )
         )
         self.vllm_metrics_logger = VllmMetricsLogger()
+        self.thread_pool_metrics_logger = ThreadPoolMetricsLogger()
         self.last_logged_step = -1
         self.start_time = time.time()
         self.num_trainer_ranks = _get_required_positive_int_config("trainer_num_workers")
@@ -286,6 +288,7 @@ class WandbLogger:
         self.event_logger.set_metrics_loggers(
             system_metrics_logger=self.system_metrics_logger,
             vllm_metrics_logger=self.vllm_metrics_logger,
+            thread_pool_metrics_logger=self.thread_pool_metrics_logger,
         )
 
         run_url = getattr(self.run, "url", None) or ""
@@ -990,6 +993,7 @@ class WandbLogger:
             # Start collection loops for system and vLLM metrics
             await self.system_metrics_logger.start()
             await self.vllm_metrics_logger.start()
+            await self.thread_pool_metrics_logger.start()
             # Start consolidated upload loop (EventLogger pulls from all sources)
             await self.event_logger.start_upload_loop()
 
@@ -1003,6 +1007,8 @@ class WandbLogger:
             await self.system_metrics_logger.stop()
         if self.vllm_metrics_logger._collection_task is not None:
             await self.vllm_metrics_logger.stop()
+        if self.thread_pool_metrics_logger._collection_task is not None:
+            await self.thread_pool_metrics_logger.stop()
 
     # ------------------------------------------------------------------
     # Eval logging
