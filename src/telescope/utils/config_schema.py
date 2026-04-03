@@ -215,6 +215,7 @@ class TelescopeConfig(BaseModel, extra="forbid"):
     gpu_memory_utilization: float = Field(gt=0, le=1)
     max_model_len: int = Field(ge=1)
     max_num_seqs: int | None = Field(ge=1)
+    max_num_batched_tokens: int | None = Field(ge=1)
     vllm_scheduling_policy: Literal["priority", "fcfs"]
     enable_thinking: bool
     chat_template: str | None = None

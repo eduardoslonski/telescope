@@ -42,6 +42,8 @@ def build_base_args(host: str = None, port: int = None, model: str = None):
     args.worker_extension_cls = "telescope.inference.worker.NCCLWeightUpdateWorker"
     if config.cfg.max_num_seqs is not None:
         args.max_num_seqs = config.cfg.max_num_seqs
+    if config.cfg.max_num_batched_tokens is not None:
+        args.max_num_batched_tokens = config.cfg.max_num_batched_tokens
     args.enable_prefix_caching = False
     args.override_generation_config = {"max_new_tokens": None}
 
