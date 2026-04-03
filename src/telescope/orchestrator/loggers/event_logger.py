@@ -6,7 +6,7 @@ in a way that's easy for the frontend UI to fetch and filter.
 
 All events are stored together in unified zip archives:
 - events/tail.zip: Last 60 seconds of all data
-  Contains: orchestrator.parquet, trainer.parquet, events_rollout.parquet, events_infra.parquet, gpu.parquet, cpu.parquet, vllm.parquet,
+  Contains: orchestrator.parquet, trainer.parquet, events_rollout.parquet, events_infra.parquet, gpu.parquet, cpu.parquet, vllm.parquet, thread_pools.parquet,
             generations_discarded.parquet, env_responses_discarded.parquet, tool_calls_discarded.parquet,
             rollouts_metrics_discarded.parquet, golden_answers_discarded.parquet, info_turns_discarded.parquet,
             sample_tags_discarded.parquet, samples_data_discarded.parquet, prompts_discarded.parquet
@@ -78,6 +78,10 @@ from telescope.orchestrator.loggers.system_metrics_logger import (
 from telescope.orchestrator.loggers.vllm_metrics_logger import (
     VllmMetricsLogger,
     VllmMetricSample,
+)
+from telescope.orchestrator.loggers.thread_pool_metrics_logger import (
+    ThreadPoolMetricsLogger,
+    ThreadPoolMetricSample,
 )
 
 _log = get_logger("orchestrator")
@@ -174,6 +178,15 @@ VLLM_METRICS_SCHEMA = pa.schema([
     ("node_id", pa.int32()),
     ("tp_group_id", pa.int32()),
     ("tp_size", pa.int32()),
+    ("metric_name", pa.string()),
+    ("value", pa.float64()),
+    ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this metric was first uploaded
+])
+
+# Thread pool metrics schema
+THREAD_POOL_METRICS_SCHEMA = pa.schema([
+    ("timestamp", pa.float64()),
+    ("pool_name", pa.string()),
     ("metric_name", pa.string()),
     ("value", pa.float64()),
     ("tail_idx", pa.int32()),  # Index of the tail upload cycle when this metric was first uploaded
@@ -947,12 +960,14 @@ class EventLogger:
         # External metrics loggers (set via set_metrics_loggers)
         self._system_metrics_logger: SystemMetricsLogger | None = None
         self._vllm_metrics_logger: VllmMetricsLogger | None = None
-        
+        self._thread_pool_metrics_logger: ThreadPoolMetricsLogger | None = None
+
         # Accumulated metrics from external loggers (persisted across uploads for block management)
         # Each metric is stored as (metric, tail_idx) tuple
         self._gpu_metrics: list[tuple[GpuMetricSample, int]] = []
         self._cpu_metrics: list[tuple[CpuMetricSample, int]] = []
         self._vllm_metrics: list[tuple[VllmMetricSample, int]] = []
+        self._thread_pool_metrics: list[tuple[ThreadPoolMetricSample, int]] = []
 
         # Tail tracking - each upload cycle increments the tail_idx
         self._current_tail_idx: int = 0
@@ -1035,19 +1050,26 @@ class EventLogger:
         self,
         system_metrics_logger: SystemMetricsLogger | None = None,
         vllm_metrics_logger: VllmMetricsLogger | None = None,
+        thread_pool_metrics_logger: ThreadPoolMetricsLogger | None = None,
     ):
         """
         Set references to external metrics loggers.
-        
+
         EventLogger will pull metrics from these loggers during upload cycles.
-        
+
         Args:
             system_metrics_logger: SystemMetricsLogger instance for GPU/CPU metrics
             vllm_metrics_logger: VllmMetricsLogger instance for vLLM metrics
+            thread_pool_metrics_logger: ThreadPoolMetricsLogger instance for thread pool metrics
         """
         self._system_metrics_logger = system_metrics_logger
         self._vllm_metrics_logger = vllm_metrics_logger
-        _log.debug(f"Set metrics loggers: system={system_metrics_logger is not None}, vllm={vllm_metrics_logger is not None}")
+        self._thread_pool_metrics_logger = thread_pool_metrics_logger
+        _log.debug(
+            f"Set metrics loggers: system={system_metrics_logger is not None}, "
+            f"vllm={vllm_metrics_logger is not None}, "
+            f"thread_pools={thread_pool_metrics_logger is not None}"
+        )
 
     def log_event(
         self,
@@ -1829,6 +1851,26 @@ class EventLogger:
             "tail_idx": [tail_idx for _, tail_idx in metrics],
         }
         return pa.table(data, schema=VLLM_METRICS_SCHEMA)
+
+    def _thread_pool_metrics_to_table(self, metrics: list[tuple[ThreadPoolMetricSample, int]]) -> pa.Table:
+        """Convert list of thread pool metrics (with tail_idx) to PyArrow table."""
+        if not metrics:
+            return pa.table({
+                "timestamp": pa.array([], type=pa.float64()),
+                "pool_name": pa.array([], type=pa.string()),
+                "metric_name": pa.array([], type=pa.string()),
+                "value": pa.array([], type=pa.float64()),
+                "tail_idx": pa.array([], type=pa.int32()),
+            })
+
+        data = {
+            "timestamp": [m.timestamp for m, _ in metrics],
+            "pool_name": [m.pool_name for m, _ in metrics],
+            "metric_name": [m.metric_name for m, _ in metrics],
+            "value": [m.value for m, _ in metrics],
+            "tail_idx": [tail_idx for _, tail_idx in metrics],
+        }
+        return pa.table(data, schema=THREAD_POOL_METRICS_SCHEMA)
 
     def _prompts_to_table(self, prompts: list[Prompt]) -> pa.Table:
         """Convert list of prompts to PyArrow table."""
@@ -2925,6 +2967,7 @@ class EventLogger:
         cancelled_prompts: list[DiscardedPrompt] | None = None,
         logs: list[tuple[LogRecord, int]] | None = None,
         inflight_snapshot: dict | None = None,
+        thread_pool_metrics: list | None = None,
     ):
         """Write all event data as separate parquet files in a single zip archive."""
         if self.run is None:
@@ -2941,6 +2984,7 @@ class EventLogger:
         gpu_table = self._gpu_metrics_to_table(gpu_metrics)
         cpu_table = self._cpu_metrics_to_table(cpu_metrics)
         vllm_table = self._vllm_metrics_to_table(vllm_metrics)
+        thread_pool_table = self._thread_pool_metrics_to_table(thread_pool_metrics or [])
 
         # Convert discarded prompts and rollouts (empty lists if None)
         discarded_proms = discarded_prompts or []
@@ -3027,6 +3071,10 @@ class EventLogger:
             buf = io.BytesIO()
             pq.write_table(vllm_table, buf)
             zf.writestr("vllm.parquet", buf.getvalue())
+
+            buf = io.BytesIO()
+            pq.write_table(thread_pool_table, buf)
+            zf.writestr("thread_pools.parquet", buf.getvalue())
 
             # Discarded tables
             buf = io.BytesIO()
@@ -3395,6 +3443,10 @@ class EventLogger:
             new_vllm = self._vllm_metrics_logger.get_and_clear_metrics()
             self._vllm_metrics.extend((m, current_tail_idx) for m in new_vllm)
 
+        if self._thread_pool_metrics_logger is not None:
+            new_tp = self._thread_pool_metrics_logger.get_and_clear_metrics()
+            self._thread_pool_metrics.extend((m, current_tail_idx) for m in new_tp)
+
         # Pull log records from the logging system
         from telescope.utils import config as _config_mod
         cfg = getattr(_config_mod, 'cfg', None)
@@ -3420,6 +3472,7 @@ class EventLogger:
         all_gpu_metrics = list(self._gpu_metrics)
         all_cpu_metrics = list(self._cpu_metrics)
         all_vllm_metrics = list(self._vllm_metrics)
+        all_thread_pool_metrics = list(self._thread_pool_metrics)
         all_log_records = list(self._log_records)
 
         block_end_time = self._block_start_time + self.BLOCK_DURATION_SECONDS
@@ -3458,6 +3511,10 @@ class EventLogger:
             ]
             block_vllm_metrics = [
                 (m, idx) for m, idx in all_vllm_metrics
+                if idx >= self._block_first_tail_idx and idx <= block_last_tail_idx
+            ]
+            block_thread_pool_metrics = [
+                (m, idx) for m, idx in all_thread_pool_metrics
                 if idx >= self._block_first_tail_idx and idx <= block_last_tail_idx
             ]
             block_log_records = [
@@ -3511,6 +3568,7 @@ class EventLogger:
                     orch_events, trainer_events, block_rollout_events, block_infra_events,
                     block_gpu_metrics, block_cpu_metrics, block_vllm_metrics,
                     block_path,
+                    thread_pool_metrics=block_thread_pool_metrics,
                     metadata=finalized_block_metadata,
                     discarded_rollouts=block_discarded_rollouts,
                     discarded_prompts=block_discarded_prompts,
@@ -3585,6 +3643,7 @@ class EventLogger:
             self._gpu_metrics = [(m, idx) for m, idx in self._gpu_metrics if idx >= new_block_first_tail_idx]
             self._cpu_metrics = [(m, idx) for m, idx in self._cpu_metrics if idx >= new_block_first_tail_idx]
             self._vllm_metrics = [(m, idx) for m, idx in self._vllm_metrics if idx >= new_block_first_tail_idx]
+            self._thread_pool_metrics = [(m, idx) for m, idx in self._thread_pool_metrics if idx >= new_block_first_tail_idx]
             self._log_records = [(r, idx) for r, idx in self._log_records if idx >= new_block_first_tail_idx]
 
             all_events = [e for e in all_events if e.tail_idx >= new_block_first_tail_idx]
@@ -3593,6 +3652,7 @@ class EventLogger:
             all_gpu_metrics = [(m, idx) for m, idx in all_gpu_metrics if idx >= new_block_first_tail_idx]
             all_cpu_metrics = [(m, idx) for m, idx in all_cpu_metrics if idx >= new_block_first_tail_idx]
             all_vllm_metrics = [(m, idx) for m, idx in all_vllm_metrics if idx >= new_block_first_tail_idx]
+            all_thread_pool_metrics = [(m, idx) for m, idx in all_thread_pool_metrics if idx >= new_block_first_tail_idx]
             all_log_records = [(r, idx) for r, idx in all_log_records if idx >= new_block_first_tail_idx]
             all_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= new_block_first_tail_idx]
             all_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= new_block_first_tail_idx]
@@ -3612,6 +3672,7 @@ class EventLogger:
         current_block_gpu = [(m, idx) for m, idx in all_gpu_metrics if idx >= self._block_first_tail_idx]
         current_block_cpu = [(m, idx) for m, idx in all_cpu_metrics if idx >= self._block_first_tail_idx]
         current_block_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= self._block_first_tail_idx]
+        current_block_thread_pools = [(m, idx) for m, idx in all_thread_pool_metrics if idx >= self._block_first_tail_idx]
         current_block_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= self._block_first_tail_idx]
         current_block_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= self._block_first_tail_idx]
         current_block_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= self._block_first_tail_idx]
@@ -3629,6 +3690,7 @@ class EventLogger:
         tail_gpu = [(m, idx) for m, idx in all_gpu_metrics if idx >= tail_min_idx_for_window]
         tail_cpu = [(m, idx) for m, idx in all_cpu_metrics if idx >= tail_min_idx_for_window]
         tail_vllm = [(m, idx) for m, idx in all_vllm_metrics if idx >= tail_min_idx_for_window]
+        tail_thread_pools = [(m, idx) for m, idx in all_thread_pool_metrics if idx >= tail_min_idx_for_window]
         tail_discarded_rollouts = [g for g in all_discarded_rollouts if g.tail_idx >= tail_min_idx_for_window]
         tail_discarded_prompts = [p for p in all_discarded_prompts if p.tail_idx >= tail_min_idx_for_window]
         tail_cancelled_rollouts = [g for g in all_cancelled_rollouts if g.tail_idx >= tail_min_idx_for_window]
@@ -3680,6 +3742,7 @@ class EventLogger:
             eval_prompts=tail_eval_prompts,
             logs=tail_log_records,
             inflight_snapshot=inflight_snapshot,
+            thread_pool_metrics=tail_thread_pools,
         )
 
         # Write block_live.zip with all data
@@ -3704,6 +3767,7 @@ class EventLogger:
             eval_rollouts=current_block_eval_rollouts,
             eval_prompts=current_block_eval_prompts,
             logs=current_block_log_records,
+            thread_pool_metrics=current_block_thread_pools,
         )
 
         # Process rollouts, prompts, and step metrics into blocks

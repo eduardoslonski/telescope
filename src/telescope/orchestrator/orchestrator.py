@@ -17,7 +17,7 @@ import itertools
 import os
 import signal
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import suppress
 
 import httpx
@@ -213,6 +213,15 @@ class Orchestrator:
         # vLLM tracing (per-request timing via OTLP)
         self.otlp_receiver: OtlpReceiver | None = None
 
+        # Batch preprocessing runs in a separate process (own GIL) for CPU-heavy
+        # FFD packing, padding, and tensor creation.  Use forkserver to avoid
+        # forking after threads are created (HTTP pool, event logger, etc.).
+        import multiprocessing as mp
+        self._batch_executor = ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=mp.get_context("forkserver"),
+        )
+
         # Logging
         self.wandb_logger = WandbLogger()
 
@@ -374,6 +383,26 @@ class Orchestrator:
         self.wandb_logger.update_model_architecture_summary()
         self.wandb_logger.log_orchestrator_timeline_event("environments_prepare_done")
 
+        # --- Start subprocess env worker pool for isolated reward computation ---
+        env_worker_workers = int(getattr(config.cfg, "env_worker_pool_size", 0))
+        if env_worker_workers > 0:
+            from telescope.orchestrator.env_worker_pool import EnvWorkerPool
+
+            env_names = [e.name for e in config.cfg.environments]
+            env_kwargs = {
+                e.name: dict(e.kwargs) if hasattr(e, "kwargs") and e.kwargs else {}
+                for e in config.cfg.environments
+            }
+            self.env_worker_pool = EnvWorkerPool(
+                env_names=env_names,
+                env_kwargs_by_name=env_kwargs,
+                num_workers=env_worker_workers,
+            )
+            self.env_worker_pool.start()
+            _log.info(f"EnvWorkerPool started with {env_worker_workers} workers")
+        else:
+            self.env_worker_pool = None
+
         # --- Wait for inference results and set up inference state ---
         self.inference_group.wait_ready()
         self.server_urls = list(self.inference_group.server_urls)
@@ -533,6 +562,51 @@ class Orchestrator:
                 _log.warning(f"Error while stopping OTLP receiver: {exc}")
 
     # =========================================================================
+    # Thread Pool Registration
+    # =========================================================================
+
+    def _register_thread_pools(self):
+        """Register all known executors and queues for metrics collection."""
+        from telescope.orchestrator.generate import _http_pool
+
+        tp_logger = self.wandb_logger.thread_pool_metrics_logger
+
+        # Thread pools
+        tp_logger.register_thread_pool(_http_pool, "http", max_workers=2048)
+        tp_logger.register_thread_pool(
+            self.wandb_logger.event_logger._executor, "event_logger", max_workers=1
+        )
+
+        # Process pools
+        tp_logger.register_process_pool(
+            self._batch_executor, "batch_executor", max_workers=1
+        )
+
+        # Environment-specific thread pools (may not be imported if env not used)
+        try:
+            from telescope.environments.i3_code.sandbox_utils import _TAR_EXECUTOR
+            tp_logger.register_thread_pool(_TAR_EXECUTOR, "tar_builder", max_workers=128)
+        except ImportError:
+            pass
+
+        try:
+            from telescope.environments._sandbox.modal_provider import _MODAL_EXECUTOR
+            tp_logger.register_thread_pool(_MODAL_EXECUTOR, "modal_ops", max_workers=500)
+        except ImportError:
+            pass
+
+        # Queues
+        try:
+            for env_name, env in self.scheduler.environments.items():
+                pool = getattr(env, '_sandbox_pool', None)
+                if pool is not None and hasattr(pool, 'ready_queue'):
+                    tp_logger.register_queue(pool.ready_queue, f"sandbox_ready_{env_name}")
+        except Exception:
+            pass
+
+        _log.debug(f"Registered {len(tp_logger._tracked)} executors/queues for metrics")
+
+    # =========================================================================
     # Main Run Loop
     # =========================================================================
 
@@ -556,6 +630,9 @@ class Orchestrator:
         _log.debug(f"Inference servers: {self.server_urls}")
         _log.debug(f"Starting state: trainer_step={self.trainer_step}, inference_step={self.inference_step}, inference_model_step={self.inference_model_step}")
         self.wandb_logger.set_trainer_steps_done(self.trainer_step)
+
+        # Register thread pools for observability
+        self._register_thread_pools()
 
         await self.wandb_logger.start_event_upload_loop()
         _log.debug("W&B event upload loop started")
@@ -687,6 +764,9 @@ class Orchestrator:
             if self.eval_runner:
                 await self.eval_runner.close()
             await self.http_client.aclose()
+            self._batch_executor.shutdown(wait=False)
+            if self.env_worker_pool is not None:
+                self.env_worker_pool.shutdown()
             await self.wandb_logger.stop_event_upload_loop()
 
     # =========================================================================
@@ -1262,6 +1342,7 @@ class Orchestrator:
                 http_client=self.http_client,
                 sample_timings=sample_timings,
                 sample_lifecycles=sample_lifecycles,
+                env_worker_pool=self.env_worker_pool,
             )
         except asyncio.CancelledError:
             self._on_cancelled_group(request_id, server_url, lane_slots, sample_timings)
@@ -1320,6 +1401,7 @@ class Orchestrator:
                     prompt_data=prompt_data,
                     timing_out=timing,
                     lifecycle=lifecycle,
+                    env_worker_pool=self.env_worker_pool,
                 )
             else:
                 result = await process_sample(
@@ -1331,6 +1413,7 @@ class Orchestrator:
                     self.tokenizer,
                     timing_out=timing,
                     lifecycle=lifecycle,
+                    env_worker_pool=self.env_worker_pool,
                 )
         except asyncio.CancelledError:
             lane_freed = lifecycle._lane_freed()  # type: ignore[attr-defined]
@@ -2252,10 +2335,12 @@ class Orchestrator:
         asyncio.ensure_future(self._save_batch_async(batch, _start_idx, _step, _checkpoint_pending))
 
     async def _save_batch_async(self, batch, start_sample_idx, step, checkpoint_pending):
-        """Run heavy batch preprocessing in thread pool, then submit to trainer."""
-        # preprocess_batch does FFD packing, padding, tensor creation — heavy CPU
+        """Run heavy batch preprocessing in process pool, then submit to trainer."""
+        # preprocess_batch does FFD packing, padding, tensor creation — heavy CPU.
+        # Runs in ProcessPoolExecutor so it gets its own GIL and doesn't compete
+        # with the orchestrator's async event loop or HTTP thread pool.
         trainer_data = await asyncio.get_event_loop().run_in_executor(
-            None, preprocess_batch, batch, self.num_trainer_data_shards, start_sample_idx,
+            self._batch_executor, preprocess_batch, batch, self.num_trainer_data_shards, start_sample_idx,
         )
 
         if checkpoint_pending:

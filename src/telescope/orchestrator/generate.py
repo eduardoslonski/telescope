@@ -1103,6 +1103,7 @@ async def process_sample(
     timing_out: dict | None = None,
     on_generation_complete: Callable[[], None] | None = None,
     lifecycle: SampleLifecycleCallbacks | None = None,
+    env_worker_pool: Any | None = None,
 ) -> dict:
     """
     Process a single prompt and compute rewards.
@@ -1182,7 +1183,17 @@ async def process_sample(
     if lifecycle is not None and lifecycle.on_reward_start is not None:
         lifecycle.on_reward_start()
     _reward_t0 = time.monotonic()
-    reward_result = await compute_reward_fn(completion_text, sample, eos_token)
+    if env_worker_pool is not None:
+        env_name = prompt_data.get("env_name", "")
+        reward_result = await env_worker_pool.compute_reward(
+            env_name=env_name,
+            is_multi_turn=False,
+            completion_or_state=completion_text,
+            sample=sample,
+            eos_token=eos_token,
+        )
+    else:
+        reward_result = await compute_reward_fn(completion_text, sample, eos_token)
     compute_reward_time = time.monotonic() - _reward_t0
     if lifecycle is not None and lifecycle.on_reward_end is not None:
         lifecycle.on_reward_end(compute_reward_time)
@@ -1255,6 +1266,7 @@ async def process_multiturn_sample(
     timing_out: dict | None = None,
     on_generation_complete: Callable[[], None] | None = None,
     lifecycle: SampleLifecycleCallbacks | None = None,
+    env_worker_pool: Any | None = None,
 ) -> dict:
     """
     Process a single multi-turn sample.
@@ -1319,11 +1331,20 @@ async def process_multiturn_sample(
     if lifecycle is not None and lifecycle.on_reward_start is not None:
         lifecycle.on_reward_start()
     _reward_t0 = time.monotonic()
-    reward_result = await env.compute_reward(state, eos_token)
+    if env_worker_pool is not None:
+        reward_result = await env_worker_pool.compute_reward(
+            env_name=env.name,
+            is_multi_turn=True,
+            completion_or_state=state,
+            sample=state.sample,
+            eos_token=eos_token,
+        )
+    else:
+        reward_result = await env.compute_reward(state, eos_token)
     compute_reward_time = time.monotonic() - _reward_t0
     if lifecycle is not None and lifecycle.on_reward_end is not None:
         lifecycle.on_reward_end(compute_reward_time)
-    
+
     # Build interleaved completion data.
     # The completion_ids include env response tokens between model completions,
     # and the completion_mask marks which tokens the model generated (1) vs
@@ -1398,6 +1419,7 @@ async def process_multiturn_group(
     http_client: httpx.AsyncClient = None,
     sample_timings: list[dict] | None = None,
     sample_lifecycles: list[SampleLifecycleCallbacks] | None = None,
+    env_worker_pool: Any | None = None,
 ) -> dict:
     """
     Process a group of multi-turn samples.
@@ -1431,6 +1453,7 @@ async def process_multiturn_group(
                 prompt_data=prompt_data,
                 timing_out=sample_timings[i] if sample_timings else None,
                 lifecycle=sample_lifecycles[i] if sample_lifecycles else None,
+                env_worker_pool=env_worker_pool,
             )
             for i in range(config.cfg.group_size)
         ]
@@ -1449,6 +1472,7 @@ async def process_multiturn_group(
                     prompt_data=prompt_data,
                     timing_out=sample_timings[i] if sample_timings else None,
                     lifecycle=sample_lifecycles[i] if sample_lifecycles else None,
+                    env_worker_pool=env_worker_pool,
                 )
                 for i in range(config.cfg.group_size)
             ]
@@ -1580,6 +1604,7 @@ async def process_group(
     http_client: httpx.AsyncClient = None,
     sample_timings: list[dict] | None = None,
     sample_lifecycles: list[SampleLifecycleCallbacks] | None = None,
+    env_worker_pool: Any | None = None,
 ) -> dict:
     """
     Process a group of samples (same prompt, multiple completions).
@@ -1611,6 +1636,7 @@ async def process_group(
             prompt_data, eos_token, server_url, env, tokenizer, http_client,
             sample_timings=sample_timings,
             sample_lifecycles=sample_lifecycles,
+            env_worker_pool=env_worker_pool,
         )
 
     # Single-turn processing - use provided client or create a new one
@@ -1618,7 +1644,8 @@ async def process_group(
         tasks = [
             process_sample(http_client, prompt_data, eos_token, server_url, compute_reward_fn, tokenizer,
                            timing_out=sample_timings[i] if sample_timings else None,
-                           lifecycle=sample_lifecycles[i] if sample_lifecycles else None)
+                           lifecycle=sample_lifecycles[i] if sample_lifecycles else None,
+                           env_worker_pool=env_worker_pool)
             for i in range(config.cfg.group_size)
         ]
         group_samples = await asyncio.gather(*tasks)
@@ -1628,7 +1655,8 @@ async def process_group(
             tasks = [
                 process_sample(client, prompt_data, eos_token, server_url, compute_reward_fn, tokenizer,
                                timing_out=sample_timings[i] if sample_timings else None,
-                               lifecycle=sample_lifecycles[i] if sample_lifecycles else None)
+                               lifecycle=sample_lifecycles[i] if sample_lifecycles else None,
+                               env_worker_pool=env_worker_pool)
                 for i in range(config.cfg.group_size)
             ]
             group_samples = await asyncio.gather(*tasks)
