@@ -136,6 +136,8 @@ inference_host: "0.0.0.0"
 inference_base_port: 8100
 gpu_memory_utilization: 0.9
 max_model_len: 4096
+max_num_seqs: null # max concurrent sequences per vLLM server; null = vLLM auto-detect (256 standard, 1024 high-memory GPUs)
+max_num_batched_tokens: null # max tokens per scheduler step (prefill + decode); null = vLLM auto-detect (2048 A100, 8192 H100/MI300x)
 vllm_scheduling_policy: "priority" # "priority" = turn-aware scheduling for multi-turn; "fcfs" = first-come-first-served
 enable_thinking: false # pass enable_thinking=True/False to apply_chat_template (e.g. Qwen3 thinking mode)
 chat_template: null # Jinja2 chat template string; null = use tokenizer's built-in template. Required for base models without a chat_template (e.g. allenai/OLMo-3-1025-7B).
