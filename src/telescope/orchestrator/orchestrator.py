@@ -566,31 +566,37 @@ class Orchestrator:
     # =========================================================================
 
     def _register_thread_pools(self):
-        """Register all known thread pools for metrics collection."""
+        """Register all known executors and queues for metrics collection."""
         from telescope.orchestrator.generate import _http_pool
 
         tp_logger = self.wandb_logger.thread_pool_metrics_logger
-        tp_logger.register_pool(_http_pool, "http", max_workers=2048)
-        tp_logger.register_pool(
+
+        # Thread pools
+        tp_logger.register_thread_pool(_http_pool, "http", max_workers=2048)
+        tp_logger.register_thread_pool(
             self.wandb_logger.event_logger._executor, "event_logger", max_workers=1
         )
 
-        # Environment-specific pools (may not be imported if env not used)
+        # Process pools
+        tp_logger.register_process_pool(
+            self._batch_executor, "batch_executor", max_workers=1
+        )
+
+        # Environment-specific thread pools (may not be imported if env not used)
         try:
             from telescope.environments.i3_code.sandbox_utils import _TAR_EXECUTOR
-            tp_logger.register_pool(_TAR_EXECUTOR, "tar_builder", max_workers=128)
+            tp_logger.register_thread_pool(_TAR_EXECUTOR, "tar_builder", max_workers=128)
         except ImportError:
             pass
 
         try:
             from telescope.environments._sandbox.modal_provider import _MODAL_EXECUTOR
-            tp_logger.register_pool(_MODAL_EXECUTOR, "modal_ops", max_workers=500)
+            tp_logger.register_thread_pool(_MODAL_EXECUTOR, "modal_ops", max_workers=500)
         except ImportError:
             pass
 
+        # Queues
         try:
-            from telescope.environments._sandbox.pool import GenericSandboxPool
-            # Sandbox pool ready queue — registered later if pool exists
             for env_name, env in self.scheduler.environments.items():
                 pool = getattr(env, '_sandbox_pool', None)
                 if pool is not None and hasattr(pool, 'ready_queue'):
@@ -598,7 +604,7 @@ class Orchestrator:
         except Exception:
             pass
 
-        _log.debug(f"Registered {len(tp_logger._pools)} thread pools/queues for metrics")
+        _log.debug(f"Registered {len(tp_logger._tracked)} executors/queues for metrics")
 
     # =========================================================================
     # Main Run Loop
