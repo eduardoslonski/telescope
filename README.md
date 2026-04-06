@@ -16,6 +16,8 @@ Telescope provides a training engine and a visualization dashboard. The training
 
 Full documentation at [docs.telescope.training](https://docs.telescope.training).
 
+https://github.com/user-attachments/assets/238e3571-3d43-486d-a13f-064f9f107b23
+
 ## Installation
 
 ### Docker (recommended)
